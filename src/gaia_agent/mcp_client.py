@@ -169,34 +169,52 @@ class MCPToolClient:
             descriptor = os.open(resolved, flags)
         except OSError:
             raise AttachmentPolicyError("attachment changed or is unavailable") from None
+        body_failed = False
         try:
-            opened = os.fstat(descriptor)
-            _validate_attachment_stat(opened)
-            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
-                raise AttachmentPolicyError("attachment changed during validation")
-            chunks: list[bytes] = []
-            total = 0
-            while total <= _MAX_ATTACHMENT_BYTES:
-                chunk = os.read(
-                    descriptor,
-                    min(_ATTACHMENT_READ_CHUNK_BYTES, _MAX_ATTACHMENT_BYTES + 1 - total),
-                )
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-            if total > _MAX_ATTACHMENT_BYTES:
-                raise AttachmentPolicyError("attachment exceeds size limit")
-            after = os.fstat(descriptor)
-            if (
-                after.st_size != opened.st_size
-                or after.st_mtime_ns != opened.st_mtime_ns
-                or total != after.st_size
-            ):
-                raise AttachmentPolicyError("attachment changed during read")
-            return b"".join(chunks)
+            try:
+                opened = os.fstat(descriptor)
+                _validate_attachment_stat(opened)
+                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise AttachmentPolicyError("attachment changed during validation")
+                chunks: list[bytes] = []
+                total = 0
+                while total <= _MAX_ATTACHMENT_BYTES:
+                    chunk = os.read(
+                        descriptor,
+                        min(
+                            _ATTACHMENT_READ_CHUNK_BYTES,
+                            _MAX_ATTACHMENT_BYTES + 1 - total,
+                        ),
+                    )
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                if total > _MAX_ATTACHMENT_BYTES:
+                    raise AttachmentPolicyError("attachment exceeds size limit")
+                after = os.fstat(descriptor)
+                if (
+                    after.st_size != opened.st_size
+                    or after.st_mtime_ns != opened.st_mtime_ns
+                    or total != after.st_size
+                ):
+                    raise AttachmentPolicyError("attachment changed during read")
+                return b"".join(chunks)
+            except AttachmentPolicyError:
+                body_failed = True
+                raise
+            except OSError:
+                body_failed = True
+                raise AttachmentPolicyError("attachment I/O failed") from None
+            except BaseException:
+                body_failed = True
+                raise
         finally:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                if not body_failed:
+                    raise AttachmentPolicyError("attachment I/O failed") from None
 
     def _validate_attachments(self, attachments: Iterable[Path]) -> tuple[Path, ...]:
         validated: list[Path] = []

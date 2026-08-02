@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections import deque
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
@@ -9,7 +10,7 @@ from typing import Any, Self
 import pytest
 
 from gaia_agent.config import RunConfig
-from gaia_agent.mcp_client import AttachmentPolicyError, ToolExecutionError
+from gaia_agent.mcp_client import AttachmentPolicyError, MCPToolClient, ToolExecutionError
 from gaia_agent.models import (
     AgentPlan,
     AgentResult,
@@ -979,6 +980,51 @@ async def test_visual_attachment_policy_failure_is_an_attachment_error(tmp_path:
         specialists={SpecialistName.VISUAL: visual},
         critic=FakeCritic(calls, []),
         tools=FakeTools(calls),
+    ).run(_task(attachment_path=attachment))
+
+    assert result.error_category == TerminalErrorCategory.ATTACHMENT_ERROR
+
+
+@pytest.mark.asyncio
+async def test_visual_low_level_read_oserror_is_an_attachment_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    attachment = tmp_path / "registered.png"
+    attachment.write_bytes(b"image")
+    policy_client = MCPToolClient(
+        task_root=tmp_path,
+        config=_config(),
+        attachments=(attachment,),
+    )
+
+    class PolicyTools(FakeTools):
+        async def read_attachment_bytes(self, path: Path) -> bytes:
+            return await policy_client.read_attachment_bytes(path)
+
+    class AttachmentReadingVisual:
+        last_usage = Usage()
+
+        async def run(
+            self,
+            task: GaiaTask,
+            step: PlanStep,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> AgentResult:
+            await tools.read_attachment_bytes(task.attachment_path)
+            raise AssertionError("failed attachment read must stop visual execution")
+
+    def fail_read(fd: int, size: int) -> bytes:
+        raise OSError(5, "raw device failure /private/sensitive-image.png")
+
+    monkeypatch.setattr(os, "read", fail_read)
+    result = await Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.VISUAL)),
+        specialists={SpecialistName.VISUAL: AttachmentReadingVisual()},
+        critic=FakeCritic(calls, []),
+        tool_client_factory=FakeToolFactory(PolicyTools(calls)),
+        config=_config(),
     ).run(_task(attachment_path=attachment))
 
     assert result.error_category == TerminalErrorCategory.ATTACHMENT_ERROR

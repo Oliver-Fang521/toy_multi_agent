@@ -427,6 +427,57 @@ async def test_attachment_bytes_are_read_off_the_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_attachment_read_oserror_is_normalized_without_raw_details(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attachment = tmp_path / "image.png"
+    attachment.write_bytes(b"image bytes")
+    client = MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        attachments=(attachment,),
+    )
+
+    def fail_read(fd: int, size: int) -> bytes:
+        raise OSError(5, "raw device failure /private/sensitive-image.png")
+
+    monkeypatch.setattr(os, "read", fail_read)
+
+    with pytest.raises(AttachmentPolicyError) as caught:
+        await client.read_attachment_bytes(attachment)
+
+    assert str(caught.value) == "attachment I/O failed"
+    assert "raw device" not in str(caught.value)
+    assert "sensitive-image" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_attachment_close_oserror_is_normalized_without_raw_details(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attachment = tmp_path / "image.png"
+    attachment.write_bytes(b"image bytes")
+    client = MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        attachments=(attachment,),
+    )
+    original_close = os.close
+
+    def fail_close(fd: int) -> None:
+        original_close(fd)
+        raise OSError(5, "raw close failure /private/sensitive-image.png")
+
+    monkeypatch.setattr(os, "close", fail_close)
+
+    with pytest.raises(AttachmentPolicyError) as caught:
+        await client.read_attachment_bytes(attachment)
+
+    assert str(caught.value) == "attachment I/O failed"
+    assert "raw close" not in str(caught.value)
+
+
+@pytest.mark.asyncio
 async def test_http_reader_extracts_html_text_and_final_url(public_dns: None) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL("https://93.184.216.34/article")
