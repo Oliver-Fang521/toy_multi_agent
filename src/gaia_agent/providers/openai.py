@@ -15,7 +15,7 @@ from gaia_agent.providers.base import (
 
 class OpenAIProvider:
     def __init__(self, client: Any, model: str = "gpt-5.6-sol") -> None:
-        self._client = client
+        self._client = client.with_options(max_retries=0)
         self._model = model
 
     async def complete(
@@ -25,7 +25,14 @@ class OpenAIProvider:
             "model": self._model,
             "instructions": request.instructions,
             "tools": [tool.as_openai_dict() for tool in request.allowed_tools],
-            "text": {"format": request.output_schema},
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "gaia_response",
+                    "schema": request.output_schema,
+                    "strict": True,
+                }
+            },
             "reasoning": {"effort": request.reasoning_effort},
             "max_output_tokens": request.max_output_tokens,
             "max_tool_calls": request.max_tool_calls,
@@ -76,7 +83,7 @@ class OpenAIProvider:
             responses.append(response)
 
         output_text, refused = _extract_output_text(response)
-        citations, remote_file_ids = _extract_sources(response)
+        citations, remote_file_ids = _extract_sources(responses)
         parsed = None if refused or not output_text else json.loads(output_text)
         if parsed is not None and not isinstance(parsed, dict):
             raise ValueError("structured response must decode to an object")
@@ -132,38 +139,39 @@ def _extract_output_text(response: Any) -> tuple[str, bool]:
     return "".join(parts), refused
 
 
-def _extract_sources(response: Any) -> tuple[list[Citation], list[str]]:
+def _extract_sources(responses: list[Any]) -> tuple[list[Citation], list[str]]:
     citations: list[Citation] = []
     remote_file_ids: list[str] = []
-    for item in response.output:
-        if item.type != "message":
-            continue
-        for content in item.content:
-            if content.type != "output_text":
+    for response in responses:
+        for item in response.output:
+            if item.type != "message":
                 continue
-            for annotation in content.annotations:
-                if annotation.type == "url_citation":
-                    citations.append(
-                        Citation(
-                            kind="url",
-                            title=annotation.title,
-                            url=annotation.url,
-                            start_index=annotation.start_index,
-                            end_index=annotation.end_index,
+            for content in item.content:
+                if content.type != "output_text":
+                    continue
+                for annotation in content.annotations:
+                    if annotation.type == "url_citation":
+                        citations.append(
+                            Citation(
+                                kind="url",
+                                title=annotation.title,
+                                url=annotation.url,
+                                start_index=annotation.start_index,
+                                end_index=annotation.end_index,
+                            )
                         )
-                    )
-                elif annotation.type in {"file_citation", "container_file_citation"}:
-                    citations.append(
-                        Citation(
-                            kind="file",
-                            file_id=annotation.file_id,
-                            filename=annotation.filename,
+                    elif annotation.type in {"file_citation", "container_file_citation"}:
+                        citations.append(
+                            Citation(
+                                kind="file",
+                                file_id=annotation.file_id,
+                                filename=annotation.filename,
+                            )
                         )
-                    )
-                    if annotation.file_id not in remote_file_ids:
-                        remote_file_ids.append(annotation.file_id)
-                elif annotation.type == "file_path":
-                    citations.append(Citation(kind="file", file_id=annotation.file_id))
-                    if annotation.file_id not in remote_file_ids:
-                        remote_file_ids.append(annotation.file_id)
+                        if annotation.file_id not in remote_file_ids:
+                            remote_file_ids.append(annotation.file_id)
+                    elif annotation.type == "file_path":
+                        citations.append(Citation(kind="file", file_id=annotation.file_id))
+                        if annotation.file_id not in remote_file_ids:
+                            remote_file_ids.append(annotation.file_id)
     return citations, remote_file_ids

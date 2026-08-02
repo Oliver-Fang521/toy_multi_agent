@@ -1,6 +1,6 @@
 from typing import Any, Literal, Protocol
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from gaia_agent.models import FrozenModel, Usage
 
@@ -28,6 +28,22 @@ class ModelRequest(FrozenModel):
     max_output_tokens: int = Field(default=2_000, gt=0)
     max_tool_calls: int = Field(default=8, ge=0)
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
+
+    @field_validator("output_schema")
+    @classmethod
+    def require_strict_object_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        properties = value.get("properties")
+        required = value.get("required")
+        if (
+            value.get("type") != "object"
+            or value.get("additionalProperties") is not False
+            or not isinstance(properties, dict)
+            or set(required or ()) != set(properties)
+        ):
+            raise ValueError(
+                "output_schema must be a strict object JSON Schema with all properties required"
+            )
+        return value
 
 
 class Citation(FrozenModel):

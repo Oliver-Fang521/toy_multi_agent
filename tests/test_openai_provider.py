@@ -80,6 +80,11 @@ class FakeResponsesClient:
         self.responses = self
         self.queued: deque[Response | Exception] = deque()
         self.requests: list[dict[str, Any]] = []
+        self.configured_max_retries: list[int] = []
+
+    def with_options(self, *, max_retries: int) -> "FakeResponsesClient":
+        self.configured_max_retries.append(max_retries)
+        return self
 
     async def create(self, **kwargs: Any) -> Response:
         self.requests.append(kwargs)
@@ -179,7 +184,12 @@ def model_request(**updates: Any) -> ModelRequest:
     values: dict[str, Any] = {
         "instructions": "answer with JSON",
         "input_items": ({"role": "user", "content": "What is six times seven?"},),
-        "output_schema": {"type": "json_object"},
+        "output_schema": {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
         "allowed_tools": (
             ToolSpec(
                 name="execute_python",
@@ -253,7 +263,19 @@ async def test_openai_provider_maps_reasoning_schema_and_function_tools_strictly
                 "strict": True,
             }
         ],
-        "text": {"format": {"type": "json_object"}},
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "gaia_response",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            }
+        },
         "reasoning": {"effort": "medium"},
         "max_output_tokens": 500,
         "max_tool_calls": 4,
@@ -347,6 +369,16 @@ async def test_openai_provider_retries_transient_failures_once(transient_error: 
 
 
 @pytest.mark.asyncio
+async def test_openai_provider_disables_sdk_internal_retries() -> None:
+    client = FakeResponsesClient()
+    client.queue_text('{"answer":"42"}')
+
+    await OpenAIProvider(client, "gpt-5.6-sol").complete(model_request())
+
+    assert client.configured_max_retries == [0]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "terminal_error",
     [_status_error(AuthenticationError, 401), _status_error(BadRequestError, 400)],
@@ -410,6 +442,64 @@ async def test_openai_provider_rejects_undeclared_function_before_execution(
         )
 
     assert executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_preserves_sources_from_intermediate_responses() -> None:
+    client = FakeResponsesClient()
+    client.queued.append(
+        _response(
+            "resp-mixed",
+            [
+                {
+                    "id": "msg-source",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "source",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://example.test/intermediate",
+                                    "title": "Intermediate source",
+                                    "start_index": 0,
+                                    "end_index": 6,
+                                },
+                                {"type": "file_path", "file_id": "file-intermediate", "index": 6},
+                            ],
+                            "logprobs": [],
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc-call-1",
+                    "call_id": "call-1",
+                    "name": "execute_python",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+            ],
+        )
+    )
+    client.queue_text('{"answer":"42"}')
+
+    response = await OpenAIProvider(client, "gpt-5.6-sol").complete(
+        model_request(), RecordingExecutor({"stdout": "42"})
+    )
+
+    assert [citation.url for citation in response.citations if citation.kind == "url"] == [
+        "https://example.test/intermediate"
+    ]
+    assert response.remote_file_ids == ("file-intermediate",)
+
+
+def test_model_request_rejects_non_strict_output_format() -> None:
+    with pytest.raises(ValidationError, match="strict object JSON Schema"):
+        model_request(output_schema={"type": "json_object"})
 
 
 def test_provider_request_is_frozen() -> None:
