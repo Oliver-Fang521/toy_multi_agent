@@ -529,6 +529,52 @@ async def test_critic_accepts_revision_grounded_in_observable_allowed_tool_event
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "output"),
+    [
+        ("execute_python", {}),
+        (
+            "execute_python",
+            {"output_text": "  ", "outputs": [], "meta": {"items": []}},
+        ),
+        (
+            "execute_python",
+            {
+                "error": "calculation failed",
+                "meta": {"api_key": "redacted-secret"},
+            },
+        ),
+        ("submit_answer", {"answer": "42"}),
+    ],
+)
+async def test_critic_rejects_revision_grounded_only_by_non_evidence_tool_event(
+    fake_provider, fake_tools, task, tool_name, output
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": "revise",
+            "feedback": "The event does not provide allowed observable result content",
+            "checked_evidence_ids": [],
+            "corrected_answer": "42",
+        },
+        tool_events=(
+            ToolEvent(
+                call_id="call-empty",
+                name=tool_name,
+                arguments={},
+                output=output,
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="revised critic decision must be grounded in checked evidence or an allowed tool event",
+    ):
+        await CriticAgent(fake_provider).verify(task, "41", (), fake_tools)
+
+
+@pytest.mark.asyncio
 async def test_critic_rejects_an_unknown_verdict(fake_provider, fake_tools, task) -> None:
     fake_provider.return_parsed(
         {

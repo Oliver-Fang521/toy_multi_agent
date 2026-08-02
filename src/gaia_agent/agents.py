@@ -23,6 +23,31 @@ if TYPE_CHECKING:
 
 ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
 
+_NON_RESULT_OUTPUT_KEYS = frozenset(
+    {
+        "debug",
+        "error",
+        "errors",
+        "exception",
+        "meta",
+        "metadata",
+        "status",
+        "status_code",
+        "traceback",
+        "truncated",
+    }
+)
+_SENSITIVE_OUTPUT_KEY_PARTS = (
+    "api_key",
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+_MAX_TOOL_OUTPUT_NODES = 256
+_MAX_TOOL_OUTPUT_DEPTH = 8
+
 
 def _strict_schema(model: type[BaseModel]) -> dict[str, Any]:
     schema = model.model_json_schema()
@@ -296,7 +321,8 @@ class CriticAgent:
         if len(set(decision.checked_evidence_ids)) != len(decision.checked_evidence_ids):
             raise ValueError("critic checked evidence IDs must be unique")
         has_allowed_tool_evidence = any(
-            event.name in self.allowed_tool_names and bool(event.output)
+            event.name in self.allowed_tool_names
+            and _has_meaningful_observable_output(event.output)
             for event in response.tool_events
         )
         if (
@@ -405,3 +431,45 @@ def _normalize_candidate_answer(candidate: str | None) -> str | None:
     ):
         raise ValueError("candidate answer must use the concise GAIA format")
     return normalized
+
+
+def _has_meaningful_observable_output(value: Any) -> bool:
+    remaining = [_MAX_TOOL_OUTPUT_NODES]
+
+    def visit(item: Any, depth: int) -> bool:
+        if remaining[0] <= 0:
+            return False
+        remaining[0] -= 1
+        if item is None:
+            return False
+        if isinstance(item, str):
+            return bool(item.strip())
+        if isinstance(item, (bool, int, float)):
+            return True
+        if depth >= _MAX_TOOL_OUTPUT_DEPTH:
+            return False
+        if isinstance(item, dict):
+            pairs = sorted(item.items(), key=lambda pair: str(pair[0]))
+            for key, child in pairs:
+                if remaining[0] <= 0:
+                    return False
+                if not _is_non_result_output_key(str(key)) and visit(child, depth + 1):
+                    return True
+            return False
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                if remaining[0] <= 0:
+                    return False
+                if visit(child, depth + 1):
+                    return True
+            return False
+        return False
+
+    return visit(value, 0)
+
+
+def _is_non_result_output_key(key: str) -> bool:
+    normalized = key.casefold()
+    return normalized in _NON_RESULT_OUTPUT_KEYS or any(
+        part in normalized for part in _SENSITIVE_OUTPUT_KEY_PARTS
+    )
