@@ -26,6 +26,7 @@ class TerminalErrorCategory(StrEnum):
     CRITIC_REJECTION = "critic_rejection"
     ATTACHMENT_ERROR = "attachment_error"
     RETRY_EXHAUSTED = "retry_exhausted"
+    NO_CONSENSUS = "no_consensus"
 
 
 class GaiaTask(FrozenModel):
