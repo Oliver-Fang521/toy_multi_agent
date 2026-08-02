@@ -504,14 +504,53 @@ async def test_critic_accepts_revision_grounded_in_known_evidence(
 
 
 @pytest.mark.asyncio
-async def test_critic_accepts_revision_grounded_in_observable_allowed_tool_event(
-    fake_provider, fake_tools, task
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "output"),
+    [
+        (
+            "web_search",
+            {"query": "independent check"},
+            {"answer": "42", "sources": []},
+        ),
+        (
+            "web_search",
+            {"query": "independent check"},
+            {
+                "answer": "",
+                "sources": [{"url": "https://source.example", "title": "Primary source"}],
+            },
+        ),
+        (
+            "read_webpage",
+            {"url": "https://source.example"},
+            {
+                "url": "https://source.example",
+                "status_code": 200,
+                "content_type": "text/html",
+                "text": "The independently verified result is 42.",
+                "truncated": False,
+            },
+        ),
+        (
+            "execute_python",
+            {"instruction": "Independently calculate the answer"},
+            {"output_text": "42", "outputs": []},
+        ),
+        (
+            "execute_python",
+            {"instruction": "Independently calculate the answer"},
+            {"output_text": "", "outputs": [{"type": "logs", "logs": "42"}]},
+        ),
+    ],
+)
+async def test_critic_accepts_revision_grounded_in_tool_specific_observable_result(
+    fake_provider, fake_tools, task, tool_name, arguments, output
 ) -> None:
     tool_event = ToolEvent(
         call_id="call-1",
-        name="execute_python",
-        arguments={"instruction": "Independently calculate the answer"},
-        output={"output_text": "42", "outputs": []},
+        name=tool_name,
+        arguments=arguments,
+        output=output,
     )
     fake_provider.return_parsed(
         {
@@ -543,6 +582,24 @@ async def test_critic_accepts_revision_grounded_in_observable_allowed_tool_event
                 "error": "calculation failed",
                 "meta": {"api_key": "redacted-secret"},
             },
+        ),
+        (
+            "read_webpage",
+            {
+                "url": "https://source.example/empty",
+                "status_code": 200,
+                "content_type": "text/html; charset=utf-8",
+                "text": "  ",
+                "truncated": False,
+            },
+        ),
+        (
+            "execute_python",
+            {"status": "error", "message": "calculation failed"},
+        ),
+        (
+            "execute_python",
+            {"request_id": "req-1", "latency_ms": 5},
         ),
         ("submit_answer", {"answer": "42"}),
     ],
