@@ -43,7 +43,10 @@ def fake_backend_env(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     def resolve_public(host: str, port: int, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("142.250.72.14", port)),
+        ]
 
     monkeypatch.setattr(socket, "getaddrinfo", resolve_public)
 
@@ -281,13 +284,18 @@ async def test_http_reader_extracts_html_text_and_final_url(public_dns: None) ->
 
 @pytest.mark.asyncio
 async def test_http_reader_raises_for_http_status(public_dns: None) -> None:
+    attempts: list[str] = []
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.host)
         return httpx.Response(503, text="backend unavailable", request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         reader = HTTPWebReader(client=client, timeout_seconds=1)
         with pytest.raises(httpx.HTTPStatusError):
             await reader.read("https://example.test/down")
+
+    assert attempts == ["93.184.216.34"]
 
 
 @pytest.mark.asyncio
@@ -373,6 +381,46 @@ async def test_http_reader_pins_validated_address_against_dns_rebinding(
 
     assert result["url"] == "https://public.test/article"
     assert resolution_count == 1
+
+
+@pytest.mark.asyncio
+async def test_http_reader_falls_back_across_validated_public_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[str] = []
+
+    def dual_stack_dns(
+        host: str, port: int, *args: Any, **kwargs: Any
+    ) -> list[tuple[Any, ...]]:
+        return [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                ("2606:4700:4700::1111", port, 0, 0),
+            ),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+        ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.host)
+        assert request.headers["host"] == "public.test"
+        assert request.extensions["sni_hostname"] == "public.test"
+        assert set(request.extensions["timeout"].values()) == {None}
+        if request.url.host == "2606:4700:4700::1111":
+            raise httpx.ConnectError("IPv6 unavailable", request=request)
+        return httpx.Response(200, text="fallback succeeded", request=request)
+
+    monkeypatch.setattr(socket, "getaddrinfo", dual_stack_dns)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await HTTPWebReader(client=client, timeout_seconds=1).read(
+            "https://public.test/article"
+        )
+
+    assert result["text"] == "fallback succeeded"
+    assert result["url"] == "https://public.test/article"
+    assert attempts == ["2606:4700:4700::1111", "93.184.216.34"]
 
 
 class FakeFiles:

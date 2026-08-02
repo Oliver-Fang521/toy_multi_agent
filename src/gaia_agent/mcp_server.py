@@ -135,48 +135,71 @@ class HTTPWebReader:
         async with asyncio.timeout(self._timeout_seconds):
             current_url = httpx.URL(url)
             for _ in range(MAX_REDIRECTS + 1):
-                pinned_url, headers, extensions = await _pin_public_url(current_url)
-                async with self._client.stream(
-                    "GET",
-                    pinned_url,
-                    headers=headers,
-                    extensions=extensions,
-                    follow_redirects=False,
-                    timeout=self._timeout_seconds,
-                ) as response:
-                    if response.is_redirect:
-                        location = response.headers.get("location")
-                        if location is None:
-                            response.raise_for_status()
-                        current_url = current_url.join(location)
-                        continue
-                    response.raise_for_status()
-                    content = bytearray()
-                    truncated = False
-                    async for chunk in response.aiter_bytes():
-                        remaining = self._max_bytes - len(content)
-                        if len(chunk) > remaining:
-                            content.extend(chunk[:remaining])
-                            truncated = True
-                            break
-                        content.extend(chunk)
-                    media_type = response.headers.get("content-type", "")
-                    text = bytes(content).decode(
-                        response.encoding or "utf-8", errors="replace"
+                pinned_urls, headers, extensions = await _pin_public_url(current_url)
+                redirect_url: httpx.URL | None = None
+                last_connect_error: httpx.ConnectError | httpx.ConnectTimeout | None = None
+                for pinned_url in pinned_urls:
+                    request = self._client.build_request(
+                        "GET",
+                        pinned_url,
+                        headers=headers,
+                        extensions=extensions,
+                        timeout=None,
                     )
-                    if "html" in media_type.lower():
-                        soup = BeautifulSoup(text, "html.parser")
-                        for element in soup(["script", "style", "noscript"]):
-                            element.decompose()
-                        text = " ".join(soup.get_text(" ", strip=True).split())
-                    return {
-                        "url": str(current_url),
-                        "status_code": response.status_code,
-                        "content_type": media_type,
-                        "text": text,
-                        "truncated": truncated,
-                    }
+                    try:
+                        response = await self._client.send(
+                            request,
+                            stream=True,
+                            follow_redirects=False,
+                        )
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+                        last_connect_error = error
+                        continue
+                    try:
+                        if response.is_redirect:
+                            location = response.headers.get("location")
+                            if location is None:
+                                response.raise_for_status()
+                            redirect_url = current_url.join(location)
+                            break
+                        return await self._read_response(response, current_url)
+                    finally:
+                        await response.aclose()
+                if redirect_url is not None:
+                    current_url = redirect_url
+                    continue
+                if last_connect_error is not None:
+                    raise last_connect_error
+                raise RuntimeError("HTTP request did not produce a response")
             raise ValueError("too many HTTP redirects")
+
+    async def _read_response(
+        self, response: httpx.Response, original_url: httpx.URL
+    ) -> dict[str, Any]:
+        response.raise_for_status()
+        content = bytearray()
+        truncated = False
+        async for chunk in response.aiter_bytes():
+            remaining = self._max_bytes - len(content)
+            if len(chunk) > remaining:
+                content.extend(chunk[:remaining])
+                truncated = True
+                break
+            content.extend(chunk)
+        media_type = response.headers.get("content-type", "")
+        text = bytes(content).decode(response.encoding or "utf-8", errors="replace")
+        if "html" in media_type.lower():
+            soup = BeautifulSoup(text, "html.parser")
+            for element in soup(["script", "style", "noscript"]):
+                element.decompose()
+            text = " ".join(soup.get_text(" ", strip=True).split())
+        return {
+            "url": str(original_url),
+            "status_code": response.status_code,
+            "content_type": media_type,
+            "text": text,
+            "truncated": truncated,
+        }
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -200,7 +223,9 @@ def _validate_public_http_url(url: str) -> None:
         raise ValueError("URL must refer to a public host")
 
 
-async def _pin_public_url(url: httpx.URL) -> tuple[httpx.URL, dict[str, str], dict[str, Any]]:
+async def _pin_public_url(
+    url: httpx.URL,
+) -> tuple[tuple[httpx.URL, ...], dict[str, str], dict[str, Any]]:
     _validate_public_http_url(str(url))
     hostname = url.host.rstrip(".").lower()
     port = url.port or (443 if url.scheme == "https" else 80)
@@ -221,7 +246,7 @@ async def _pin_public_url(url: httpx.URL) -> tuple[httpx.URL, dict[str, str], di
     parsed_addresses = [ipaddress.ip_address(address) for address in addresses]
     if any(not _is_global_address(address) for address in parsed_addresses):
         raise ValueError("URL must refer to a public host")
-    pinned = url.copy_with(host=str(parsed_addresses[0]))
+    pinned = tuple(url.copy_with(host=str(address)) for address in parsed_addresses)
     host_header = url.netloc.decode("ascii")
     headers = {"Host": host_header, "Connection": "close"}
     extensions: dict[str, Any] = {}
