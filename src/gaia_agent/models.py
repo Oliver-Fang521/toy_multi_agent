@@ -61,6 +61,9 @@ class Usage(FrozenModel):
     total_tokens: int = 0
 
 
+HOSTED_USAGE_METADATA_KEY = "__gaia_usage__"
+
+
 class AgentResult(FrozenModel):
     specialist: SpecialistName
     evidence: tuple[Evidence, ...] = ()

@@ -9,7 +9,7 @@ from typing import Any, Self
 import pytest
 
 from gaia_agent.config import RunConfig
-from gaia_agent.mcp_client import ToolExecutionError
+from gaia_agent.mcp_client import AttachmentPolicyError, ToolExecutionError
 from gaia_agent.models import (
     AgentPlan,
     AgentResult,
@@ -64,12 +64,15 @@ class FakeSpecialist:
         *,
         tool_calls: list[tuple[str, dict[str, Any]]] | None = None,
         error: Exception | None = None,
+        usage_on_error: Usage | None = None,
     ) -> None:
         self.name = name
         self.calls = calls
         self.results = deque(results)
         self.tool_calls = tool_calls or []
         self.error = error
+        self.usage_on_error = usage_on_error or Usage()
+        self.last_usage = Usage()
         self.tasks: list[GaiaTask] = []
         self.prior_evidence: list[tuple[Evidence, ...]] = []
 
@@ -80,14 +83,18 @@ class FakeSpecialist:
         evidence: tuple[Evidence, ...],
         tools: Any,
     ) -> AgentResult:
+        self.last_usage = Usage()
         self.calls.append(self.name.value)
         self.tasks.append(task)
         self.prior_evidence.append(evidence)
-        if self.error is not None:
-            raise self.error
         for name, arguments in self.tool_calls:
             await tools.call(name, arguments)
-        return self.results.popleft()
+        if self.error is not None:
+            self.last_usage = self.usage_on_error
+            raise self.error
+        result = self.results.popleft()
+        self.last_usage = result.usage
+        return result
 
 
 class FakeCritic:
@@ -130,9 +137,12 @@ class FakeCritic:
 
 
 class FakeTools(AbstractAsyncContextManager["FakeTools"]):
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(self, calls: list[str], *, usage_by_tool: dict[str, Usage] | None = None) -> None:
         self.calls = calls
         self.call_arguments: list[tuple[str, dict[str, Any]]] = []
+        self.attachment_reads: list[Path] = []
+        self.usage = Usage()
+        self.usage_by_tool = usage_by_tool or {}
         self.tool_specs = tuple(
             ToolSpec(
                 name=name,
@@ -167,7 +177,18 @@ class FakeTools(AbstractAsyncContextManager["FakeTools"]):
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(name)
         self.call_arguments.append((name, arguments))
+        charged = self.usage_by_tool.get(name, Usage())
+        self.usage = Usage(
+            input_tokens=self.usage.input_tokens + charged.input_tokens,
+            output_tokens=self.usage.output_tokens + charged.output_tokens,
+            reasoning_tokens=self.usage.reasoning_tokens + charged.reasoning_tokens,
+            total_tokens=self.usage.total_tokens + charged.total_tokens,
+        )
         return {"accepted": True} if name == "submit_answer" else {"result": "observable"}
+
+    async def read_attachment_bytes(self, path: Path) -> bytes:
+        self.attachment_reads.append(path)
+        return path.read_bytes()
 
 
 class FakeToolFactory:
@@ -357,6 +378,65 @@ async def test_orchestrator_aggregates_planner_specialist_and_every_critic_usage
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_adds_hosted_tool_usage_once_on_success() -> None:
+    calls: list[str] = []
+    source = _evidence("source-1", "source")
+    lookup = FakeSpecialist(
+        SpecialistName.LOOKUP,
+        calls,
+        [
+            _result(
+                SpecialistName.LOOKUP,
+                (source,),
+                "Marie Curie",
+                usage=Usage(input_tokens=2, total_tokens=2),
+            )
+        ],
+        tool_calls=[("web_search", {"query": "synthetic element"})],
+    )
+    tools = FakeTools(
+        calls,
+        usage_by_tool={"web_search": Usage(input_tokens=13, output_tokens=5, total_tokens=18)},
+    )
+
+    result = await _orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={SpecialistName.LOOKUP: lookup},
+        critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
+        tools=tools,
+    ).run(_task())
+
+    assert result.usage == Usage(input_tokens=15, output_tokens=5, total_tokens=20)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_keeps_hosted_and_malformed_specialist_usage_on_failure() -> None:
+    calls: list[str] = []
+    lookup = FakeSpecialist(
+        SpecialistName.LOOKUP,
+        calls,
+        [],
+        tool_calls=[("web_search", {"query": "synthetic element"})],
+        error=ValueError("malformed specialist output"),
+        usage_on_error=Usage(output_tokens=7, total_tokens=7),
+    )
+    tools = FakeTools(
+        calls,
+        usage_by_tool={"web_search": Usage(input_tokens=11, output_tokens=3, total_tokens=14)},
+    )
+
+    result = await _orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={SpecialistName.LOOKUP: lookup},
+        critic=FakeCritic(calls, []),
+        tools=tools,
+    ).run(_task())
+
+    assert result.error_category == TerminalErrorCategory.MALFORMED_RESPONSE
+    assert result.usage == Usage(input_tokens=11, output_tokens=10, total_tokens=21)
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_routes_every_specialist_in_plan_order(tmp_path: Path) -> None:
     calls: list[str] = []
     roles = tuple(SpecialistName)
@@ -403,6 +483,42 @@ async def test_orchestrator_routes_every_specialist_in_plan_order(tmp_path: Path
         "evidence-0003",
         "evidence-0004",
     )
+
+
+@pytest.mark.asyncio
+async def test_budget_wrapper_delegates_visual_attachment_policy_read(tmp_path: Path) -> None:
+    calls: list[str] = []
+    attachment = tmp_path / "registered.png"
+    attachment.write_bytes(b"image")
+
+    class AttachmentReadingVisual:
+        last_usage = Usage()
+
+        async def run(
+            self,
+            task: GaiaTask,
+            step: PlanStep,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> AgentResult:
+            assert await tools.read_attachment_bytes(task.attachment_path) == b"image"
+            return _result(
+                SpecialistName.VISUAL,
+                (_evidence("visual-1", "visual"),),
+                "blue",
+            )
+
+    tools = FakeTools(calls)
+    result = await Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.VISUAL)),
+        specialists={SpecialistName.VISUAL: AttachmentReadingVisual()},
+        critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
+        tool_client_factory=FakeToolFactory(tools),
+        config=_config(),
+    ).run(_task(attachment_path=attachment))
+
+    assert result.answer == "blue"
+    assert tools.attachment_reads == [attachment]
 
 
 @pytest.mark.asyncio
@@ -844,6 +960,28 @@ async def test_attachment_specialist_without_registered_file_is_an_attachment_er
 
     assert result.error_category == TerminalErrorCategory.ATTACHMENT_ERROR
     assert calls == ["planner"]
+
+
+@pytest.mark.asyncio
+async def test_visual_attachment_policy_failure_is_an_attachment_error(tmp_path: Path) -> None:
+    calls: list[str] = []
+    attachment = tmp_path / "registered.png"
+    attachment.write_bytes(b"image")
+    visual = FakeSpecialist(
+        SpecialistName.VISUAL,
+        calls,
+        [],
+        error=AttachmentPolicyError("attachment changed during read"),
+    )
+
+    result = await _orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.VISUAL)),
+        specialists={SpecialistName.VISUAL: visual},
+        critic=FakeCritic(calls, []),
+        tools=FakeTools(calls),
+    ).run(_task(attachment_path=attachment))
+
+    assert result.error_category == TerminalErrorCategory.ATTACHMENT_ERROR
 
 
 @pytest.mark.asyncio

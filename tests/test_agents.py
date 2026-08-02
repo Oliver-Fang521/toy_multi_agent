@@ -205,6 +205,82 @@ async def test_specialist_filters_mcp_specs_and_parses_typed_result(
 
 
 @pytest.mark.asyncio
+async def test_specialist_usage_survives_malformed_semantic_output(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "lookup", "evidence": "not-an-array", "candidate_answer": None},
+        usage=Usage(input_tokens=9, output_tokens=4, total_tokens=13),
+    )
+    agent = LookupAgent(fake_provider)
+
+    with pytest.raises(ValueError):
+        await agent.run(
+            task,
+            PlanStep(specialist="lookup", instruction="Find a source"),
+            (),
+            fake_tools,
+        )
+
+    assert agent.last_usage == Usage(input_tokens=9, output_tokens=4, total_tokens=13)
+
+
+@pytest.mark.asyncio
+async def test_specialist_usage_is_task_local_without_stale_or_concurrent_leakage(
+    task, fake_tools
+) -> None:
+    release_first = asyncio.Event()
+
+    class InterleavingProvider:
+        async def complete(
+            self, request: ModelRequest, executor: object | None = None
+        ) -> ModelResponse:
+            context = json.loads(request.input_items[0]["content"][0]["text"])
+            if context["task_id"] == "first":
+                await release_first.wait()
+                usage = Usage(input_tokens=3, total_tokens=3)
+            else:
+                release_first.set()
+                usage = Usage(output_tokens=5, total_tokens=5)
+            return ModelResponse(
+                parsed={"specialist": "lookup", "evidence": [], "candidate_answer": "answer"},
+                usage=usage,
+            )
+
+    agent = LookupAgent(InterleavingProvider())
+    step = PlanStep(specialist="lookup", instruction="Find a source")
+
+    async def invoke(task_id: str) -> Usage:
+        await agent.run(task.model_copy(update={"task_id": task_id}), step, (), fake_tools)
+        if task_id == "second":
+            await asyncio.sleep(0.01)
+        return agent.last_usage
+
+    first, second = await asyncio.gather(invoke("first"), invoke("second"))
+
+    assert first == Usage(input_tokens=3, total_tokens=3)
+    assert second == Usage(output_tokens=5, total_tokens=5)
+
+
+@pytest.mark.asyncio
+async def test_specialist_usage_resets_before_a_provider_failure(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "lookup", "evidence": [], "candidate_answer": "answer"},
+        usage=Usage(input_tokens=9, total_tokens=9),
+    )
+    agent = LookupAgent(fake_provider)
+    step = PlanStep(specialist="lookup", instruction="Find a source")
+
+    await agent.run(task, step, (), fake_tools)
+    with pytest.raises(IndexError):
+        await agent.run(task, step, (), fake_tools)
+
+    assert agent.last_usage == Usage()
+
+
+@pytest.mark.asyncio
 async def test_file_agent_routes_registered_attachment_without_exposing_gold(
     fake_provider, fake_tools, image_task
 ) -> None:

@@ -143,6 +143,13 @@ class SpecialistAgent:
         self.provider = provider
         self.reasoning_effort = reasoning_effort
         self.max_tool_calls = max_tool_calls
+        self._last_usage: ContextVar[Usage | None] = ContextVar(
+            f"specialist_usage_{id(self)}", default=None
+        )
+
+    @property
+    def last_usage(self) -> Usage:
+        return self._last_usage.get() or Usage()
 
     async def run(
         self,
@@ -151,6 +158,7 @@ class SpecialistAgent:
         evidence: tuple[Evidence, ...],
         tools: MCPToolClient,
     ) -> AgentResult:
+        self._last_usage.set(Usage())
         if step.specialist != self.name:
             raise ValueError(
                 f"step specialist {step.specialist.value} does not match agent {self.name.value}"
@@ -164,13 +172,20 @@ class SpecialistAgent:
         output_schema = _agent_result_schema(self.name, self.allowed_evidence_kinds)
         request = ModelRequest(
             instructions=self.instructions,
-            input_items=_specialist_input(task, step, evidence, visual=self.name == "visual"),
+            input_items=await _specialist_input(
+                task,
+                step,
+                evidence,
+                visual=self.name == "visual",
+                tools=tools,
+            ),
             output_schema=output_schema,
             allowed_tools=allowed_tools,
             max_tool_calls=self.max_tool_calls,
             reasoning_effort=self.reasoning_effort,
         )
         response = await self.provider.complete(request, tools)
+        self._last_usage.set(response.usage)
         result = AgentResult.model_validate(response.parsed)
         if result.specialist != self.name:
             raise ValueError(
@@ -364,12 +379,13 @@ def _agent_result_schema(
     return schema
 
 
-def _specialist_input(
+async def _specialist_input(
     task: GaiaTask,
     step: PlanStep,
     evidence: tuple[Evidence, ...],
     *,
     visual: bool,
+    tools: MCPToolClient,
 ) -> tuple[dict[str, Any], ...]:
     attachment = _attachment_metadata(task)
     context = {
@@ -392,7 +408,9 @@ def _specialist_input(
         media_type = attachment["media_type"] if attachment is not None else "image/png"
         if not str(media_type).startswith("image/"):
             raise ValueError("visual agent requires an image attachment")
-        encoded = b64encode(task.attachment_path.read_bytes()).decode("ascii")
+        encoded = b64encode(
+            await tools.read_attachment_bytes(task.attachment_path)
+        ).decode("ascii")
         content.append(
             {
                 "type": "input_image",

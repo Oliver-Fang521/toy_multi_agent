@@ -26,6 +26,8 @@ from pypdf import PdfReader
 from pypdf import filters as pypdf_filters
 from pypdf.errors import LimitReachedError
 
+from gaia_agent.models import HOSTED_USAGE_METADATA_KEY, Usage
+
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
 MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
@@ -485,7 +487,8 @@ class HostedOpenAIBackend:
                 url = _field(source, "url")
                 if url:
                     sources.append({"url": url, "title": _field(source, "title")})
-        return {"answer": response.output_text, "sources": sources}
+        result = {"answer": response.output_text, "sources": sources}
+        return _with_response_usage(result, response)
 
     async def execute_python(self, instruction: str, paths: list[str]) -> dict[str, Any]:
         file_ids = [await self._upload_registered(path) for path in paths]
@@ -513,7 +516,8 @@ class HostedOpenAIBackend:
         for item in response.output:
             if _field(item, "type") == "code_interpreter_call":
                 outputs.extend(_jsonable(output) for output in (_field(item, "outputs", []) or []))
-        return {"output_text": response.output_text, "outputs": outputs}
+        result = {"output_text": response.output_text, "outputs": outputs}
+        return _with_response_usage(result, response)
 
     async def _upload_registered(self, path: str) -> str:
         resolved = self._attachments.resolve_registered(path)
@@ -532,6 +536,23 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _with_response_usage(result: dict[str, Any], response: Any) -> dict[str, Any]:
+    raw_usage = _field(response, "usage")
+    if raw_usage is None:
+        return result
+    output_details = _field(raw_usage, "output_tokens_details")
+    usage = Usage(
+        input_tokens=_field(raw_usage, "input_tokens", 0) or 0,
+        output_tokens=_field(raw_usage, "output_tokens", 0) or 0,
+        reasoning_tokens=_field(output_details, "reasoning_tokens", 0) or 0,
+        total_tokens=_field(raw_usage, "total_tokens", 0) or 0,
+    )
+    return {
+        **result,
+        HOSTED_USAGE_METADATA_KEY: usage.model_dump(mode="json"),
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -616,7 +637,12 @@ async def _safe_tool_call(
 ) -> dict[str, Any]:
     try:
         result = await operation if hasattr(operation, "__await__") else operation()
-        return _bounded_result(_redact(result, settings.secrets))
+        redacted = _redact(result, settings.secrets)
+        usage = redacted.pop(HOSTED_USAGE_METADATA_KEY, None)
+        bounded = _bounded_result(redacted)
+        if usage is not None:
+            bounded[HOSTED_USAGE_METADATA_KEY] = usage
+        return bounded
     # This is the server boundary: redact arbitrary backend/parser failures before
     # MCP serializes them into consumer-visible tool errors.
     except Exception as error:  # noqa: BLE001

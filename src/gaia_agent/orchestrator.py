@@ -11,10 +11,11 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from gaia_agent.config import RunConfig
-from gaia_agent.mcp_client import ToolExecutionError
+from gaia_agent.mcp_client import AttachmentPolicyError, ToolExecutionError
 from gaia_agent.models import (
     AgentPlan,
     AgentResult,
@@ -39,6 +40,8 @@ class Planner(Protocol):
 
 
 class Specialist(Protocol):
+    last_usage: Usage
+
     async def run(
         self,
         task: GaiaTask,
@@ -106,6 +109,9 @@ class _BudgetedToolClient:
     @property
     def tool_specs(self) -> tuple[ToolSpec, ...]:
         return tuple(self._client.tool_specs)
+
+    async def read_attachment_bytes(self, path: Path | str) -> bytes:
+        return await self._client.read_attachment_bytes(path)
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         signature = json.dumps(
@@ -180,19 +186,19 @@ class Orchestrator:
         state = _TaskState()
         execution_task = task.model_copy(update={"final_answer": ""})
         budgeted_tools: _BudgetedToolClient | None = None
+        raw_tools: Any | None = None
+        prediction: TaskPrediction | None = None
+        category: TerminalErrorCategory | None = None
         try:
             async with asyncio.timeout(self._config.timeout_seconds):
-                async with self._tool_client_factory(execution_task) as raw_tools:
+                async with self._tool_client_factory(execution_task) as active_tools:
+                    raw_tools = active_tools
                     budgeted_tools = _BudgetedToolClient(
-                        raw_tools,
+                        active_tools,
                         max_calls=self._config.max_tool_calls,
                         audit=self._audit,
                     )
                     prediction = await self._execute(state, execution_task, budgeted_tools)
-            self.tool_call_count = budgeted_tools.call_count
-            return prediction.model_copy(
-                update={"duration_seconds": time.monotonic() - started}
-            )
         except TimeoutError:
             category = TerminalErrorCategory.TIMEOUT
         except _ToolBudgetExhausted:
@@ -203,6 +209,8 @@ class Orchestrator:
             category = TerminalErrorCategory.CRITIC_REJECTION
         except _AttachmentUnavailable:
             category = TerminalErrorCategory.ATTACHMENT_ERROR
+        except AttachmentPolicyError:
+            category = TerminalErrorCategory.ATTACHMENT_ERROR
         except (FileNotFoundError, IsADirectoryError, PermissionError):
             category = TerminalErrorCategory.ATTACHMENT_ERROR
         except (ValueError, TypeError, KeyError):
@@ -211,9 +219,23 @@ class Orchestrator:
             category = TerminalErrorCategory.RETRY_EXHAUSTED
         except Exception:  # noqa: BLE001 - task isolation requires a terminal result
             category = TerminalErrorCategory.RETRY_EXHAUSTED
+        finally:
+            if raw_tools is not None:
+                state.usage = _add_usage(
+                    state.usage,
+                    getattr(raw_tools, "usage", Usage()),
+                )
         if budgeted_tools is not None:
             self.tool_call_count = budgeted_tools.call_count
         self.step_count = state.step_count
+        if prediction is not None:
+            return prediction.model_copy(
+                update={
+                    "duration_seconds": time.monotonic() - started,
+                    "usage": state.usage,
+                }
+            )
+        assert category is not None
         self._audit(
             "terminal_failure",
             {"category": category.value, "critic_verdict": state.critic_verdict},
@@ -294,7 +316,10 @@ class Orchestrator:
                 "step_number": state.step_count,
             },
         )
-        result = await specialist.run(task, step, tuple(state.evidence), tools)
+        try:
+            result = await specialist.run(task, step, tuple(state.evidence), tools)
+        finally:
+            state.usage = _add_usage(state.usage, specialist.last_usage)
         trusted_evidence_ids = self._record_result(state, step, result)
         self._audit(
             f"{event_prefix}_completed",
@@ -343,7 +368,6 @@ class Orchestrator:
                 raise ValueError("candidate answer must use the concise GAIA format")
             state.candidate = candidate
             state.candidate_origins[state.step_count] = candidate
-        state.usage = _add_usage(state.usage, result.usage)
         return tuple(trusted_ids)
 
     async def _verify(

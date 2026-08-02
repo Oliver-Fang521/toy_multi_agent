@@ -1,3 +1,4 @@
+import asyncio
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,9 @@ class FakeToolClient:
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((name, arguments))
         raise AssertionError("fake provider must not call tools unless a test explicitly enables it")
+
+    async def read_attachment_bytes(self, path: Path) -> bytes:
+        return await asyncio.to_thread(path.read_bytes)
 
 
 @pytest.fixture

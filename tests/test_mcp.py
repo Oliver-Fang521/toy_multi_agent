@@ -1,5 +1,8 @@
+import asyncio
 import json
+import os
 import socket
+import time
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +17,7 @@ from pypdf.generic import DecodedStreamObject, NameObject
 
 from gaia_agent import mcp_server
 from gaia_agent.config import RunConfig
-from gaia_agent.mcp_client import MCPToolClient, ToolExecutionError
+from gaia_agent.mcp_client import AttachmentPolicyError, MCPToolClient, ToolExecutionError
 from gaia_agent.mcp_server import (
     AttachmentReader,
     HostedOpenAIBackend,
@@ -22,6 +25,7 @@ from gaia_agent.mcp_server import (
     MCPServerSettings,
     build_server,
 )
+from gaia_agent.models import Usage
 
 
 @pytest.fixture
@@ -256,6 +260,173 @@ async def test_stdio_results_are_recursively_redacted(
 
 
 @pytest.mark.asyncio
+async def test_mcp_client_strips_and_accumulates_reserved_hosted_usage(
+    tmp_path: Path, run_config: RunConfig
+) -> None:
+    responses = {
+        "web_search": {
+            "answer": "result",
+            "sources": [],
+            "__gaia_usage__": {
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "reasoning_tokens": 2,
+                "total_tokens": 8,
+            },
+        },
+        "execute_python": {
+            "output_text": "42",
+            "outputs": [],
+            "__gaia_usage__": {
+                "input_tokens": 7,
+                "output_tokens": 11,
+                "reasoning_tokens": 4,
+                "total_tokens": 18,
+            },
+        },
+    }
+
+    class InterleavingClient:
+        async def call_tool(self, name: str, arguments: dict[str, Any], **kwargs: Any) -> Any:
+            await asyncio.sleep(0)
+            return SimpleNamespace(
+                is_error=False,
+                structured_content=dict(responses[name]),
+                content=[],
+            )
+
+    client = MCPToolClient(task_root=tmp_path, config=run_config)
+    client._client = InterleavingClient()
+
+    search, code = await asyncio.gather(
+        client.call("web_search", {"query": "question"}),
+        client.call("execute_python", {"instruction": "6 * 7"}),
+    )
+
+    assert search == {"answer": "result", "sources": []}
+    assert code == {"output_text": "42", "outputs": []}
+    assert "__gaia_usage__" not in repr((search, code))
+    assert client.usage == Usage(
+        input_tokens=10,
+        output_tokens=16,
+        reasoning_tokens=6,
+        total_tokens=26,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_rejects_malformed_reserved_hosted_usage(
+    tmp_path: Path, run_config: RunConfig
+) -> None:
+    class MalformedUsageClient:
+        async def call_tool(self, name: str, arguments: dict[str, Any], **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                is_error=False,
+                structured_content={
+                    "answer": "result",
+                    "sources": [],
+                    "__gaia_usage__": {
+                        "input_tokens": 3,
+                        "output_tokens": 5,
+                        "reasoning_tokens": 2,
+                        "total_tokens": 8,
+                        "unexpected": 1,
+                    },
+                },
+                content=[],
+            )
+
+    client = MCPToolClient(task_root=tmp_path, config=run_config)
+    client._client = MalformedUsageClient()
+
+    with pytest.raises(ToolExecutionError, match="invalid hosted usage metadata"):
+        await client.call("web_search", {"query": "question"})
+
+    assert client.usage == Usage()
+
+
+@pytest.mark.asyncio
+async def test_attachment_bytes_require_registration_and_reject_symlink_swap(
+    tmp_path: Path, run_config: RunConfig
+) -> None:
+    attachment = tmp_path / "registered.png"
+    attachment.write_bytes(b"registered")
+    unregistered = tmp_path / "unregistered.png"
+    unregistered.write_bytes(b"private")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.png"
+    outside.write_bytes(b"outside")
+    client = MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        attachments=(attachment,),
+    )
+
+    with pytest.raises(AttachmentPolicyError, match="not registered"):
+        await client.read_attachment_bytes(unregistered)
+
+    attachment.unlink()
+    attachment.symlink_to(outside)
+    with pytest.raises(AttachmentPolicyError, match="outside task root|not registered|changed"):
+        await client.read_attachment_bytes(attachment)
+
+
+@pytest.mark.asyncio
+async def test_attachment_bytes_reject_sparse_file_over_32_mib_without_reading(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attachment = tmp_path / "large.png"
+    with attachment.open("wb") as stream:
+        stream.truncate(32 * 1024 * 1024 + 1)
+    client = MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        attachments=(attachment,),
+    )
+    reads: list[int] = []
+    original_read = os.read
+
+    def tracked_read(fd: int, size: int) -> bytes:
+        reads.append(size)
+        return original_read(fd, size)
+
+    monkeypatch.setattr(os, "read", tracked_read)
+
+    with pytest.raises(AttachmentPolicyError, match="exceeds size limit"):
+        await client.read_attachment_bytes(attachment)
+
+    assert reads == []
+
+
+@pytest.mark.asyncio
+async def test_attachment_bytes_are_read_off_the_event_loop(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attachment = tmp_path / "image.png"
+    attachment.write_bytes(b"image bytes")
+    client = MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        attachments=(attachment,),
+    )
+    original_read = os.read
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_read(fd: int, size: int) -> bytes:
+        loop.call_soon_threadsafe(started.set)
+        time.sleep(0.05)
+        return original_read(fd, size)
+
+    monkeypatch.setattr(os, "read", slow_read)
+    read_task = asyncio.create_task(client.read_attachment_bytes(attachment))
+    await started.wait()
+    await asyncio.sleep(0)
+
+    assert not read_task.done()
+    assert await read_task == b"image bytes"
+
+
+@pytest.mark.asyncio
 async def test_http_reader_extracts_html_text_and_final_url(public_dns: None) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == httpx.URL("https://93.184.216.34/article")
@@ -452,6 +623,12 @@ class FakeHostedClient:
 async def test_hosted_search_requires_web_tool_and_extracts_sources(tmp_path: Path) -> None:
     response = SimpleNamespace(
         output_text="The answer",
+        usage=SimpleNamespace(
+            input_tokens=13,
+            output_tokens=5,
+            total_tokens=18,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=2),
+        ),
         output=[
             SimpleNamespace(
                 type="web_search_call",
@@ -491,6 +668,12 @@ async def test_hosted_search_requires_web_tool_and_extracts_sources(tmp_path: Pa
             {"url": "https://one.test", "title": "One"},
             {"url": "https://two.test", "title": "Two"},
         ],
+        "__gaia_usage__": {
+            "input_tokens": 13,
+            "output_tokens": 5,
+            "reasoning_tokens": 2,
+            "total_tokens": 18,
+        },
     }
 
 
@@ -504,6 +687,12 @@ async def test_code_interpreter_uses_only_registered_files_and_caches_uploads(
     unregistered.write_text("secret", encoding="utf-8")
     response = SimpleNamespace(
         output_text="42",
+        usage=SimpleNamespace(
+            input_tokens=17,
+            output_tokens=7,
+            total_tokens=24,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=3),
+        ),
         output=[
             SimpleNamespace(
                 type="code_interpreter_call",
@@ -542,7 +731,16 @@ async def test_code_interpreter_uses_only_registered_files_and_caches_uploads(
         "include": ["code_interpreter_call.outputs"],
         "reasoning": {"effort": "medium"},
     }
-    assert first == {"output_text": "42", "outputs": [{"type": "logs", "logs": "42"}]}
+    assert first == {
+        "output_text": "42",
+        "outputs": [{"type": "logs", "logs": "42"}],
+        "__gaia_usage__": {
+            "input_tokens": 17,
+            "output_tokens": 7,
+            "reasoning_tokens": 3,
+            "total_tokens": 24,
+        },
+    }
     assert second["output_text"] == "42"
     with pytest.raises(ValueError, match="not registered"):
         await backend.execute_python("steal", ["private.csv"])
