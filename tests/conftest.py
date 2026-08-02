@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from gaia_agent.models import GaiaTask, Usage
-from gaia_agent.providers import ModelRequest, ModelResponse, ToolSpec
+from gaia_agent.providers import ModelRequest, ModelResponse, ToolEvent, ToolSpec
 
 
 class FakeProvider:
@@ -19,8 +19,15 @@ class FakeProvider:
         parsed: dict[str, Any],
         *,
         usage: Usage | None = None,
+        tool_events: tuple[ToolEvent, ...] = (),
     ) -> None:
-        self._responses.append(ModelResponse(parsed=parsed, usage=usage or Usage()))
+        self._responses.append(
+            ModelResponse(
+                parsed=parsed,
+                usage=usage or Usage(),
+                tool_events=tool_events,
+            )
+        )
 
     async def complete(
         self,

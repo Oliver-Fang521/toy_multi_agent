@@ -13,6 +13,7 @@ from gaia_agent.agents import (
     VisualAgent,
 )
 from gaia_agent.models import Evidence, PlanStep, SpecialistName, Usage
+from gaia_agent.providers import ToolEvent
 
 
 @pytest.mark.asyncio
@@ -28,6 +29,7 @@ async def test_planner_emits_bounded_specialist_steps_without_tools(fake_provide
 
     assert plan.steps[0].specialist == SpecialistName.LOOKUP
     assert fake_provider.requests[0].allowed_tools == ()
+    assert fake_provider.requests[0].max_tool_calls == 0
     assert fake_provider.executors == [None]
 
 
@@ -304,6 +306,41 @@ async def test_specialist_rejects_untraceable_evidence(
 
 
 @pytest.mark.asyncio
+async def test_specialist_rejects_evidence_id_already_present_in_prior_evidence(
+    fake_provider, fake_tools, task
+) -> None:
+    prior = (
+        Evidence(
+            evidence_id="source-1",
+            kind="source",
+            summary="Prior source",
+            source_url="https://prior.example/fact",
+        ),
+    )
+    fake_provider.return_parsed(
+        {
+            "specialist": "lookup",
+            "evidence": [
+                {
+                    "evidence_id": "source-1",
+                    "kind": "source",
+                    "summary": "New source reuses the prior ID",
+                    "source_url": "https://new.example/fact",
+                }
+            ],
+            "candidate_answer": None,
+        }
+    )
+    step = PlanStep(specialist="lookup", instruction="Find another source")
+
+    with pytest.raises(
+        ValueError,
+        match=r"evidence IDs duplicate prior evidence: \['source-1'\]",
+    ):
+        await LookupAgent(fake_provider).run(task, step, prior, fake_tools)
+
+
+@pytest.mark.asyncio
 async def test_specialist_rejects_a_result_for_the_wrong_role(fake_provider, fake_tools, task) -> None:
     fake_provider.return_parsed(
         {"specialist": "computation", "evidence": [], "candidate_answer": "42"}
@@ -419,6 +456,76 @@ async def test_critic_correction_is_single_and_verdict_scoped(
 
     with pytest.raises(ValueError, match=message):
         await CriticAgent(fake_provider).verify(task, "candidate", (), fake_tools)
+
+
+@pytest.mark.asyncio
+async def test_critic_rejects_ungrounded_revision_without_evidence_or_tool_event(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": "revise",
+            "feedback": "Claims a correction without checking anything",
+            "checked_evidence_ids": [],
+            "corrected_answer": "42",
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="revised critic decision must be grounded in checked evidence or an allowed tool event",
+    ):
+        await CriticAgent(fake_provider).verify(task, "41", (), fake_tools)
+
+
+@pytest.mark.asyncio
+async def test_critic_accepts_revision_grounded_in_known_evidence(
+    fake_provider, fake_tools, task
+) -> None:
+    evidence = (
+        Evidence(
+            evidence_id="computation-1",
+            kind="computation",
+            summary="The checked calculation returns 42",
+        ),
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "revise",
+            "feedback": "The checked calculation contradicts the candidate",
+            "checked_evidence_ids": ["computation-1"],
+            "corrected_answer": "42",
+        }
+    )
+
+    decision = await CriticAgent(fake_provider).verify(task, "41", evidence, fake_tools)
+
+    assert decision.corrected_answer == "42"
+
+
+@pytest.mark.asyncio
+async def test_critic_accepts_revision_grounded_in_observable_allowed_tool_event(
+    fake_provider, fake_tools, task
+) -> None:
+    tool_event = ToolEvent(
+        call_id="call-1",
+        name="execute_python",
+        arguments={"instruction": "Independently calculate the answer"},
+        output={"output_text": "42", "outputs": []},
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "revise",
+            "feedback": "The independent calculation contradicts the candidate",
+            "checked_evidence_ids": [],
+            "corrected_answer": "42",
+        },
+        tool_events=(tool_event,),
+    )
+
+    decision = await CriticAgent(fake_provider).verify(task, "41", (), fake_tools)
+
+    assert decision.corrected_answer == "42"
 
 
 @pytest.mark.asyncio

@@ -151,6 +151,14 @@ class SpecialistAgent:
                 f"result specialist {result.specialist.value} does not match agent {self.name.value}"
             )
         _validate_evidence(result.evidence, self.allowed_evidence_kinds)
+        prior_ids = {item.evidence_id for item in evidence}
+        duplicate_prior_ids = sorted(
+            item.evidence_id for item in result.evidence if item.evidence_id in prior_ids
+        )
+        if duplicate_prior_ids:
+            raise ValueError(
+                f"evidence IDs duplicate prior evidence: {duplicate_prior_ids}"
+            )
         candidate = _normalize_candidate_answer(result.candidate_answer)
         return result.model_copy(update={"candidate_answer": candidate, "usage": response.usage})
 
@@ -287,6 +295,19 @@ class CriticAgent:
             raise ValueError(f"critic checked unknown evidence IDs: {sorted(unknown_ids)}")
         if len(set(decision.checked_evidence_ids)) != len(decision.checked_evidence_ids):
             raise ValueError("critic checked evidence IDs must be unique")
+        has_allowed_tool_evidence = any(
+            event.name in self.allowed_tool_names and bool(event.output)
+            for event in response.tool_events
+        )
+        if (
+            decision.verdict == "revise"
+            and not decision.checked_evidence_ids
+            and not has_allowed_tool_evidence
+        ):
+            raise ValueError(
+                "revised critic decision must be grounded in checked evidence "
+                "or an allowed tool event"
+            )
         return decision.model_copy(update={"corrected_answer": corrected_answer})
 
 
