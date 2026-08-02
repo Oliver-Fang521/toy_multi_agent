@@ -25,18 +25,44 @@ from gaia_agent.models import (
 _TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _OPAQUE_EVIDENCE_ID_PATTERN = re.compile(r"evidence-[0-9]{4}\Z")
 _SECRET_VALUE_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]+\b"),
-    re.compile(r"\bhf_[A-Za-z0-9_-]+\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]+\b", flags=re.IGNORECASE),
+    re.compile(r"\bhf_[A-Za-z0-9_-]+\b", flags=re.IGNORECASE),
     re.compile(r"\bBearer\s+[A-Za-z0-9._-]+\b", flags=re.IGNORECASE),
+    re.compile(r"api[_ -]?key|secret|token|password|credential|authorization", flags=re.IGNORECASE),
 )
 _PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _PUBLIC_PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _PUBLIC_TOOL_NAMES = frozenset(
     {"web_search", "read_webpage", "execute_python", "read_attachment", "submit_answer"}
 )
-_PUBLIC_ARGUMENT_KEYS = frozenset(
-    {"query", "url", "instruction", "code", "path", "attachment_ids", "answer", "evidence_ids"}
-)
+_PUBLIC_TOOL_ARGUMENT_KEYS = {
+    "web_search": frozenset({"query"}),
+    "read_webpage": frozenset({"url"}),
+    "execute_python": frozenset({"instruction", "code", "paths", "attachment_ids", "file_ids"}),
+    "read_attachment": frozenset({"path"}),
+    "submit_answer": frozenset({"answer", "evidence_ids"}),
+}
+_PUBLIC_TOOL_RESULT_KEYS = {
+    "web_search": frozenset({"answer", "sources"}),
+    "read_webpage": frozenset({"url", "status_code", "content_type", "text", "truncated"}),
+    "execute_python": frozenset({"output_text", "outputs"}),
+    "read_attachment": frozenset(
+        {
+            "path",
+            "kind",
+            "type",
+            "text",
+            "rows",
+            "data",
+            "page_count",
+            "sheets",
+            "media_type",
+            "size_bytes",
+            "metadata",
+        }
+    ),
+    "submit_answer": frozenset({"answer", "evidence_ids"}),
+}
 _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
     {
         "tool_call_started",
@@ -57,7 +83,7 @@ _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
         "submit_completed",
     }
 )
-_PUBLIC_CRITIC_VERDICTS = frozenset({"approve", "revise", "insufficient_evidence"})
+_PUBLIC_CRITIC_VERDICTS = frozenset({"approve", "revise", "insufficient_evidence", "not_run"})
 _PREDICTION_KEYS = frozenset(
     {
         "task_id",
@@ -101,10 +127,13 @@ class RunManifest(FrozenModel):
     expected_levels: dict[str, Literal[1, 2, 3]]
     sample_size: int
     seed: int
+    run_id: str = "gaia-run"
     model: str
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"]
+    dataset_name: str = "gaia-benchmark"
     dataset_revision: str
     dataset_configuration: str = "2023_all"
+    dataset_split: str = "validation"
     limits: dict[str, int | float] = Field(default_factory=dict)
     package_versions: dict[str, str] = Field(default_factory=dict)
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -122,19 +151,23 @@ class RunManifest(FrozenModel):
         for task_id in self.selected_task_ids:
             _validate_task_id(task_id)
         for value_name, value in (
+            ("run_id", self.run_id),
             ("model", self.model),
+            ("dataset_name", self.dataset_name),
             ("dataset_revision", self.dataset_revision),
             ("dataset_configuration", self.dataset_configuration),
+            ("dataset_split", self.dataset_split),
         ):
-            if not _PUBLIC_IDENTIFIER_PATTERN.fullmatch(value):
-                raise ValueError(f"{value_name} must be a bounded public identifier")
+            _validate_public_identifier(value_name, value)
         if set(self.limits) - {"max_steps", "max_tool_calls", "timeout_seconds", "votes"}:
             raise ValueError("limits contains an unsupported public key")
         if any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in self.limits.values()):
             raise ValueError("limits values must be numeric")
         if any(
             not _PUBLIC_PACKAGE_NAME_PATTERN.fullmatch(name)
+            or _contains_secret_material(name)
             or not _PUBLIC_IDENTIFIER_PATTERN.fullmatch(version)
+            or _contains_secret_material(version)
             for name, version in self.package_versions.items()
         ):
             raise ValueError("package_versions must contain bounded public identifiers")
@@ -246,7 +279,7 @@ class RunStore:
     def append_audit(self, task_id: str, event: AuditEvent) -> Path:
         if event.event_type not in _PUBLIC_AUDIT_EVENT_TYPES:
             raise ValueError("audit event_type is not public")
-        payload = _public_audit_payload(event.payload)
+        payload = _public_audit_payload(event.event_type, event.payload)
         record = {
             "sequence": event.sequence,
             "event_type": event.event_type,
@@ -379,6 +412,19 @@ class RunStore:
 def _validate_task_id(task_id: str) -> None:
     if not _TASK_ID_PATTERN.fullmatch(task_id) or task_id in {".", ".."} or ".." in task_id:
         raise ValueError("task ID must be a safe filename component")
+    if _contains_secret_material(task_id):
+        raise ValueError("task ID must not contain secret material")
+
+
+def _validate_public_identifier(value_name: str, value: str) -> None:
+    if not _PUBLIC_IDENTIFIER_PATTERN.fullmatch(value) or _contains_secret_material(value):
+        raise ValueError(f"{value_name} must be a bounded public identifier")
+
+
+def _contains_secret_material(value: str) -> bool:
+    return any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS) or any(
+        secret in value for secret in _known_secret_values()
+    )
 
 
 def _ensure_directory(directory: Path, *, root: Path | None = None) -> None:
@@ -450,7 +496,7 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
-def _public_audit_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     allowed_keys = {
         "task_id",
         "tool",
@@ -482,11 +528,6 @@ def _public_audit_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         elif key in {"call_number", "step_count", "step_number"}:
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000_000:
                 raise ValueError("audit counter must be a bounded integer")
-        elif key in {"argument_keys", "result_keys"}:
-            if not isinstance(value, list) or any(item not in _PUBLIC_ARGUMENT_KEYS for item in value):
-                raise ValueError("audit key names are not allowlisted")
-            if len(value) > 32:
-                raise ValueError("audit key names exceed the public limit")
         elif key in {"category", "critic_verdict", "verdict"}:
             if value not in _PUBLIC_CRITIC_VERDICTS | {item.value for item in TerminalErrorCategory}:
                 raise ValueError("audit category is not allowlisted")
@@ -509,6 +550,25 @@ def _public_audit_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         elif key == "has_candidate" and not isinstance(value, bool):
             raise ValueError("audit has_candidate must be boolean")
         public[key] = value
+    if event_type in {"tool_call_started", "tool_call_completed"}:
+        tool = public.get("tool")
+        if tool not in _PUBLIC_TOOL_NAMES:
+            raise ValueError("tool audit must include an allowlisted tool")
+        argument_keys = public.get("argument_keys")
+        if not isinstance(argument_keys, list) or not set(argument_keys) <= _PUBLIC_TOOL_ARGUMENT_KEYS[tool]:
+            raise ValueError("tool audit argument keys do not match the tool contract")
+        if len(argument_keys) > 32:
+            raise ValueError("tool audit argument keys exceed the public limit")
+        result_keys = public.get("result_keys")
+        if event_type == "tool_call_started" and result_keys is not None:
+            raise ValueError("tool start audit cannot include result keys")
+        if event_type == "tool_call_completed":
+            if not isinstance(result_keys, list) or not set(result_keys) <= _PUBLIC_TOOL_RESULT_KEYS[tool]:
+                raise ValueError("tool audit result keys do not match the tool contract")
+            if len(result_keys) > 32:
+                raise ValueError("tool audit result keys exceed the public limit")
+    elif "argument_keys" in public or "result_keys" in public or "tool" in public:
+        raise ValueError("non-tool audit cannot include tool metadata")
     return public
 
 
@@ -535,7 +595,7 @@ def _validate_audit_record(value: Any) -> None:
         raise ValueError("audit timestamp is invalid") from error
     if not isinstance(value["payload"], Mapping):
         raise TypeError("audit payload must be a mapping")
-    _public_audit_payload(value["payload"])
+    _public_audit_payload(value["event_type"], value["payload"])
 
 
 def _public_prediction_record(prediction: TaskPrediction) -> dict[str, Any]:
@@ -580,7 +640,7 @@ def _validated_prediction_record(
         return None
     if not isinstance(record.get("answer"), str | type(None)):
         return None
-    if not isinstance(record.get("critic_verdict"), str) or not record["critic_verdict"]:
+    if record.get("critic_verdict") not in _PUBLIC_CRITIC_VERDICTS:
         return None
     if not isinstance(record.get("duration_seconds"), int | float) or record["duration_seconds"] < 0:
         return None

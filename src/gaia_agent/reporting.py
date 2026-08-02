@@ -43,7 +43,7 @@ class EvaluationSummary(FrozenModel):
     def validate_public_report_values(self) -> EvaluationSummary:
         if set(self.by_level) != {1, 2, 3}:
             raise ValueError("by_level must contain all GAIA levels")
-        if set(self.critic_verdicts) - {"approve", "revise", "insufficient_evidence"}:
+        if set(self.critic_verdicts) - {"approve", "revise", "insufficient_evidence", "not_run"}:
             raise ValueError("critic_verdicts contains a non-public verdict")
         if set(self.failure_categories) - {item.value for item in TerminalErrorCategory}:
             raise ValueError("failure_categories contains a non-public category")

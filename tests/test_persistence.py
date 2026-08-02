@@ -6,7 +6,15 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from gaia_agent.models import AgentPlan, AuditEvent, PlanStep, SpecialistName, TaskPrediction, Usage
+from gaia_agent.models import (
+    AgentPlan,
+    AuditEvent,
+    PlanStep,
+    SpecialistName,
+    TaskPrediction,
+    TerminalErrorCategory,
+    Usage,
+)
 from gaia_agent.persistence import PublicNote, RunManifest, RunStore
 
 
@@ -111,7 +119,7 @@ def test_audit_append_is_jsonl_and_redacts_secret_values(tmp_path, prediction) -
             sequence=1,
             event_type="tool_call_started",
             timestamp=datetime(2026, 8, 2, tzinfo=UTC),
-            payload={"tool": "web_search", "call_number": 1},
+            payload={"tool": "web_search", "call_number": 1, "argument_keys": ["query"]},
         ),
     )
 
@@ -282,3 +290,99 @@ def test_manifest_rejects_markdown_injection_in_public_strings() -> None:
             reasoning_effort="medium",
             dataset_revision="synthetic-revision",
         )
+
+
+def test_task_six_terminal_not_run_prediction_and_audit_are_publicly_reportable(tmp_path, prediction) -> None:
+    from gaia_agent.reporting import summarize, write_reports
+
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+    terminal = prediction.model_copy(
+        update={
+            "answer": None,
+            "correct": False,
+            "critic_verdict": "not_run",
+            "error_category": TerminalErrorCategory.TIMEOUT,
+        }
+    )
+    store.append(terminal)
+    store.append_audit(
+        prediction.task_id,
+        AuditEvent(
+            sequence=1,
+            event_type="terminal_failure",
+            timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+            payload={"category": "timeout", "critic_verdict": "not_run"},
+        ),
+    )
+
+    _, report_path = write_reports(store, summarize(store.load_predictions()))
+
+    assert '"critic_verdict":"not_run"' in store.predictions_path.read_text()
+    assert "- not_run: 1" in report_path.read_text()
+
+
+def test_real_task_six_tool_audit_shapes_persist_only_key_names(tmp_path, prediction) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+    shapes = (
+        ("web_search", ["query"], ["answer", "sources"]),
+        ("read_webpage", ["url"], ["url", "status_code", "content_type", "text", "truncated"]),
+        ("execute_python", ["code", "paths"], ["output_text", "outputs"]),
+        ("read_attachment", ["path"], ["path", "kind", "text", "page_count", "rows", "data", "sheets", "media_type", "size_bytes"]),
+        ("submit_answer", ["answer", "evidence_ids"], ["answer", "evidence_ids"]),
+    )
+    sequence = 1
+    for tool, argument_keys, result_keys in shapes:
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=sequence,
+                event_type="tool_call_started",
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={"tool": tool, "call_number": sequence, "argument_keys": argument_keys},
+            ),
+        )
+        sequence += 1
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=sequence,
+                event_type="tool_call_completed",
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={
+                    "tool": tool,
+                    "call_number": sequence - 1,
+                    "argument_keys": argument_keys,
+                    "result_keys": result_keys,
+                },
+            ),
+        )
+        sequence += 1
+
+    audit = (store.task_directory(prediction.task_id) / "audit.jsonl").read_text()
+    assert '"result_keys":["answer","sources"]' in audit
+    assert "gated question" not in audit
+
+
+def test_manifest_rejects_known_environment_secrets_in_all_public_identifiers(tmp_path, monkeypatch) -> None:
+    secret = "env-private-value"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    values = {
+        "run_id": secret,
+        "model": secret,
+        "dataset_name": secret,
+        "dataset_revision": secret,
+        "dataset_split": secret,
+        "package_versions": {"gaia_agent": secret},
+        "selected_task_ids": ("task-1",),
+        "expected_levels": {"task-1": 1},
+    }
+    with pytest.raises(ValidationError, match="public"):
+        RunManifest(
+            sample_size=1,
+            seed=42,
+            reasoning_effort="medium",
+            **values,
+        )
+    safe = RunStore.create(tmp_path, manifest_for(["task-1"]))
+    assert secret not in "".join(path.read_text() for path in tmp_path.rglob("*"))
+    assert safe.manifest_path.exists()
