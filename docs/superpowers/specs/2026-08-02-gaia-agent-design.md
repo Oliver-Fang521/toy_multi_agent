@@ -99,20 +99,23 @@ the active specialist's allowlist, sends them through `ModelProvider`, and
 executes requested calls through the server. The initial server contains:
 
 - `web_search(query)` and `read_webpage(url)`;
-- `execute_python(code)` in a temporary, time-limited working directory;
+- `execute_python(code, attachment_ids)` through a sandboxed code backend;
 - `read_attachment(path)` for safe type-aware extraction;
 - `submit_answer(answer, evidence_ids)` as the only terminal action.
 
 `VisualAgent` sends task-contained image inputs through `ModelProvider` because
 vision is a model capability rather than a deterministic tool. The web-search
 MCP handler uses a `SearchBackend` protocol whose initial implementation uses
-OpenAI web search; this provider-specific backend remains behind the MCP
-boundary.
+OpenAI web search. The Python handler uses a `CodeBackend` protocol whose
+initial implementation uses an ephemeral OpenAI Code Interpreter container.
+These provider-specific backends remain behind the MCP boundary and can later
+be replaced by E2B or another sandbox.
 
-File access is restricted to the current task workspace, subprocesses have hard
-timeouts, outputs are size-limited, and secrets are redacted from audit events.
-The mocked end-to-end suite starts the real stdio server so the MCP transport,
-schema discovery, allowlists, and error mapping are tested rather than assumed.
+Attachment access is restricted to files registered for the current task,
+backend calls have hard timeouts, outputs are size-limited, and secrets are
+redacted from audit events. No model-generated code runs on the host. The mocked
+end-to-end suite starts the real stdio server so the MCP transport, schema
+discovery, allowlists, and error mapping are tested rather than assumed.
 
 ### 4. Quality and Verification Plane
 
