@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 from base64 import b64encode
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
@@ -15,6 +16,7 @@ from gaia_agent.models import (
     GaiaTask,
     PlanStep,
     SpecialistName,
+    Usage,
 )
 from gaia_agent.providers import ModelProvider, ModelRequest
 
@@ -74,8 +76,16 @@ class PlannerAgent:
         self.provider = provider
         self.max_steps = max_steps
         self.reasoning_effort = reasoning_effort
+        self._last_usage: ContextVar[Usage | None] = ContextVar(
+            f"planner_usage_{id(self)}", default=None
+        )
+
+    @property
+    def last_usage(self) -> Usage:
+        return self._last_usage.get() or Usage()
 
     async def plan(self, task: GaiaTask) -> AgentPlan:
+        self._last_usage.set(Usage())
         output_schema = _strict_schema(AgentPlan)
         output_schema["properties"]["steps"].update(
             {"minItems": 1, "maxItems": self.max_steps}
@@ -110,6 +120,7 @@ class PlannerAgent:
             reasoning_effort=self.reasoning_effort,
         )
         response = await self.provider.complete(request)
+        self._last_usage.set(response.usage)
         plan = AgentPlan.model_validate(response.parsed)
         if not 1 <= len(plan.steps) <= self.max_steps:
             raise ValueError(f"planner must return between 1 and {self.max_steps} steps")
@@ -248,6 +259,13 @@ class CriticAgent:
         self.provider = provider
         self.reasoning_effort = reasoning_effort
         self.max_tool_calls = max_tool_calls
+        self._last_usage: ContextVar[Usage | None] = ContextVar(
+            f"critic_usage_{id(self)}", default=None
+        )
+
+    @property
+    def last_usage(self) -> Usage:
+        return self._last_usage.get() or Usage()
 
     async def verify(
         self,
@@ -256,6 +274,7 @@ class CriticAgent:
         evidence: tuple[Evidence, ...],
         tools: MCPToolClient,
     ) -> CriticDecision:
+        self._last_usage.set(Usage())
         allowed_tools = tuple(
             tool for tool in tools.tool_specs if tool.name in self.allowed_tool_names
         )
@@ -294,6 +313,7 @@ class CriticAgent:
             reasoning_effort=self.reasoning_effort,
         )
         response = await self.provider.complete(request, tools)
+        self._last_usage.set(response.usage)
         decision = CriticDecision.model_validate(response.parsed)
         corrected_answer = _normalize_candidate_answer(decision.corrected_answer)
         if decision.verdict == "revise" and not corrected_answer:

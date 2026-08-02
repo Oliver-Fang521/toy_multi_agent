@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import string
@@ -10,7 +11,6 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
 from gaia_agent.config import RunConfig
@@ -29,9 +29,12 @@ from gaia_agent.models import (
     Usage,
 )
 from gaia_agent.providers import ToolSpec
+from gaia_agent.scoring import normalize_number
 
 
 class Planner(Protocol):
+    last_usage: Usage
+
     async def plan(self, task: GaiaTask) -> AgentPlan: ...
 
 
@@ -46,6 +49,8 @@ class Specialist(Protocol):
 
 
 class Critic(Protocol):
+    last_usage: Usage
+
     async def verify(
         self,
         task: GaiaTask,
@@ -73,10 +78,11 @@ class _AttachmentUnavailable(RuntimeError):
 
 @dataclass
 class _TaskState:
-    task: GaiaTask
     plan: AgentPlan | None = None
     evidence: list[Evidence] = field(default_factory=list)
     evidence_origins: dict[str, int] = field(default_factory=dict)
+    raw_evidence_id_digests: set[bytes] = field(default_factory=set)
+    candidate_origins: dict[int, str] = field(default_factory=dict)
     candidate: str | None = None
     usage: Usage = field(default_factory=Usage)
     step_count: int = 0
@@ -171,7 +177,7 @@ class Orchestrator:
         self.correction_count = 0
         self.step_count = 0
         self.tool_call_count = 0
-        state = _TaskState(task=task)
+        state = _TaskState()
         execution_task = task.model_copy(update={"final_answer": ""})
         budgeted_tools: _BudgetedToolClient | None = None
         try:
@@ -230,7 +236,10 @@ class Orchestrator:
         tools: _BudgetedToolClient,
     ) -> TaskPrediction:
         self._audit("plan_started", {"task_id": task.task_id})
-        plan = await self._planner.plan(task)
+        try:
+            plan = await self._planner.plan(task)
+        finally:
+            state.usage = _add_usage(state.usage, self._planner.last_usage)
         if not plan.steps or len(plan.steps) > self._config.max_steps:
             raise ValueError("planner exceeded the global step budget")
         state.plan = plan
@@ -286,13 +295,13 @@ class Orchestrator:
             },
         )
         result = await specialist.run(task, step, tuple(state.evidence), tools)
-        self._record_result(state, step, result)
+        trusted_evidence_ids = self._record_result(state, step, result)
         self._audit(
             f"{event_prefix}_completed",
             {
                 "specialist": step.specialist.value,
                 "step_number": state.step_count,
-                "evidence_ids": [item.evidence_id for item in result.evidence],
+                "evidence_ids": list(trusted_evidence_ids),
                 "has_candidate": result.candidate_answer is not None,
             },
         )
@@ -302,26 +311,40 @@ class Orchestrator:
         state: _TaskState,
         step: PlanStep,
         result: AgentResult,
-    ) -> None:
+    ) -> tuple[str, ...]:
         if result.specialist != step.specialist:
             raise ValueError("specialist result does not match dispatched plan step")
-        existing_ids = set(state.evidence_origins)
         result_ids = [item.evidence_id for item in result.evidence]
         if any(not evidence_id.strip() for evidence_id in result_ids):
             raise ValueError("evidence IDs must be non-empty")
-        if len(result_ids) != len(set(result_ids)) or existing_ids.intersection(result_ids):
+        result_digests = [
+            hashlib.sha256(evidence_id.encode("utf-8")).digest()
+            for evidence_id in result_ids
+        ]
+        if len(result_digests) != len(set(result_digests)) or (
+            state.raw_evidence_id_digests.intersection(result_digests)
+        ):
             raise ValueError("evidence IDs must be globally unique")
         if any(item.kind == "source" and not item.source_url for item in result.evidence):
             raise ValueError("source evidence must include a URL")
-        for item in result.evidence:
-            state.evidence.append(item)
-            state.evidence_origins[item.evidence_id] = state.step_count
+        if len(state.evidence) + len(result.evidence) > 9_999:
+            raise ValueError("evidence limit exceeded")
+        trusted_ids: list[str] = []
+        for item, raw_digest in zip(result.evidence, result_digests, strict=True):
+            trusted_id = f"evidence-{len(state.evidence) + 1:04d}"
+            trusted_item = item.model_copy(update={"evidence_id": trusted_id})
+            state.evidence.append(trusted_item)
+            state.evidence_origins[trusted_id] = state.step_count
+            state.raw_evidence_id_digests.add(raw_digest)
+            trusted_ids.append(trusted_id)
         if result.candidate_answer is not None:
             candidate = result.candidate_answer.strip()
             if not candidate or "\n" in candidate:
                 raise ValueError("candidate answer must use the concise GAIA format")
             state.candidate = candidate
+            state.candidate_origins[state.step_count] = candidate
         state.usage = _add_usage(state.usage, result.usage)
+        return tuple(trusted_ids)
 
     async def _verify(
         self,
@@ -336,12 +359,15 @@ class Orchestrator:
                 "has_candidate": state.candidate is not None,
             },
         )
-        decision = await self._critic.verify(
-            task,
-            state.candidate,
-            tuple(state.evidence),
-            tools,
-        )
+        try:
+            decision = await self._critic.verify(
+                task,
+                state.candidate,
+                tuple(state.evidence),
+                tools,
+            )
+        finally:
+            state.usage = _add_usage(state.usage, self._critic.last_usage)
         known_ids = {item.evidence_id for item in state.evidence}
         checked_ids = decision.checked_evidence_ids
         if len(checked_ids) != len(set(checked_ids)):
@@ -432,13 +458,19 @@ class Orchestrator:
             return False
         kinds = {item.kind for item in state.evidence}
         if _numeric_value(state.candidate) is not None:
+            final_value = _numeric_value(state.candidate)
             computation_origins = {
                 state.evidence_origins[item.evidence_id]
                 for item in state.evidence
                 if item.kind == "computation"
             }
-            return len(computation_origins) >= 2 or (
-                bool(computation_origins) and "source" in kinds
+            agreeing_origins = {
+                origin
+                for origin in computation_origins
+                if _numeric_value(state.candidate_origins.get(origin)) == final_value
+            }
+            return len(agreeing_origins) >= 2 or (
+                bool(agreeing_origins) and "source" in kinds
             )
         assert state.plan is not None
         is_research = any(
@@ -506,22 +538,10 @@ def _add_usage(first: Usage, second: Usage) -> Usage:
     )
 
 
-def _numeric_value(answer: str | None) -> Decimal | None:
+def _numeric_value(answer: str | None) -> float | None:
     if answer is None:
         return None
-    stripped = answer.strip()
-    if not stripped:
-        return None
-    has_numeric_marker = stripped.startswith("$") or stripped.endswith("%")
-    thousands = bool(re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", stripped))
-    plain_number = bool(re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", stripped))
-    if not (has_numeric_marker or thousands or plain_number):
-        return None
-    normalized = stripped.replace("$", "").replace("%", "").replace(",", "")
-    try:
-        return Decimal(normalized)
-    except InvalidOperation:
-        return None
+    return normalize_number(answer)
 
 
 def _normalize_for_voting(answer: str | None) -> str:
@@ -529,14 +549,16 @@ def _normalize_for_voting(answer: str | None) -> str:
         return "string:none"
     numeric = _numeric_value(answer)
     if numeric is not None:
-        return f"number:{numeric.normalize()}"
+        canonical_numeric = 0.0 if numeric == 0 else numeric
+        return f"number:{canonical_numeric.hex()}"
     if "," in answer or ";" in answer:
         parts = re.split(r"[,;]", answer)
         normalized_parts: list[str] = []
         for part in parts:
             numeric_part = _numeric_value(part)
             if numeric_part is not None:
-                normalized_parts.append(f"number:{numeric_part.normalize()}")
+                canonical_numeric = 0.0 if numeric_part == 0 else numeric_part
+                normalized_parts.append(f"number:{canonical_numeric.hex()}")
             else:
                 normalized_part = re.sub(r"\s", "", part).casefold()
                 normalized_parts.append(f"string:{normalized_part}")
@@ -558,7 +580,13 @@ def choose_majority(
         raise ValueError("predictions must not be empty")
     if len(predictions) > votes:
         raise ValueError("predictions cannot exceed configured votes")
+    if len({prediction.task_id for prediction in predictions}) != 1:
+        raise ValueError("predictions must share one task ID")
+    if len({prediction.level for prediction in predictions}) != 1:
+        raise ValueError("predictions must share one level")
     run_indexes = [prediction.run_index for prediction in predictions]
+    if any(run_index < 0 or run_index >= votes for run_index in run_indexes):
+        raise ValueError("prediction run index must be within configured votes")
     if len(set(run_indexes)) != len(run_indexes):
         raise ValueError("predictions must have unique run indexes")
 

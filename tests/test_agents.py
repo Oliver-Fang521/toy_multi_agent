@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -13,7 +14,7 @@ from gaia_agent.agents import (
     VisualAgent,
 )
 from gaia_agent.models import Evidence, PlanStep, SpecialistName, Usage
-from gaia_agent.providers import ToolEvent
+from gaia_agent.providers import ModelRequest, ModelResponse, ToolEvent
 
 
 @pytest.mark.asyncio
@@ -96,6 +97,64 @@ async def test_planner_context_is_deterministic_and_excludes_reference_answer(
         "task_id": "synthetic-image-task",
     }
     assert "Hidden Image Answer" not in repr(first)
+
+
+@pytest.mark.asyncio
+async def test_planner_exposes_only_the_current_provider_invocation_usage(
+    fake_provider, task
+) -> None:
+    parsed = {
+        "restatement": "Use lookup",
+        "steps": [{"specialist": "lookup", "instruction": "Find a source"}],
+    }
+    fake_provider.return_parsed(parsed, usage=Usage(input_tokens=3, total_tokens=3))
+    fake_provider.return_parsed(parsed, usage=Usage(output_tokens=5, total_tokens=5))
+    planner = PlannerAgent(fake_provider)
+
+    await planner.plan(task)
+    first = planner.last_usage
+    await planner.plan(task)
+    second = planner.last_usage
+
+    assert first == Usage(input_tokens=3, total_tokens=3)
+    assert second == Usage(output_tokens=5, total_tokens=5)
+
+
+@pytest.mark.asyncio
+async def test_planner_usage_is_isolated_between_concurrent_calls(task) -> None:
+    release_first = asyncio.Event()
+
+    class InterleavingProvider:
+        async def complete(
+            self, request: ModelRequest, executor: object | None = None
+        ) -> ModelResponse:
+            context = json.loads(request.input_items[0]["content"][0]["text"])
+            if context["task_id"] == "first":
+                await release_first.wait()
+                usage = Usage(input_tokens=3, total_tokens=3)
+            else:
+                release_first.set()
+                usage = Usage(output_tokens=5, total_tokens=5)
+            return ModelResponse(
+                parsed={
+                    "restatement": "Use lookup",
+                    "steps": [{"specialist": "lookup", "instruction": "Find a source"}],
+                },
+                usage=usage,
+            )
+
+    planner = PlannerAgent(InterleavingProvider())
+
+    async def invoke(task_id: str) -> Usage:
+        await planner.plan(task.model_copy(update={"task_id": task_id}))
+        if task_id == "second":
+            await asyncio.sleep(0.01)
+        return planner.last_usage
+
+    first, second = await asyncio.gather(invoke("first"), invoke("second"))
+
+    assert first == Usage(input_tokens=3, total_tokens=3)
+    assert second == Usage(output_tokens=5, total_tokens=5)
 
 
 @pytest.mark.asyncio
@@ -393,6 +452,37 @@ async def test_critic_uses_only_verification_tools_and_returns_typed_decision(
         "insufficient_evidence",
     ]
     assert "Hidden Reference Answer" not in repr(request.input_items)
+
+
+@pytest.mark.asyncio
+async def test_critic_exposes_only_the_current_provider_invocation_usage(
+    fake_provider, fake_tools, task
+) -> None:
+    evidence = (
+        Evidence(
+            evidence_id="source-1",
+            kind="source",
+            summary="Primary source supports the candidate",
+            source_url="https://primary.example/fact",
+        ),
+    )
+    parsed = {
+        "verdict": "approve",
+        "feedback": "The source supports the candidate",
+        "checked_evidence_ids": ["source-1"],
+        "corrected_answer": None,
+    }
+    fake_provider.return_parsed(parsed, usage=Usage(input_tokens=7, total_tokens=7))
+    fake_provider.return_parsed(parsed, usage=Usage(reasoning_tokens=11, total_tokens=11))
+    critic = CriticAgent(fake_provider)
+
+    await critic.verify(task, "Marie Curie", evidence, fake_tools)
+    first = critic.last_usage
+    await critic.verify(task, "Marie Curie", evidence, fake_tools)
+    second = critic.last_usage
+
+    assert first == Usage(input_tokens=7, total_tokens=7)
+    assert second == Usage(reasoning_tokens=11, total_tokens=11)
 
 
 @pytest.mark.asyncio

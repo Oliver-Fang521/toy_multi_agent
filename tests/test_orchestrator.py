@@ -20,6 +20,7 @@ from gaia_agent.models import (
     SpecialistName,
     TaskPrediction,
     TerminalErrorCategory,
+    Usage,
 )
 from gaia_agent.orchestrator import Orchestrator, choose_majority
 from gaia_agent.providers import ToolSpec
@@ -33,14 +34,18 @@ class FakePlanner:
         *,
         error: Exception | None = None,
         delay: float = 0,
+        usage: Usage | None = None,
     ) -> None:
         self.calls = calls
         self.result = plan
         self.error = error
         self.delay = delay
+        self.invocation_usage = usage or Usage()
+        self.last_usage = Usage()
         self.tasks: list[GaiaTask] = []
 
     async def plan(self, task: GaiaTask) -> AgentPlan:
+        self.last_usage = self.invocation_usage
         self.calls.append("planner")
         self.tasks.append(task)
         if self.delay:
@@ -93,13 +98,17 @@ class FakeCritic:
         *,
         error: Exception | None = None,
         tool_calls: list[tuple[str, dict[str, Any]]] | None = None,
+        usages: list[Usage] | None = None,
     ) -> None:
         self.calls = calls
         self.decisions = deque(decisions)
         self.error = error
         self.tool_calls = tool_calls or []
+        self.usages = deque(usages or [Usage() for _ in decisions])
+        self.last_usage = Usage()
         self.tasks: list[GaiaTask] = []
         self.candidates: list[str | None] = []
+        self.evidence_seen: list[tuple[Evidence, ...]] = []
 
     async def verify(
         self,
@@ -108,9 +117,11 @@ class FakeCritic:
         evidence: tuple[Evidence, ...],
         tools: Any,
     ) -> CriticDecision:
+        self.last_usage = self.usages.popleft()
         self.calls.append("critic")
         self.tasks.append(task)
         self.candidates.append(candidate)
+        self.evidence_seen.append(evidence)
         if self.error is not None:
             raise self.error
         for name, arguments in self.tool_calls:
@@ -226,11 +237,14 @@ def _result(
     specialist: SpecialistName,
     evidence: tuple[Evidence, ...],
     candidate: str | None,
+    *,
+    usage: Usage | None = None,
 ) -> AgentResult:
     return AgentResult(
         specialist=specialist,
         evidence=evidence,
         candidate_answer=candidate,
+        usage=usage or Usage(),
     )
 
 
@@ -275,7 +289,7 @@ async def test_orchestrator_runs_plan_act_verify_submit() -> None:
         calls,
         [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
     )
-    critic = FakeCritic(calls, [_decision("approve", ("source-1",))])
+    critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
     tools = FakeTools(calls)
 
     result = await _orchestrator(
@@ -290,8 +304,56 @@ async def test_orchestrator_runs_plan_act_verify_submit() -> None:
     assert result.critic_verdict == "approve"
     assert result.error_category is None
     assert tools.call_arguments == [
-        ("submit_answer", {"answer": "Marie Curie", "evidence_ids": ["source-1"]})
+        ("submit_answer", {"answer": "Marie Curie", "evidence_ids": ["evidence-0001"]})
     ]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_aggregates_planner_specialist_and_every_critic_usage() -> None:
+    calls: list[str] = []
+    source = _evidence("source-1", "source")
+    planner = FakePlanner(
+        calls,
+        _plan(SpecialistName.LOOKUP),
+        usage=Usage(input_tokens=3, total_tokens=3),
+    )
+    lookup = FakeSpecialist(
+        SpecialistName.LOOKUP,
+        calls,
+        [
+            _result(
+                SpecialistName.LOOKUP,
+                (source,),
+                "Polonium",
+                usage=Usage(output_tokens=5, total_tokens=5),
+            )
+        ],
+    )
+    critic = FakeCritic(
+        calls,
+        [
+            _decision("revise", ("evidence-0001",), corrected_answer="Radium"),
+            _decision("approve", ("evidence-0001",)),
+        ],
+        usages=[
+            Usage(reasoning_tokens=7, total_tokens=7),
+            Usage(input_tokens=11, total_tokens=11),
+        ],
+    )
+
+    result = await _orchestrator(
+        planner=planner,
+        specialists={SpecialistName.LOOKUP: lookup},
+        critic=critic,
+        tools=FakeTools(calls),
+    ).run(_task())
+
+    assert result.usage == Usage(
+        input_tokens=14,
+        output_tokens=5,
+        reasoning_tokens=7,
+        total_tokens=26,
+    )
 
 
 @pytest.mark.asyncio
@@ -319,7 +381,10 @@ async def test_orchestrator_routes_every_specialist_in_plan_order(tmp_path: Path
     specialists = {
         role: FakeSpecialist(role, calls, [results[role]]) for role in roles
     }
-    critic = FakeCritic(calls, [_decision("approve", ("source-1", "visual-1"))])
+    critic = FakeCritic(
+        calls,
+        [_decision("approve", ("evidence-0001", "evidence-0004"))],
+    )
     tools = FakeTools(calls)
 
     attachment = tmp_path / "registered.png"
@@ -333,10 +398,10 @@ async def test_orchestrator_routes_every_specialist_in_plan_order(tmp_path: Path
 
     assert calls == ["planner", *[role.value for role in roles], "critic", "submit_answer"]
     assert result.evidence_ids == (
-        "source-1",
-        "computation-1",
-        "file-1",
-        "visual-1",
+        "evidence-0001",
+        "evidence-0002",
+        "evidence-0003",
+        "evidence-0004",
     )
 
 
@@ -387,7 +452,7 @@ async def test_submit_cannot_bypass_global_tool_call_budget() -> None:
     result = await _orchestrator(
         planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
         specialists={SpecialistName.LOOKUP: lookup},
-        critic=FakeCritic(calls, [_decision("approve", ("source-1",))]),
+        critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
         tools=tools,
         config=_config(max_tool_calls=1),
     ).run(_task())
@@ -410,7 +475,7 @@ async def test_identical_tool_call_across_roles_stops_as_a_loop() -> None:
     )
     critic = FakeCritic(
         calls,
-        [_decision("approve", ("source-1",))],
+        [_decision("approve", ("evidence-0001",))],
         tool_calls=repeated,
     )
     result = await _orchestrator(
@@ -445,8 +510,8 @@ async def test_numerical_answer_requires_independent_double_check() -> None:
     critic = FakeCritic(
         calls,
         [
-            _decision("approve", ("computation-1",)),
-            _decision("approve", ("computation-1", "computation-2")),
+            _decision("approve", ("evidence-0001",)),
+            _decision("approve", ("evidence-0001", "evidence-0002")),
         ],
     )
     orchestrator = _orchestrator(
@@ -461,7 +526,82 @@ async def test_numerical_answer_requires_independent_double_check() -> None:
     assert calls == ["planner", "computation", "critic", "computation", "critic", "submit_answer"]
     assert result.answer == "42"
     assert orchestrator.correction_count == 1
-    assert computation.prior_evidence[1][0].evidence_id == "computation-1"
+    assert computation.prior_evidence[1][0].evidence_id == "evidence-0001"
+
+
+@pytest.mark.asyncio
+async def test_contradictory_computation_candidates_cannot_satisfy_numerical_check() -> None:
+    calls: list[str] = []
+    computation = FakeSpecialist(
+        SpecialistName.COMPUTATION,
+        calls,
+        [
+            _result(
+                SpecialistName.COMPUTATION,
+                (_evidence("computation-1", "computation"),),
+                "42",
+            ),
+            _result(
+                SpecialistName.COMPUTATION,
+                (_evidence("computation-2", "computation"),),
+                "41",
+            ),
+        ],
+    )
+    result = await _orchestrator(
+        planner=FakePlanner(
+            calls,
+            _plan(SpecialistName.COMPUTATION, SpecialistName.COMPUTATION),
+        ),
+        specialists={SpecialistName.COMPUTATION: computation},
+        critic=FakeCritic(
+            calls,
+            [_decision("approve", ("evidence-0001", "evidence-0002"))],
+        ),
+        tools=FakeTools(calls),
+        config=_config(max_steps=2),
+    ).run(_task(question="What is six times seven?"))
+
+    assert result.answer is None
+    assert result.error_category == TerminalErrorCategory.CRITIC_REJECTION
+    assert "submit_answer" not in calls
+
+
+@pytest.mark.asyncio
+async def test_agreeing_computation_candidates_satisfy_numerical_check() -> None:
+    calls: list[str] = []
+    computation = FakeSpecialist(
+        SpecialistName.COMPUTATION,
+        calls,
+        [
+            _result(
+                SpecialistName.COMPUTATION,
+                (_evidence("computation-1", "computation"),),
+                "42",
+            ),
+            _result(
+                SpecialistName.COMPUTATION,
+                (_evidence("computation-2", "computation"),),
+                "42.0",
+            ),
+        ],
+    )
+    result = await _orchestrator(
+        planner=FakePlanner(
+            calls,
+            _plan(SpecialistName.COMPUTATION, SpecialistName.COMPUTATION),
+        ),
+        specialists={SpecialistName.COMPUTATION: computation},
+        critic=FakeCritic(
+            calls,
+            [_decision("approve", ("evidence-0001", "evidence-0002"))],
+        ),
+        tools=FakeTools(calls),
+    ).run(_task(question="What is six times seven?"))
+
+    assert result.answer == "42.0"
+    assert result.error_category is None
+    assert calls[-1] == "submit_answer"
 
 
 @pytest.mark.asyncio
@@ -481,7 +621,7 @@ async def test_research_answer_requires_source_evidence_before_submission() -> N
     )
     critic = FakeCritic(
         calls,
-        [_decision("approve", ()), _decision("approve", ("source-1",))],
+        [_decision("approve", ()), _decision("approve", ("evidence-0001",))],
     )
     orchestrator = _orchestrator(
         planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
@@ -510,8 +650,8 @@ async def test_critic_revision_is_reverified_before_corrected_answer_submission(
     critic = FakeCritic(
         calls,
         [
-            _decision("revise", ("source-1",), corrected_answer="Radium"),
-            _decision("approve", ("source-1",)),
+            _decision("revise", ("evidence-0001",), corrected_answer="Radium"),
+            _decision("approve", ("evidence-0001",)),
         ],
     )
     tools = FakeTools(calls)
@@ -596,6 +736,61 @@ async def test_duplicate_evidence_ids_are_rejected_across_specialists() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_evidence_ids_are_replaced_before_trusted_state_and_artifacts() -> None:
+    calls: list[str] = []
+    malicious_id = (
+        "Who discovered the synthetic element?|/private/attachment.png|model-secret-token"
+    )
+    lookup = FakeSpecialist(
+        SpecialistName.LOOKUP,
+        calls,
+        [
+            _result(
+                SpecialistName.LOOKUP,
+                (_evidence(malicious_id, "source"),),
+                None,
+            ),
+            _result(
+                SpecialistName.LOOKUP,
+                (_evidence("second-raw-id", "source"),),
+                "Marie Curie",
+            ),
+        ],
+    )
+    critic = FakeCritic(
+        calls,
+        [_decision("approve", ("evidence-0001", "evidence-0002"))],
+    )
+    tools = FakeTools(calls)
+    orchestrator = _orchestrator(
+        planner=FakePlanner(
+            calls,
+            _plan(SpecialistName.LOOKUP, SpecialistName.LOOKUP),
+        ),
+        specialists={SpecialistName.LOOKUP: lookup},
+        critic=critic,
+        tools=tools,
+    )
+
+    result = await orchestrator.run(_task())
+
+    assert result.evidence_ids == ("evidence-0001", "evidence-0002")
+    assert [item.evidence_id for item in lookup.prior_evidence[1]] == ["evidence-0001"]
+    assert [item.evidence_id for item in critic.evidence_seen[0]] == [
+        "evidence-0001",
+        "evidence-0002",
+    ]
+    assert tools.call_arguments[-1][1]["evidence_ids"] == [
+        "evidence-0001",
+        "evidence-0002",
+    ]
+    assert malicious_id not in repr(orchestrator.audit_events)
+    assert malicious_id not in repr(result)
+    assert "/private/attachment.png" not in repr(orchestrator.audit_events)
+    assert "model-secret-token" not in repr(orchestrator.audit_events)
+
+
+@pytest.mark.asyncio
 async def test_single_deadline_covers_the_complete_state_machine() -> None:
     calls: list[str] = []
     result = await _orchestrator(
@@ -661,7 +856,7 @@ async def test_audit_is_ordered_and_excludes_question_gold_and_raw_errors() -> N
         calls,
         [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
     )
-    critic = FakeCritic(calls, [_decision("approve", ("source-1",))])
+    critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
     tools = FakeTools(calls)
     orchestrator = _orchestrator(
         planner=planner,
@@ -715,6 +910,28 @@ def test_choose_majority_uses_scorer_compatible_normalization_and_first_winner()
     assert winner.error_category is None
 
 
+@pytest.mark.parametrize(
+    ("first_answer", "second_answer"),
+    [("1e3", "1000"), ("-0", "0")],
+)
+def test_choose_majority_uses_scorer_numeric_equivalence(
+    first_answer: str,
+    second_answer: str,
+) -> None:
+    winner = choose_majority(
+        [
+            _prediction(first_answer, 0),
+            _prediction(second_answer, 1),
+            _prediction("999", 2),
+        ],
+        votes=3,
+    )
+
+    assert winner.answer == first_answer
+    assert winner.vote_count == 2
+    assert winner.error_category is None
+
+
 def test_choose_majority_returns_typed_no_consensus_without_gold() -> None:
     predictions = [_prediction("A", 0), _prediction("B", 1), _prediction("C", 2)]
 
@@ -735,3 +952,25 @@ def test_choose_majority_rejects_invalid_vote_bounds(
 ) -> None:
     with pytest.raises(ValueError, match="votes|predictions"):
         choose_majority(predictions, votes=votes)
+
+
+@pytest.mark.parametrize(
+    "predictions",
+    [
+        [
+            _prediction("A", 0),
+            _prediction("A", 1).model_copy(update={"task_id": "other-task"}),
+        ],
+        [
+            _prediction("A", 0),
+            _prediction("A", 1).model_copy(update={"level": 3}),
+        ],
+        [_prediction("A", -1)],
+        [_prediction("A", 3)],
+    ],
+)
+def test_choose_majority_rejects_mixed_identity_or_out_of_range_run_index(
+    predictions: list[TaskPrediction],
+) -> None:
+    with pytest.raises(ValueError, match="task|level|run index"):
+        choose_majority(predictions, votes=3)

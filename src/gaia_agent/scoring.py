@@ -2,13 +2,13 @@ import re
 import string
 
 
-def _normalize_number(number: str) -> float:
+def normalize_number(number: str) -> float | None:
     for char in ["$", "%", ","]:
         number = number.replace(char, "")
     try:
         return float(number)
     except ValueError:
-        return float("inf")
+        return None
 
 
 def _normalize_string(value: str, *, remove_punctuation: bool = True) -> str:
@@ -32,7 +32,7 @@ def _is_float(value: str) -> bool:
 
 def _compare_element(answer: str, ground_truth: str) -> bool:
     if _is_float(ground_truth):
-        return _normalize_number(answer) == float(ground_truth)
+        return normalize_number(answer) == float(ground_truth)
     return _normalize_string(answer, remove_punctuation=False) == _normalize_string(
         ground_truth, remove_punctuation=False
     )
@@ -41,7 +41,7 @@ def _compare_element(answer: str, ground_truth: str) -> bool:
 def question_scorer(model_answer: str | None, ground_truth: str) -> bool:
     answer = "None" if model_answer is None else model_answer
     if _is_float(ground_truth):
-        return _normalize_number(answer) == float(ground_truth)
+        return normalize_number(answer) == float(ground_truth)
     if any(char in ground_truth for char in [",", ";"]):
         gold_parts = _split(ground_truth)
         answer_parts = _split(answer)
