@@ -25,10 +25,14 @@ from gaia_agent.models import (
 _TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _OPAQUE_EVIDENCE_ID_PATTERN = re.compile(r"evidence-[0-9]{4}\Z")
 _SECRET_VALUE_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]+\b", flags=re.IGNORECASE),
-    re.compile(r"\bhf_[A-Za-z0-9_-]+\b", flags=re.IGNORECASE),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._-]+\b", flags=re.IGNORECASE),
-    re.compile(r"api[_ -]?key|secret|token|password|credential|authorization", flags=re.IGNORECASE),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b", flags=re.IGNORECASE),
+    re.compile(r"\bhf_[A-Za-z0-9_-]{8,}\b", flags=re.IGNORECASE),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._-]{8,}\b", flags=re.IGNORECASE),
+    re.compile(
+        r"\b(?:api[_ -]?key|secret|token|password|credential)\s*(?:=|:)\s*[^\s]+",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(r"\bauthorization\s*:\s*bearer\s+[^\s]+", flags=re.IGNORECASE),
 )
 _PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _PUBLIC_PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
@@ -42,27 +46,25 @@ _PUBLIC_TOOL_ARGUMENT_KEYS = {
     "read_attachment": frozenset({"path"}),
     "submit_answer": frozenset({"answer", "evidence_ids"}),
 }
-_PUBLIC_TOOL_RESULT_KEYS = {
-    "web_search": frozenset({"answer", "sources"}),
-    "read_webpage": frozenset({"url", "status_code", "content_type", "text", "truncated"}),
-    "execute_python": frozenset({"output_text", "outputs"}),
+_PUBLIC_TOOL_NORMAL_RESULT_SHAPES = {
+    "web_search": frozenset({frozenset({"answer", "sources"})}),
+    "read_webpage": frozenset(
+        {frozenset({"url", "status_code", "content_type", "text", "truncated"})}
+    ),
+    "execute_python": frozenset({frozenset({"output_text", "outputs"})}),
     "read_attachment": frozenset(
         {
-            "path",
-            "kind",
-            "type",
-            "text",
-            "rows",
-            "data",
-            "page_count",
-            "sheets",
-            "media_type",
-            "size_bytes",
-            "metadata",
+            frozenset({"path", "kind", "text"}),
+            frozenset({"path", "kind", "rows"}),
+            frozenset({"path", "kind", "data"}),
+            frozenset({"path", "kind", "page_count", "text"}),
+            frozenset({"path", "kind", "sheets"}),
+            frozenset({"path", "kind", "media_type", "size_bytes"}),
         }
     ),
-    "submit_answer": frozenset({"answer", "evidence_ids"}),
+    "submit_answer": frozenset({frozenset({"answer", "evidence_ids"})}),
 }
+_BOUNDED_RESULT_KEYS = frozenset({"output", "truncated"})
 _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
     {
         "tool_call_started",
@@ -84,6 +86,7 @@ _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
     }
 )
 _PUBLIC_CRITIC_VERDICTS = frozenset({"approve", "revise", "insufficient_evidence", "not_run"})
+_NORMAL_CRITIC_VERDICTS = _PUBLIC_CRITIC_VERDICTS - {"not_run"}
 _PREDICTION_KEYS = frozenset(
     {
         "task_id",
@@ -528,9 +531,6 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
         elif key in {"call_number", "step_count", "step_number"}:
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000_000:
                 raise ValueError("audit counter must be a bounded integer")
-        elif key in {"category", "critic_verdict", "verdict"}:
-            if value not in _PUBLIC_CRITIC_VERDICTS | {item.value for item in TerminalErrorCategory}:
-                raise ValueError("audit category is not allowlisted")
         elif key == "specialist":
             if value not in {item.value for item in SpecialistName}:
                 raise ValueError("audit specialist is not allowlisted")
@@ -563,13 +563,40 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
         if event_type == "tool_call_started" and result_keys is not None:
             raise ValueError("tool start audit cannot include result keys")
         if event_type == "tool_call_completed":
-            if not isinstance(result_keys, list) or not set(result_keys) <= _PUBLIC_TOOL_RESULT_KEYS[tool]:
+            result_key_set = frozenset(result_keys) if isinstance(result_keys, list) else None
+            if result_key_set not in _PUBLIC_TOOL_NORMAL_RESULT_SHAPES[tool] | {_BOUNDED_RESULT_KEYS}:
                 raise ValueError("tool audit result keys do not match the tool contract")
-            if len(result_keys) > 32:
+            if not isinstance(result_keys, list) or len(result_keys) != len(result_key_set) or len(result_keys) > 32:
                 raise ValueError("tool audit result keys exceed the public limit")
     elif "argument_keys" in public or "result_keys" in public or "tool" in public:
         raise ValueError("non-tool audit cannot include tool metadata")
+    _validate_audit_value_context(event_type, public)
     return public
+
+
+def _validate_audit_value_context(event_type: str, payload: Mapping[str, Any]) -> None:
+    terminal_categories = {item.value for item in TerminalErrorCategory}
+    if event_type == "terminal_failure":
+        if payload.get("category") not in terminal_categories:
+            raise ValueError("terminal_failure category must be a terminal error category")
+        if payload.get("critic_verdict") not in _PUBLIC_CRITIC_VERDICTS:
+            raise ValueError("terminal_failure critic_verdict is invalid")
+        return
+    if "critic_verdict" in payload:
+        raise ValueError("critic_verdict is only public on terminal_failure")
+    if event_type == "verify_completed":
+        if payload.get("verdict") not in _NORMAL_CRITIC_VERDICTS:
+            raise ValueError("verify_completed verdict must be a completed critic verdict")
+    elif event_type == "correction_started":
+        if payload.get("verdict") not in _NORMAL_CRITIC_VERDICTS:
+            raise ValueError("correction_started verdict must be a completed critic verdict")
+    elif "verdict" in payload:
+        raise ValueError("verdict is only public on verification or correction audit events")
+    if event_type == "quality_rejected":
+        if payload.get("category") != "insufficient_evidence":
+            raise ValueError("quality_rejected category must be insufficient_evidence")
+    elif "category" in payload:
+        raise ValueError("category is only public on terminal_failure or quality_rejected")
 
 
 def _validate_plan_record(value: Any) -> None:
@@ -599,8 +626,7 @@ def _validate_audit_record(value: Any) -> None:
 
 
 def _public_prediction_record(prediction: TaskPrediction) -> dict[str, Any]:
-    if prediction.critic_verdict not in _PUBLIC_CRITIC_VERDICTS:
-        raise ValueError("prediction critic_verdict is not public")
+    validate_public_prediction(prediction)
     evidence_ids = [
         evidence_id
         for evidence_id in prediction.evidence_ids
@@ -624,7 +650,20 @@ def _public_prediction_record(prediction: TaskPrediction) -> dict[str, Any]:
 
 
 def _prediction_from_record(record: Mapping[str, Any]) -> TaskPrediction:
-    return TaskPrediction.model_validate(record)
+    prediction = TaskPrediction.model_validate(record)
+    validate_public_prediction(prediction)
+    return prediction
+
+
+def validate_public_prediction(prediction: TaskPrediction) -> None:
+    if prediction.critic_verdict not in _PUBLIC_CRITIC_VERDICTS:
+        raise ValueError("prediction critic_verdict is not public")
+    if prediction.critic_verdict == "not_run" and (
+        prediction.answer is not None
+        or prediction.correct
+        or not isinstance(prediction.error_category, TerminalErrorCategory)
+    ):
+        raise ValueError("not_run prediction must be an incorrect terminal failure")
 
 
 def _validated_prediction_record(
@@ -667,7 +706,7 @@ def _validated_prediction_record(
     if record.get("error_category") is not None and not isinstance(record["error_category"], str):
         return None
     try:
-        TaskPrediction.model_validate(record)
+        validate_public_prediction(TaskPrediction.model_validate(record))
     except ValueError:
         return None
     return dict(record)

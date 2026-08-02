@@ -327,7 +327,7 @@ def test_real_task_six_tool_audit_shapes_persist_only_key_names(tmp_path, predic
         ("web_search", ["query"], ["answer", "sources"]),
         ("read_webpage", ["url"], ["url", "status_code", "content_type", "text", "truncated"]),
         ("execute_python", ["code", "paths"], ["output_text", "outputs"]),
-        ("read_attachment", ["path"], ["path", "kind", "text", "page_count", "rows", "data", "sheets", "media_type", "size_bytes"]),
+        ("read_attachment", ["path"], ["path", "kind", "text"]),
         ("submit_answer", ["answer", "evidence_ids"], ["answer", "evidence_ids"]),
     )
     sequence = 1
@@ -386,3 +386,109 @@ def test_manifest_rejects_known_environment_secrets_in_all_public_identifiers(tm
     safe = RunStore.create(tmp_path, manifest_for(["task-1"]))
     assert secret not in "".join(path.read_text() for path in tmp_path.rglob("*"))
     assert safe.manifest_path.exists()
+
+
+def test_bounded_task_four_results_are_allowed_only_as_the_shared_shape(tmp_path, prediction) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+    for sequence, tool, argument_keys in (
+        (1, "execute_python", ["instruction", "paths"]),
+        (2, "web_search", ["query"]),
+    ):
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=sequence,
+                event_type="tool_call_completed",
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={
+                    "tool": tool,
+                    "call_number": sequence,
+                    "argument_keys": argument_keys,
+                    "result_keys": ["output", "truncated"],
+                },
+            ),
+        )
+
+    with pytest.raises(ValueError, match="result keys"):
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=3,
+                event_type="tool_call_completed",
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={
+                    "tool": "web_search",
+                    "call_number": 3,
+                    "argument_keys": ["query"],
+                    "result_keys": ["answer", "output", "truncated"],
+                },
+            ),
+        )
+
+
+def test_not_run_requires_an_incorrect_terminal_failure_and_audit_context(tmp_path, prediction) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+    invalid_predictions = (
+        prediction.model_copy(
+            update={"answer": "unverified", "correct": False, "critic_verdict": "not_run", "error_category": TerminalErrorCategory.TIMEOUT}
+        ),
+        prediction.model_copy(
+            update={"answer": None, "correct": False, "critic_verdict": "not_run", "error_category": None}
+        ),
+        prediction.model_copy(
+            update={"answer": None, "correct": True, "critic_verdict": "not_run", "error_category": TerminalErrorCategory.TIMEOUT}
+        ),
+    )
+    for item in invalid_predictions:
+        with pytest.raises(ValueError, match="not_run"):
+            store.append(item)
+
+    with pytest.raises(ValueError, match="verify_completed"):
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=1,
+                event_type="verify_completed",
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={"verdict": "not_run"},
+            ),
+        )
+    with pytest.raises(ValueError, match="terminal_failure"):
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=2,
+                event_type="terminal_failure",
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={"category": "not_run", "critic_verdict": "not_run"},
+            ),
+        )
+
+
+@pytest.mark.parametrize("identifier", ["tokenizers", "secretariat", "passwordless", "api-key-docs"])
+def test_ordinary_public_identifiers_are_not_rejected_as_secrets(identifier) -> None:
+    manifest = RunManifest(
+        selected_task_ids=("task-1",),
+        expected_levels={"task-1": 1},
+        sample_size=1,
+        seed=42,
+        model=identifier,
+        reasoning_effort="medium",
+        dataset_revision="synthetic-revision",
+    )
+
+    assert manifest.model == identifier
+
+
+@pytest.mark.parametrize("identifier", ["sk-credentialvalue", "hf_credentialvalue", "Bearer credentialvalue"])
+def test_credential_shaped_public_identifiers_are_rejected(identifier) -> None:
+    with pytest.raises(ValidationError, match="public"):
+        RunManifest(
+            selected_task_ids=("task-1",),
+            expected_levels={"task-1": 1},
+            sample_size=1,
+            seed=42,
+            model=identifier,
+            reasoning_effort="medium",
+            dataset_revision="synthetic-revision",
+        )

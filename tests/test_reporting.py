@@ -132,5 +132,5 @@ def test_report_writes_are_idempotent(tmp_path) -> None:
 
 
 def test_summary_rejects_untyped_verdict_text_before_markdown_interpolation() -> None:
-    with pytest.raises(ValueError, match="critic_verdicts"):
+    with pytest.raises(ValueError, match="critic_verdict"):
         summarize([prediction("a", 1, correct=True, duration=1, verdict="approve\n# injected")])

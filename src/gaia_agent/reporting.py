@@ -11,7 +11,7 @@ from typing import Literal
 from pydantic import model_validator
 
 from gaia_agent.models import FrozenModel, TaskPrediction, TerminalErrorCategory, Usage
-from gaia_agent.persistence import RunStore
+from gaia_agent.persistence import RunStore, validate_public_prediction
 
 
 class LevelMetrics(FrozenModel):
@@ -69,6 +69,8 @@ class EvaluationSummary(FrozenModel):
 
 
 def summarize(predictions: Sequence[TaskPrediction]) -> EvaluationSummary:
+    for prediction in predictions:
+        validate_public_prediction(prediction)
     ordered = sorted(predictions, key=lambda prediction: (prediction.level, prediction.task_id))
     levels = {
         level: _level_metrics([prediction for prediction in ordered if prediction.level == level])
