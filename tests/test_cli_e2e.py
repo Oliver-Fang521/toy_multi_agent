@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
@@ -8,10 +9,15 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from gaia_agent import cli as cli_module
+from gaia_agent import runner as runner_module
+from gaia_agent.agents import CriticAgent, LookupAgent, PlannerAgent
 from gaia_agent.cli import app
 from gaia_agent.config import RunConfig
 from gaia_agent.models import GaiaTask, TaskPrediction, TerminalErrorCategory, Usage
-from gaia_agent.runner import EvaluationRunner
+from gaia_agent.providers import ModelRequest, ModelResponse
+from gaia_agent.reporting import summarize
+from gaia_agent.runner import EvaluationRunner, ProviderRuntime, build_runner
 
 cli_runner = CliRunner()
 FIXTURE = Path(__file__).parent / "fixtures" / "gaia_records.json"
@@ -25,15 +31,12 @@ def _credentials(monkeypatch: pytest.MonkeyPatch) -> None:
 def _evaluate_arguments(output_dir: Path, *extra: str) -> list[str]:
     return [
         "evaluate",
-        "--dataset-fixture",
-        str(FIXTURE),
         "--sample-size",
         "3",
         "--seed",
         "42",
         "--output-dir",
         str(output_dir),
-        "--fake-provider",
         *extra,
     ]
 
@@ -82,10 +85,169 @@ class _ScriptedOrchestrator:
         return outcome
 
 
+class _OfflineProvider:
+    async def complete(
+        self,
+        request: ModelRequest,
+        executor: Any | None = None,
+    ) -> ModelResponse:
+        context = _request_context(request)
+        if request.instructions == PlannerAgent.instructions:
+            return ModelResponse(
+                parsed={
+                    "restatement": "Gather one source and verify the concise answer",
+                    "steps": [{"specialist": "lookup", "instruction": "Use the tool plane"}],
+                }
+            )
+        if request.instructions == LookupAgent.instructions:
+            assert executor is not None
+            task_id = str(context["task_id"])
+            result = await executor.call("web_search", {"query": task_id})
+            sources = result["sources"]
+            return ModelResponse(
+                parsed={
+                    "specialist": "lookup",
+                    "evidence": [
+                        {
+                            "evidence_id": f"offline-{task_id}",
+                            "kind": "source",
+                            "summary": "Deterministic test-process backend result",
+                            "source_url": sources[0]["url"],
+                        }
+                    ],
+                    "candidate_answer": "synthetic gold "
+                    + str(context["question"]).removeprefix("Synthetic question "),
+                }
+            )
+        if request.instructions == CriticAgent.instructions:
+            evidence = context["evidence"]
+            return ModelResponse(
+                parsed={
+                    "verdict": "approve",
+                    "feedback": "Observable source evidence is present",
+                    "checked_evidence_ids": [item["evidence_id"] for item in evidence],
+                    "corrected_answer": None,
+                }
+            )
+        raise AssertionError("unexpected agent request")
+
+
+def _request_context(request: ModelRequest) -> dict[str, Any]:
+    content = request.input_items[0]["content"]
+    text = next(item["text"] for item in content if item["type"] == "input_text")
+    value = json.loads(text)
+    assert isinstance(value, dict)
+    return value
+
+
+def _inject_offline_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    def injected_build_runner(config: RunConfig) -> EvaluationRunner:
+        return build_runner(
+            config,
+            dataset_loader=lambda _config: _fixture_tasks(),
+            provider_factory=lambda _config: ProviderRuntime(
+                provider=_OfflineProvider(),
+                provider_name="offline-fixture",
+                evaluation_mode="test",
+                fake_mcp_backend=True,
+            ),
+        )
+
+    monkeypatch.setattr(cli_module, "build_runner", injected_build_runner)
+
+
+def _inject_capturing_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    captured: list[RunConfig],
+) -> None:
+    class _CapturingRunner:
+        async def run(self):
+            return summarize([])
+
+    def capture(config: RunConfig):
+        captured.append(config)
+        return _CapturingRunner()
+
+    monkeypatch.setattr(cli_module, "build_runner", capture)
+
+
+def test_build_runner_rejects_dataset_only_injection_before_default_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_client_calls: list[dict[str, Any]] = []
+
+    def unexpected_async_openai(**kwargs: Any) -> None:
+        provider_client_calls.append(kwargs)
+        raise AssertionError("default provider client must not be constructed")
+
+    monkeypatch.setattr(runner_module, "AsyncOpenAI", unexpected_async_openai)
+
+    with pytest.raises(ValueError, match="dataset_loader and provider_factory must be injected together"):
+        build_runner(
+            _config(tmp_path),
+            dataset_loader=lambda _config: _fixture_tasks(),
+        )
+
+    assert provider_client_calls == []
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_build_runner_rejects_provider_only_injection_before_factory_or_store(
+    tmp_path: Path,
+) -> None:
+    provider_factory_calls: list[RunConfig] = []
+
+    def injected_provider_factory(config: RunConfig) -> ProviderRuntime:
+        provider_factory_calls.append(config)
+        return ProviderRuntime(
+            provider=_OfflineProvider(),
+            provider_name="offline-fixture",
+            evaluation_mode="test",
+            fake_mcp_backend=True,
+        )
+
+    with pytest.raises(ValueError, match="dataset_loader and provider_factory must be injected together"):
+        build_runner(
+            _config(tmp_path),
+            provider_factory=injected_provider_factory,
+        )
+
+    assert provider_factory_calls == []
+    assert not (tmp_path / "manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "evaluation_mode"),
+    [
+        pytest.param("offline-fixture", "production", id="production-mode"),
+        pytest.param("openai", "test", id="production-provider-name"),
+    ],
+)
+def test_complete_injected_composition_requires_non_production_identity(
+    tmp_path: Path,
+    provider_name: str,
+    evaluation_mode: Any,
+) -> None:
+    with pytest.raises(ValueError, match="non-production test identity"):
+        build_runner(
+            _config(tmp_path),
+            dataset_loader=lambda _config: _fixture_tasks(),
+            provider_factory=lambda _config: ProviderRuntime(
+                provider=_OfflineProvider(),
+                provider_name=provider_name,
+                evaluation_mode=evaluation_mode,
+            ),
+        )
+
+    assert not (tmp_path / "manifest.json").exists()
+
+
 def test_evaluate_cli_runs_four_planes_over_real_stdio_and_writes_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _credentials(monkeypatch)
+    _inject_offline_runner(monkeypatch)
     output_dir = tmp_path / "run"
 
     result = cli_runner.invoke(app, _evaluate_arguments(output_dir))
@@ -95,9 +257,163 @@ def test_evaluate_cli_runs_four_planes_over_real_stdio_and_writes_reports(
     assert (output_dir / "predictions.jsonl").read_text(encoding="utf-8").count("\n") == 3
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "report.md").exists()
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["provider_name"] == "offline-fixture"
+    assert manifest["evaluation_mode"] == "test"
     audit = "".join(path.read_text(encoding="utf-8") for path in output_dir.rglob("audit.jsonl"))
     assert '"tool":"web_search"' in audit
     assert '"tool":"submit_answer"' in audit
+
+
+def test_public_cli_does_not_expose_or_accept_fixture_backend_switches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _credentials(monkeypatch)
+    captured: list[RunConfig] = []
+    _inject_capturing_runner(monkeypatch, captured)
+
+    help_result = cli_runner.invoke(app, ["evaluate", "--help"])
+
+    assert help_result.exit_code == 0
+    assert "--fake-provider" not in help_result.output
+    assert "--dataset-fixture" not in help_result.output
+    for arguments in (
+        ["evaluate", "--fake-provider"],
+        ["evaluate", "--dataset-fixture", str(FIXTURE)],
+    ):
+        result = cli_runner.invoke(app, arguments)
+        assert result.exit_code == 2
+        assert "No such option" in result.output
+    assert captured == []
+
+
+def test_cli_uses_run_config_environment_when_options_are_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _credentials(monkeypatch)
+    monkeypatch.setenv("GAIA_MODEL", "env-model")
+    monkeypatch.setenv("GAIA_REASONING_EFFORT", "high")
+    monkeypatch.setenv("GAIA_SAMPLE_SIZE", "6")
+    monkeypatch.setenv("GAIA_SEED", "9")
+    monkeypatch.setenv("GAIA_MAX_STEPS", "3")
+    monkeypatch.setenv("GAIA_MAX_TOOL_CALLS", "7")
+    monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("GAIA_VOTES", "3")
+    monkeypatch.setenv("GAIA_OUTPUT_DIR", str(tmp_path / "env-run"))
+    monkeypatch.setenv("GAIA_RESUME", "true")
+    captured: list[RunConfig] = []
+    _inject_capturing_runner(monkeypatch, captured)
+
+    result = cli_runner.invoke(app, ["evaluate"])
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    config = captured[0]
+    assert config.model == "env-model"
+    assert config.reasoning_effort == "high"
+    assert config.sample_size == 6
+    assert config.seed == 9
+    assert config.max_steps == 3
+    assert config.max_tool_calls == 7
+    assert config.timeout_seconds == 12.5
+    assert config.votes == 3
+    assert config.output_dir == tmp_path / "env-run"
+    assert config.resume is True
+
+
+def test_explicit_cli_options_override_run_config_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _credentials(monkeypatch)
+    monkeypatch.setenv("GAIA_MODEL", "env-model")
+    monkeypatch.setenv("GAIA_REASONING_EFFORT", "low")
+    monkeypatch.setenv("GAIA_MAX_STEPS", "2")
+    monkeypatch.setenv("GAIA_MAX_TOOL_CALLS", "3")
+    monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", "4")
+    monkeypatch.setenv("GAIA_VOTES", "1")
+    captured: list[RunConfig] = []
+    _inject_capturing_runner(monkeypatch, captured)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evaluate",
+            "--model",
+            "cli-model",
+            "--reasoning-effort",
+            "xhigh",
+            "--max-steps",
+            "5",
+            "--max-tool-calls",
+            "9",
+            "--timeout-seconds",
+            "20",
+            "--votes",
+            "3",
+            "--output-dir",
+            str(tmp_path / "cli-run"),
+            "--resume",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured[0]
+    assert config.model == "cli-model"
+    assert config.reasoning_effort == "xhigh"
+    assert config.max_steps == 5
+    assert config.max_tool_calls == 9
+    assert config.timeout_seconds == 20
+    assert config.votes == 3
+    assert config.output_dir == tmp_path / "cli-run"
+    assert config.resume is True
+
+
+def test_invalid_run_config_environment_fails_without_printing_its_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _credentials(monkeypatch)
+    invalid_value = "not-a-private-limit"
+    monkeypatch.setenv("GAIA_MAX_TOOL_CALLS", invalid_value)
+    captured: list[RunConfig] = []
+    _inject_capturing_runner(monkeypatch, captured)
+
+    result = cli_runner.invoke(app, ["evaluate"])
+
+    assert result.exit_code == 2
+    assert "configuration error" in result.output.lower()
+    assert invalid_value not in result.output
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_production_stdio_client_removes_ambient_fake_backend_switch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[str | None] = []
+
+    class _CapturingClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self):
+            observed.append(os.environ.get("GAIA_MCP_FAKE_BACKEND"))
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setenv("GAIA_MCP_FAKE_BACKEND", "1")
+    monkeypatch.setattr(runner_module, "MCPToolClient", _CapturingClient)
+    task = GaiaTask(task_id="ambient-test", question="q", level=1, final_answer="a")
+
+    async with runner_module._stdio_client(task, _config(tmp_path), fake_backend=False):
+        pass
+
+    assert observed == [None]
+    assert os.environ["GAIA_MCP_FAKE_BACKEND"] == "1"
 
 
 @pytest.mark.parametrize("missing", ["OPENAI_API_KEY", "HF_TOKEN"])
@@ -105,6 +421,7 @@ def test_evaluate_preflight_names_missing_credentials_without_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
 ) -> None:
     _credentials(monkeypatch)
+    _inject_offline_runner(monkeypatch)
     monkeypatch.delenv(missing)
 
     result = cli_runner.invoke(app, _evaluate_arguments(tmp_path / "run"))
@@ -133,6 +450,7 @@ def test_evaluate_preflight_rejects_invalid_model_and_limits(
     arguments: tuple[str, str],
 ) -> None:
     _credentials(monkeypatch)
+    _inject_offline_runner(monkeypatch)
 
     result = cli_runner.invoke(app, _evaluate_arguments(tmp_path / "run", *arguments))
 
@@ -145,6 +463,7 @@ def test_seed_selection_and_task_level_manifest_are_literal_and_stable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _credentials(monkeypatch)
+    _inject_offline_runner(monkeypatch)
     first = tmp_path / "first"
     second = tmp_path / "second"
 
@@ -299,6 +618,7 @@ def test_resume_skips_complete_records_and_plain_append_repairs_incomplete_recor
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _credentials(monkeypatch)
+    _inject_offline_runner(monkeypatch)
     output_dir = tmp_path / "run"
     first = cli_runner.invoke(app, _evaluate_arguments(output_dir))
     assert first.exit_code == 0, first.output
@@ -333,6 +653,7 @@ def test_outputs_stay_contained_and_exclude_secret_and_gated_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _credentials(monkeypatch)
+    _inject_offline_runner(monkeypatch)
     output_dir = tmp_path / "chosen" / "run"
 
     result = cli_runner.invoke(app, _evaluate_arguments(output_dir))
@@ -360,6 +681,7 @@ def test_verify_results_reloads_artifacts_and_rejects_mismatch_privacy_and_incom
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _credentials(monkeypatch)
+    _inject_offline_runner(monkeypatch)
     output_dir = tmp_path / "run"
     evaluated = cli_runner.invoke(app, _evaluate_arguments(output_dir))
     assert evaluated.exit_code == 0, evaluated.output
@@ -382,6 +704,10 @@ def test_verify_results_reloads_artifacts_and_rejects_mismatch_privacy_and_incom
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     privacy = cli_runner.invoke(app, ["verify-results", str(output_dir)])
     assert privacy.exit_code == 2
+    predictions_before_resume = (output_dir / "predictions.jsonl").read_text(encoding="utf-8")
+    private_resume = cli_runner.invoke(app, _evaluate_arguments(output_dir, "--resume"))
+    assert private_resume.exit_code == 2
+    assert (output_dir / "predictions.jsonl").read_text(encoding="utf-8") == predictions_before_resume
 
     manifest_path.write_text(original_manifest, encoding="utf-8")
     predictions_path = output_dir / "predictions.jsonl"

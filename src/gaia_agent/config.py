@@ -34,7 +34,14 @@ class RunConfig(BaseModel):
             "hf_token": os.environ.get("HF_TOKEN"),
             "model": os.environ.get("GAIA_MODEL", "gpt-5.6-sol"),
             "reasoning_effort": os.environ.get("GAIA_REASONING_EFFORT", "medium"),
+            "sample_size": os.environ.get("GAIA_SAMPLE_SIZE", "15"),
+            "seed": os.environ.get("GAIA_SEED", "42"),
             "max_steps": os.environ.get("GAIA_MAX_STEPS", "8"),
+            "max_tool_calls": os.environ.get("GAIA_MAX_TOOL_CALLS", "24"),
+            "timeout_seconds": os.environ.get("GAIA_TIMEOUT_SECONDS", "300"),
+            "votes": os.environ.get("GAIA_VOTES", "1"),
+            "output_dir": os.environ.get("GAIA_OUTPUT_DIR", "results/gaia-15-seed42"),
+            "resume": os.environ.get("GAIA_RESUME", "false"),
         }
         values.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(values)

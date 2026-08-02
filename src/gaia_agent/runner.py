@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import math
 import os
@@ -15,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from openai import AsyncOpenAI
 
@@ -42,7 +41,7 @@ from gaia_agent.models import (
 )
 from gaia_agent.orchestrator import Orchestrator, choose_majority
 from gaia_agent.persistence import RunManifest, RunStore
-from gaia_agent.providers import ModelRequest, ModelResponse, OpenAIProvider
+from gaia_agent.providers import ModelProvider, OpenAIProvider
 from gaia_agent.reporting import (
     EvaluationSummary,
     LevelMetrics,
@@ -99,6 +98,17 @@ class TaskOrchestrator(Protocol):
 DatasetLoader = Callable[[RunConfig], tuple[list[GaiaTask], str]]
 OrchestratorFactory = Callable[[GaiaTask], TaskOrchestrator]
 Sleep = Callable[[float], Awaitable[None]]
+ProviderFactory = Callable[[RunConfig], "ProviderRuntime"]
+
+
+@dataclass(frozen=True)
+class ProviderRuntime:
+    """Injected provider composition and its explicit persisted run identity."""
+
+    provider: ModelProvider
+    provider_name: str
+    evaluation_mode: Literal["production", "test"]
+    fake_mcp_backend: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,17 +128,27 @@ class EvaluationRunner:
         dataset_loader: DatasetLoader,
         orchestrator_factory: OrchestratorFactory,
         sleep: Sleep = asyncio.sleep,
+        provider_name: str = "injected",
+        evaluation_mode: Literal["production", "test"] = "test",
     ) -> None:
         self._config = config
         self._dataset_loader = dataset_loader
         self._orchestrator_factory = orchestrator_factory
         self._sleep = sleep
+        self._provider_name = provider_name
+        self._evaluation_mode = evaluation_mode
 
     async def run(self) -> EvaluationSummary:
         validate_config(self._config)
         tasks, revision = self._dataset_loader(self._config)
         selected = sample_stratified(tasks, self._config.sample_size, self._config.seed)
-        store = _open_or_create_store(self._config, selected, revision)
+        store = _open_or_create_store(
+            self._config,
+            selected,
+            revision,
+            provider_name=self._provider_name,
+            evaluation_mode=self._evaluation_mode,
+        )
 
         for task in selected:
             if task.task_id in store.completed_task_ids():
@@ -261,59 +281,46 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("output_dir must be a safe directory")
 
 
-def load_fixture_dataset(path: Path) -> tuple[list[GaiaTask], str]:
-    """Load synthetic GAIA-shaped records for the explicitly offline CLI mode."""
-
-    fixture = path.resolve(strict=True)
-    raw = fixture.read_bytes()
-    records = json.loads(raw)
-    if not isinstance(records, list):
-        raise TypeError("dataset fixture must contain a JSON list")
-    tasks: list[GaiaTask] = []
-    for record in records:
-        if not isinstance(record, Mapping):
-            raise TypeError("dataset fixture records must be objects")
-        attachment_path = _fixture_attachment(fixture.parent, record.get("file_path"))
-        tasks.append(
-            GaiaTask(
-                task_id=record["task_id"],
-                question=record["Question"],
-                level=int(record["Level"]),
-                final_answer=record["Final answer"],
-                attachment_path=attachment_path,
-            )
-        )
-    return tasks, "fixture-" + hashlib.sha256(raw).hexdigest()[:16]
-
-
 def build_runner(
     config: RunConfig,
     *,
-    dataset_fixture: Path | None = None,
-    fake_provider: bool = False,
+    dataset_loader: DatasetLoader | None = None,
+    provider_factory: ProviderFactory | None = None,
 ) -> EvaluationRunner:
     """Compose provider-neutral agents and orchestrators with the real stdio MCP client."""
 
+    injected_dataset = dataset_loader is not None
+    injected_provider = provider_factory is not None
+    if injected_dataset != injected_provider:
+        raise ValueError("dataset_loader and provider_factory must be injected together")
+
     validate_config(config)
-    if dataset_fixture is None:
-        dataset_loader: DatasetLoader = lambda active: load_gaia_validation(
+    if not injected_dataset:
+        dataset_loader = lambda active: load_gaia_validation(
             active.hf_token.get_secret_value()
         )
-    else:
-        fixture_path = dataset_fixture
-        dataset_loader = lambda _active: load_fixture_dataset(fixture_path)
-
-    provider: Any
-    if fake_provider:
-        provider = _OfflineFixtureProvider()
-    else:
-        provider = OpenAIProvider(
-            AsyncOpenAI(
-                api_key=config.openai_api_key.get_secret_value(),
-                max_retries=0,
+        runtime = ProviderRuntime(
+            provider=OpenAIProvider(
+                AsyncOpenAI(
+                    api_key=config.openai_api_key.get_secret_value(),
+                    max_retries=0,
+                ),
+                model=config.model,
             ),
-            model=config.model,
+            provider_name="openai",
+            evaluation_mode="production",
         )
+    else:
+        assert dataset_loader is not None
+        assert provider_factory is not None
+        runtime = provider_factory(config)
+        if runtime.evaluation_mode != "test" or runtime.provider_name == "openai":
+            raise ValueError("injected composition must declare a non-production test identity")
+    if not _PUBLIC_IDENTIFIER_PATTERN.fullmatch(runtime.provider_name):
+        raise ValueError("provider_name must be a bounded public identifier")
+    if runtime.fake_mcp_backend and runtime.evaluation_mode != "test":
+        raise ValueError("fake MCP backend requires an injected test runtime")
+    provider = runtime.provider
     planner = PlannerAgent(
         provider,
         max_steps=config.max_steps,
@@ -355,7 +362,7 @@ def build_runner(
             tool_client_factory=lambda active_task: _stdio_client(
                 active_task,
                 config,
-                fake_backend=fake_provider,
+                fake_backend=runtime.fake_mcp_backend,
             ),
             config=config,
         )
@@ -364,6 +371,8 @@ def build_runner(
         config=config,
         dataset_loader=dataset_loader,
         orchestrator_factory=orchestrator_factory,
+        provider_name=runtime.provider_name,
+        evaluation_mode=runtime.evaluation_mode,
     )
 
 
@@ -375,10 +384,7 @@ def verify_run_directory(root: Path) -> EvaluationSummary:
     if any(not path.is_file() or path.is_symlink() for path in required):
         raise ValueError("run is incomplete: required result artifacts are missing")
 
-    raw_manifest = _load_json_object(root / "manifest.json")
-    _require_exact_keys(raw_manifest, RunManifest.model_fields, "manifest")
-    _reject_forbidden_keys(raw_manifest)
-    manifest = RunManifest.model_validate(raw_manifest)
+    manifest = _load_public_manifest(root / "manifest.json")
     if manifest.sample_size < 3 or manifest.sample_size % 3:
         raise ValueError("manifest sample size is not evenly stratified")
     expected_per_level = manifest.sample_size // 3
@@ -422,15 +428,31 @@ def _open_or_create_store(
     config: RunConfig,
     selected: Sequence[GaiaTask],
     revision: str,
+    *,
+    provider_name: str,
+    evaluation_mode: Literal["production", "test"],
 ) -> RunStore:
     manifest_path = config.output_dir.absolute() / "manifest.json"
     if manifest_path.exists():
         if not config.resume:
             raise ValueError("output directory already contains a run; pass --resume")
-        persisted = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
-        manifest = _manifest_for(config, selected, revision, started_at=persisted.started_at)
+        persisted = _load_public_manifest(manifest_path)
+        manifest = _manifest_for(
+            config,
+            selected,
+            revision,
+            provider_name=provider_name,
+            evaluation_mode=evaluation_mode,
+            started_at=persisted.started_at,
+        )
         return RunStore.open(config.output_dir, manifest)
-    manifest = _manifest_for(config, selected, revision)
+    manifest = _manifest_for(
+        config,
+        selected,
+        revision,
+        provider_name=provider_name,
+        evaluation_mode=evaluation_mode,
+    )
     return RunStore.create(config.output_dir, manifest)
 
 
@@ -439,6 +461,8 @@ def _manifest_for(
     selected: Sequence[GaiaTask],
     revision: str,
     *,
+    provider_name: str,
+    evaluation_mode: Literal["production", "test"],
     started_at: datetime | None = None,
 ) -> RunManifest:
     return RunManifest(
@@ -448,6 +472,8 @@ def _manifest_for(
         seed=config.seed,
         run_id=f"gaia-seed{config.seed}-n{config.sample_size}",
         model=config.model,
+        provider_name=provider_name,
+        evaluation_mode=evaluation_mode,
         reasoning_effort=config.reasoning_effort,
         dataset_revision=revision,
         limits={
@@ -469,19 +495,6 @@ def _package_versions() -> dict[str, str]:
     return {"gaia-multi-agent": package_version}
 
 
-def _fixture_attachment(root: Path, value: Any) -> Path | None:
-    if value in (None, ""):
-        return None
-    if not isinstance(value, str):
-        raise TypeError("fixture file_path must be a string")
-    resolved = (root / value).resolve()
-    if not resolved.is_relative_to(root.resolve()):
-        raise ValueError("fixture attachment path escapes the fixture directory")
-    if not resolved.is_file():
-        raise ValueError("fixture attachment does not exist")
-    return resolved
-
-
 @asynccontextmanager
 async def _stdio_client(
     task: GaiaTask,
@@ -492,101 +505,21 @@ async def _stdio_client(
     task_root = task.attachment_path.parent if task.attachment_path is not None else Path.cwd()
     attachments = (task.attachment_path,) if task.attachment_path is not None else ()
     previous = os.environ.get("GAIA_MCP_FAKE_BACKEND")
+    os.environ.pop("GAIA_MCP_FAKE_BACKEND", None)
     if fake_backend:
         os.environ["GAIA_MCP_FAKE_BACKEND"] = "1"
     client = MCPToolClient(task_root=task_root, config=config, attachments=attachments)
     try:
         entered = await client.__aenter__()
     finally:
-        if fake_backend:
-            if previous is None:
-                os.environ.pop("GAIA_MCP_FAKE_BACKEND", None)
-            else:
-                os.environ["GAIA_MCP_FAKE_BACKEND"] = previous
+        if previous is None:
+            os.environ.pop("GAIA_MCP_FAKE_BACKEND", None)
+        else:
+            os.environ["GAIA_MCP_FAKE_BACKEND"] = previous
     try:
         yield entered
     finally:
         await client.__aexit__(None, None, None)
-
-
-class _OfflineFixtureProvider:
-    """Deterministic hosted-provider double; MCP transport and server remain real."""
-
-    async def complete(
-        self,
-        request: ModelRequest,
-        executor: Any | None = None,
-    ) -> ModelResponse:
-        context = _request_context(request)
-        if request.instructions == PlannerAgent.instructions:
-            return ModelResponse(
-                parsed={
-                    "restatement": "Gather one observable source and verify the concise answer",
-                    "steps": [{"specialist": "lookup", "instruction": "Use the shared tool plane"}],
-                }
-            )
-        if request.instructions == LookupAgent.instructions:
-            if executor is None:
-                raise RuntimeError("offline lookup requires the MCP executor")
-            task_id = str(context.get("task_id", "offline-task"))
-            result = await executor.call("web_search", {"query": task_id})
-            sources = result.get("sources")
-            source_url = (
-                sources[0].get("url")
-                if isinstance(sources, list) and sources and isinstance(sources[0], Mapping)
-                else "https://example.test/source"
-            )
-            return ModelResponse(
-                parsed={
-                    "specialist": "lookup",
-                    "evidence": [
-                        {
-                            "evidence_id": f"offline-{task_id}",
-                            "kind": "source",
-                            "summary": "Deterministic hosted-backend fixture result",
-                            "source_url": source_url,
-                        }
-                    ],
-                    "candidate_answer": _offline_answer(str(context.get("question", ""))),
-                }
-            )
-        if request.instructions == CriticAgent.instructions:
-            evidence = context.get("evidence")
-            evidence_ids = [
-                item["evidence_id"]
-                for item in evidence
-                if isinstance(evidence, list)
-                and isinstance(item, Mapping)
-                and isinstance(item.get("evidence_id"), str)
-            ]
-            return ModelResponse(
-                parsed={
-                    "verdict": "approve",
-                    "feedback": "Observable source evidence is present",
-                    "checked_evidence_ids": evidence_ids,
-                    "corrected_answer": None,
-                }
-            )
-        raise ValueError("offline provider received an unsupported agent request")
-
-
-def _request_context(request: ModelRequest) -> dict[str, Any]:
-    try:
-        content = request.input_items[0]["content"]
-        text = next(item["text"] for item in content if item.get("type") == "input_text")
-        value = json.loads(text)
-    except (IndexError, KeyError, StopIteration, TypeError, json.JSONDecodeError) as error:
-        raise ValueError("offline provider received malformed input") from error
-    if not isinstance(value, dict):
-        raise TypeError("offline provider input must be an object")
-    return value
-
-
-def _offline_answer(question: str) -> str:
-    prefix = "Synthetic question "
-    if question.startswith(prefix):
-        return "synthetic gold " + question.removeprefix(prefix)
-    return "offline answer"
 
 
 def _validate_prediction_identity(prediction: TaskPrediction, task: GaiaTask) -> None:
@@ -683,6 +616,13 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"{path.name} must contain a JSON object")
     return value
+
+
+def _load_public_manifest(path: Path) -> RunManifest:
+    raw_manifest = _load_json_object(path)
+    _require_exact_keys(raw_manifest, RunManifest.model_fields, "manifest")
+    _reject_forbidden_keys(raw_manifest)
+    return RunManifest.model_validate(raw_manifest)
 
 
 def _require_exact_keys(value: Any, fields: Mapping[str, Any], label: str) -> None:

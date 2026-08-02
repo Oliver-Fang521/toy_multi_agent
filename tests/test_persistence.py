@@ -234,6 +234,14 @@ def test_manifest_requires_a_complete_typed_task_level_mapping() -> None:
         )
 
 
+def test_manifest_forbids_unknown_fields_in_public_artifacts() -> None:
+    payload = manifest_for(["task-1"]).model_dump(mode="json")
+    payload["question"] = "gated content"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        RunManifest.model_validate(payload)
+
+
 def test_prediction_level_must_match_manifest_on_append_resume_and_integrity(tmp_path, prediction) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
     wrong_level = prediction.model_copy(update={"level": 2})

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from gaia_agent.models import (
     AgentPlan,
@@ -145,6 +145,8 @@ class PublicNote(FrozenModel):
 class RunManifest(FrozenModel):
     """Public, non-gated identity of one reproducible evaluation selection."""
 
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     schema_version: int = 1
     selected_task_ids: tuple[str, ...]
     expected_levels: dict[str, Literal[1, 2, 3]]
@@ -152,6 +154,8 @@ class RunManifest(FrozenModel):
     seed: int
     run_id: str = "gaia-run"
     model: str
+    provider_name: str = "openai"
+    evaluation_mode: Literal["production", "test"] = "production"
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"]
     dataset_name: str = "gaia-benchmark"
     dataset_revision: str
@@ -176,6 +180,7 @@ class RunManifest(FrozenModel):
         for value_name, value in (
             ("run_id", self.run_id),
             ("model", self.model),
+            ("provider_name", self.provider_name),
             ("dataset_name", self.dataset_name),
             ("dataset_revision", self.dataset_revision),
             ("dataset_configuration", self.dataset_configuration),

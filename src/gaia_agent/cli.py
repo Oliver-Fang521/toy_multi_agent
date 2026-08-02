@@ -18,22 +18,16 @@ app = typer.Typer(no_args_is_help=True)
 
 @app.command()
 def evaluate(
-    sample_size: Annotated[int, typer.Option("--sample-size")] = 15,
-    seed: Annotated[int, typer.Option("--seed")] = 42,
-    model: Annotated[str, typer.Option("--model")] = "gpt-5.6-sol",
-    reasoning_effort: Annotated[str, typer.Option("--reasoning-effort")] = "medium",
-    votes: Annotated[int, typer.Option("--votes")] = 1,
-    max_steps: Annotated[int, typer.Option("--max-steps")] = 8,
-    max_tool_calls: Annotated[int, typer.Option("--max-tool-calls")] = 24,
-    timeout_seconds: Annotated[float, typer.Option("--timeout-seconds")] = 300.0,
-    output_dir: Annotated[Path, typer.Option("--output-dir")] = Path(
-        "results/gaia-15-seed42"
-    ),
-    resume: Annotated[bool, typer.Option("--resume")] = False,
-    dataset_fixture: Annotated[
-        Path | None, typer.Option("--dataset-fixture", hidden=True)
-    ] = None,
-    fake_provider: Annotated[bool, typer.Option("--fake-provider", hidden=True)] = False,
+    sample_size: Annotated[int | None, typer.Option("--sample-size")] = None,
+    seed: Annotated[int | None, typer.Option("--seed")] = None,
+    model: Annotated[str | None, typer.Option("--model")] = None,
+    reasoning_effort: Annotated[str | None, typer.Option("--reasoning-effort")] = None,
+    votes: Annotated[int | None, typer.Option("--votes")] = None,
+    max_steps: Annotated[int | None, typer.Option("--max-steps")] = None,
+    max_tool_calls: Annotated[int | None, typer.Option("--max-tool-calls")] = None,
+    timeout_seconds: Annotated[float | None, typer.Option("--timeout-seconds")] = None,
+    output_dir: Annotated[Path | None, typer.Option("--output-dir")] = None,
+    resume: Annotated[bool | None, typer.Option("--resume/--no-resume")] = None,
 ) -> None:
     """Evaluate a balanced GAIA validation sample."""
 
@@ -63,11 +57,7 @@ def evaluate(
         raise typer.Exit(code=2) from None
 
     try:
-        runner = build_runner(
-            config,
-            dataset_fixture=dataset_fixture,
-            fake_provider=fake_provider,
-        )
+        runner = build_runner(config)
         summary = asyncio.run(runner.run())
     except Exception:  # noqa: BLE001 - CLI emits a value-free failure boundary
         typer.echo("evaluation failed; no credential or gated values were printed", err=True)
