@@ -61,7 +61,6 @@
     ├── test_orchestrator.py             # routing, verification, correction, voting
     ├── test_persistence.py              # atomic checkpoints and resume guards
     ├── test_reporting.py                # aggregate/per-level metrics and privacy
-    ├── test_readme.py                   # documentation acceptance checks
     └── test_scoring.py                  # GAIA scorer parity cases
 ```
 
@@ -989,7 +988,6 @@ git commit -m "feat: add GAIA evaluation CLI"
 
 **Files:**
 - Create: `README.md`
-- Create: `tests/test_readme.py`
 - Create locally (gitignored): `results/gaia-15-seed42/*`
 - Modify only if verification exposes defects: source/test files named by the failing check
 
@@ -997,30 +995,7 @@ git commit -m "feat: add GAIA evaluation CLI"
 - Consumes: `gaia-agent evaluate`, `gaia-agent verify-results`
 - Produces: installed project, passing test suite, and verified real evaluation report
 
-- [ ] **Step 1: Write README acceptance assertions**
-
-```python
-def test_readme_documents_reproducible_evaluation() -> None:
-    text = Path("README.md").read_text(encoding="utf-8")
-    for required in [
-        "Plan → Act → Verify → Submit",
-        "HF_TOKEN",
-        "OPENAI_API_KEY",
-        "--sample-size 15",
-        "--seed 42",
-        "gaia-agent verify-results",
-        "not comparable to the full GAIA leaderboard",
-    ]:
-        assert required in text
-```
-
-- [ ] **Step 2: Run the README test and confirm failure**
-
-Run: `uv run pytest tests/test_readme.py::test_readme_documents_reproducible_evaluation -q`
-
-Expected: failure because `README.md` is absent.
-
-- [ ] **Step 3: Write concise installation, architecture, privacy, and run documentation**
+- [ ] **Step 1: Write concise installation, architecture, privacy, and run documentation**
 
 Document:
 
@@ -1034,7 +1009,7 @@ uv run gaia-agent verify-results results/gaia-15-seed42
 
 Explain how to accept GAIA's gated dataset terms, the six specialist roles, MCP process boundary, hosted sandbox cost, result artifacts, resume behavior, and why a 15-task subset is not directly comparable to the full leaderboard.
 
-- [ ] **Step 4: Run all offline quality gates from a clean environment**
+- [ ] **Step 2: Run all offline quality gates from a clean environment**
 
 Run:
 
@@ -1047,7 +1022,7 @@ uv build
 
 Expected: all tests pass, Ruff is clean, and both wheel and source distribution build successfully.
 
-- [ ] **Step 5: Check credential presence without printing values**
+- [ ] **Step 3: Check credential presence without printing values**
 
 Run:
 
@@ -1057,7 +1032,7 @@ uv run python -c 'import os; missing=[k for k in ("OPENAI_API_KEY","HF_TOKEN") i
 
 Expected: `ready`. If credentials are missing, stop before network/API execution and request only the missing secret setup.
 
-- [ ] **Step 6: Run one real smoke task and inspect its audit trail**
+- [ ] **Step 4: Run one real smoke task and inspect its audit trail**
 
 Run:
 
@@ -1068,7 +1043,7 @@ uv run gaia-agent verify-results results/smoke-3
 
 Expected: three terminal predictions, one per level; `verify-results` passes; no artifact contains `Question`, `Final answer`, `OPENAI_API_KEY`, or `HF_TOKEN` keys. Although the command selects three tasks to preserve level balance, set `max_steps=1` for this smoke run through its config override so API exposure remains bounded.
 
-- [ ] **Step 7: Run the real 15-task evaluation and verify it independently**
+- [ ] **Step 5: Run the real 15-task evaluation and verify it independently**
 
 Run:
 
@@ -1079,14 +1054,14 @@ uv run gaia-agent verify-results results/gaia-15-seed42
 
 Expected: 15 unique predictions, exactly five per GAIA level; summary totals recompute from predictions; the Markdown report contains measured overall/per-level accuracy, latency, token usage, critic outcomes, and failures.
 
-- [ ] **Step 8: Inspect the measured report and document limitations**
+- [ ] **Step 6: Inspect the measured report and document limitations**
 
 Read `results/gaia-15-seed42/report.md` and cross-check every number against `summary.json`. If failures occurred, inspect their task-local audit logs and categorize them without copying gated question/gold content into the report.
 
-- [ ] **Step 9: Commit source and documentation, excluding run artifacts**
+- [ ] **Step 7: Commit source and documentation, excluding run artifacts**
 
 ```bash
-git add README.md tests/test_readme.py
+git add README.md
 git commit -m "docs: document GAIA multi-agent evaluation"
 git status --short
 ```
