@@ -406,7 +406,7 @@ class Orchestrator:
         state.critic_verdict = "insufficient_evidence"
         self._audit(
             "quality_rejected",
-            {"reason": self._evidence_gap(state)},
+            {"category": "insufficient_evidence"},
         )
         return CriticDecision(
             verdict="insufficient_evidence",
@@ -426,7 +426,7 @@ class Orchestrator:
         self.correction_count = 1
         self._audit(
             "correction_started",
-            {"reason": decision.verdict},
+            {"verdict": decision.verdict},
         )
         if decision.verdict == "revise":
             corrected = (decision.corrected_answer or "").strip()

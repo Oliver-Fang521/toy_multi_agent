@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from gaia_agent.models import TaskPrediction, Usage
 from gaia_agent.persistence import RunManifest, RunStore
 from gaia_agent.reporting import summarize, write_reports
@@ -33,6 +35,7 @@ def prediction(
 def manifest() -> RunManifest:
     return RunManifest(
         selected_task_ids=("a", "b", "c"),
+        expected_levels={"a": 1, "b": 2, "c": 3},
         sample_size=3,
         seed=42,
         model="test-model",
@@ -126,3 +129,8 @@ def test_report_writes_are_idempotent(tmp_path) -> None:
 
     assert first == second
     assert tuple(path.read_text() for path in second) == first_contents
+
+
+def test_summary_rejects_untyped_verdict_text_before_markdown_interpolation() -> None:
+    with pytest.raises(ValueError, match="critic_verdicts"):
+        summarize([prediction("a", 1, correct=True, duration=1, verdict="approve\n# injected")])

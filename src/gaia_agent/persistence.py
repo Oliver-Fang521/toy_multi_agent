@@ -5,14 +5,22 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
-from gaia_agent.models import AgentPlan, AuditEvent, FrozenModel, TaskPrediction
+from gaia_agent.models import (
+    AgentPlan,
+    AuditEvent,
+    FrozenModel,
+    SpecialistName,
+    TaskPrediction,
+    TerminalErrorCategory,
+)
 
 _TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _OPAQUE_EVIDENCE_ID_PATTERN = re.compile(r"evidence-[0-9]{4}\Z")
@@ -21,24 +29,35 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bhf_[A-Za-z0-9_-]+\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._-]+\b", flags=re.IGNORECASE),
 )
-_BLOCKED_KEY_PARTS = (
-    "question",
-    "final_answer",
-    "reference_answer",
-    "gold",
-    "attachment",
-    "prompt",
-    "instruction",
-    "restatement",
-    "path",
-    "content",
-    "raw_evidence_id",
-    "api_key",
-    "authorization",
-    "credential",
-    "password",
-    "secret",
+_PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
+_PUBLIC_PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_PUBLIC_TOOL_NAMES = frozenset(
+    {"web_search", "read_webpage", "execute_python", "read_attachment", "submit_answer"}
 )
+_PUBLIC_ARGUMENT_KEYS = frozenset(
+    {"query", "url", "instruction", "code", "path", "attachment_ids", "answer", "evidence_ids"}
+)
+_PUBLIC_AUDIT_EVENT_TYPES = frozenset(
+    {
+        "tool_call_started",
+        "tool_call_completed",
+        "terminal_failure",
+        "plan_started",
+        "plan_completed",
+        "act_started",
+        "act_completed",
+        "correction_act_started",
+        "correction_act_completed",
+        "verify_started",
+        "verify_completed",
+        "quality_rejected",
+        "correction_started",
+        "correction_completed",
+        "submit_started",
+        "submit_completed",
+    }
+)
+_PUBLIC_CRITIC_VERDICTS = frozenset({"approve", "revise", "insufficient_evidence"})
 _PREDICTION_KEYS = frozenset(
     {
         "task_id",
@@ -56,15 +75,34 @@ _PREDICTION_KEYS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class _CheckpointState:
+    completed: dict[str, dict[str, Any]]
+    repairable: dict[str, dict[str, Any]]
+
+
+class PublicNote(FrozenModel):
+    """A deliberately small, non-textual per-task note record."""
+
+    category: Literal[
+        "checkpoint_repaired",
+        "checkpoint_skipped",
+        "checkpoint_corrupt",
+        "checkpoint_incomplete",
+    ]
+    count: int = Field(ge=0, le=1_000_000)
+
+
 class RunManifest(FrozenModel):
     """Public, non-gated identity of one reproducible evaluation selection."""
 
     schema_version: int = 1
     selected_task_ids: tuple[str, ...]
+    expected_levels: dict[str, Literal[1, 2, 3]]
     sample_size: int
     seed: int
     model: str
-    reasoning_effort: str
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"]
     dataset_revision: str
     dataset_configuration: str = "2023_all"
     limits: dict[str, int | float] = Field(default_factory=dict)
@@ -79,9 +117,34 @@ class RunManifest(FrozenModel):
             raise ValueError("sample_size must match selected_task_ids")
         if len(set(self.selected_task_ids)) != self.sample_size:
             raise ValueError("selected_task_ids must be unique")
+        if set(self.expected_levels) != set(self.selected_task_ids):
+            raise ValueError("expected_levels must exactly match selected_task_ids")
         for task_id in self.selected_task_ids:
             _validate_task_id(task_id)
+        for value_name, value in (
+            ("model", self.model),
+            ("dataset_revision", self.dataset_revision),
+            ("dataset_configuration", self.dataset_configuration),
+        ):
+            if not _PUBLIC_IDENTIFIER_PATTERN.fullmatch(value):
+                raise ValueError(f"{value_name} must be a bounded public identifier")
+        if set(self.limits) - {"max_steps", "max_tool_calls", "timeout_seconds", "votes"}:
+            raise ValueError("limits contains an unsupported public key")
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in self.limits.values()):
+            raise ValueError("limits values must be numeric")
+        if any(
+            not _PUBLIC_PACKAGE_NAME_PATTERN.fullmatch(name)
+            or not _PUBLIC_IDENTIFIER_PATTERN.fullmatch(version)
+            for name, version in self.package_versions.items()
+        ):
+            raise ValueError("package_versions must contain bounded public identifiers")
         return self
+
+    def expected_level(self, task_id: str) -> Literal[1, 2, 3]:
+        try:
+            return self.expected_levels[task_id]
+        except KeyError as error:
+            raise ValueError("task ID is not selected by this manifest") from error
 
 
 class RunStore:
@@ -142,9 +205,12 @@ class RunStore:
     def append(self, prediction: TaskPrediction) -> None:
         if prediction.task_id not in self.manifest.selected_task_ids:
             raise ValueError("prediction task ID is not selected by this manifest")
-        records = self._valid_prediction_records()
-        if prediction.task_id in records:
+        if prediction.level != self.manifest.expected_level(prediction.task_id):
+            raise ValueError("prediction level does not match the run manifest")
+        checkpoint = self._checkpoint_state()
+        if prediction.task_id in checkpoint.completed:
             raise ValueError(f"duplicate prediction for {prediction.task_id}")
+        records = checkpoint.repairable
         records[prediction.task_id] = _public_prediction_record(prediction)
         self._write_prediction_records(records)
 
@@ -157,49 +223,56 @@ class RunStore:
     def completed_task_ids(self) -> frozenset[str]:
         return frozenset(self._valid_prediction_records())
 
-    def write_plan(self, task_id: str, plan: AgentPlan | Mapping[str, Any]) -> Path:
+    def write_plan(self, task_id: str, plan: AgentPlan) -> Path:
         """Persist a plan's safe shape, never its generated textual instructions."""
 
-        if isinstance(plan, AgentPlan):
-            specialist_values = [step.specialist.value for step in plan.steps]
-        else:
-            raw_steps = plan.get("steps", ())
-            specialist_values = [
-                str(step.get("specialist", "unknown"))
-                for step in raw_steps
-                if isinstance(step, Mapping)
+        if not isinstance(plan, AgentPlan):
+            raise TypeError("plan must be an AgentPlan")
+        payload = {
+            "steps": [
+                {"index": index, "specialist": step.specialist.value}
+                for index, step in enumerate(plan.steps, start=1)
             ]
-        payload = {"step_count": len(specialist_values), "specialists": specialist_values}
+        }
         path = self.task_directory(task_id) / "plan.json"
         _atomic_write(path, _json_text(payload))
         return path
 
-    def append_note(self, task_id: str, note: Mapping[str, Any]) -> Path:
-        return self._append_task_jsonl(task_id, "notes.jsonl", _redact_value(note))
+    def append_note(self, task_id: str, note: PublicNote) -> Path:
+        if not isinstance(note, PublicNote):
+            raise TypeError("note must be a PublicNote")
+        return self._append_task_jsonl(task_id, "notes.jsonl", note.model_dump(mode="json"))
 
     def append_audit(self, task_id: str, event: AuditEvent) -> Path:
-        payload = {
+        if event.event_type not in _PUBLIC_AUDIT_EVENT_TYPES:
+            raise ValueError("audit event_type is not public")
+        payload = _public_audit_payload(event.payload)
+        record = {
             "sequence": event.sequence,
             "event_type": event.event_type,
             "timestamp": event.timestamp.astimezone(UTC).isoformat(),
-            "payload": _redact_value(event.payload),
+            "payload": payload,
         }
-        return self._append_task_jsonl(task_id, "audit.jsonl", payload)
+        return self._append_task_jsonl(task_id, "audit.jsonl", record)
 
-    def write_public_json(self, filename: str, payload: Mapping[str, Any]) -> Path:
-        if filename not in {"summary.json"}:
-            raise ValueError("unsupported public artifact filename")
-        path = self.root / filename
+    def write_summary(self, summary: Any) -> Path:
+        from gaia_agent.reporting import EvaluationSummary
+
+        if not isinstance(summary, EvaluationSummary):
+            raise TypeError("summary must be an EvaluationSummary")
+        path = self.root / "summary.json"
         _assert_contained(path, self.root)
-        _atomic_write(path, _json_text(_redact_value(payload)))
+        _atomic_write(path, _json_text(summary.model_dump(mode="json")))
         return path
 
-    def write_public_text(self, filename: str, text: str) -> Path:
-        if filename not in {"report.md"}:
-            raise ValueError("unsupported public artifact filename")
-        path = self.root / filename
+    def write_report(self, summary: Any) -> Path:
+        from gaia_agent.reporting import EvaluationSummary, _markdown_report
+
+        if not isinstance(summary, EvaluationSummary):
+            raise TypeError("summary must be an EvaluationSummary")
+        path = self.root / "report.md"
         _assert_contained(path, self.root)
-        _atomic_write(path, text)
+        _atomic_write(path, _markdown_report(self, summary))
         return path
 
     def verify_integrity(self) -> None:
@@ -216,8 +289,43 @@ class RunStore:
         for path in sorted(self.root.rglob("*")):
             if path.is_symlink():
                 raise ValueError("run artifacts must not contain symlinks")
-            if path.is_file() and path.suffix in {".json", ".jsonl"}:
-                _assert_private_json(path)
+            if path.is_file():
+                self._verify_artifact(path)
+
+    def _verify_artifact(self, path: Path) -> None:
+        relative = path.relative_to(self.root)
+        if relative in {Path("manifest.json"), Path("predictions.jsonl")}:
+            return
+        if relative == Path("summary.json"):
+            from gaia_agent.reporting import EvaluationSummary
+
+            EvaluationSummary.model_validate_json(path.read_text(encoding="utf-8"))
+            return
+        if relative == Path("report.md"):
+            from gaia_agent.reporting import EvaluationSummary, _markdown_report
+
+            summary = EvaluationSummary.model_validate_json(
+                (self.root / "summary.json").read_text(encoding="utf-8")
+            )
+            if path.read_text(encoding="utf-8") != _markdown_report(self, summary):
+                raise ValueError("report does not match the typed public summary")
+            return
+        parts = relative.parts
+        if len(parts) != 3 or parts[0] != "tasks":
+            raise ValueError("run artifact is not allowlisted")
+        _validate_task_id(parts[1])
+        if parts[1] not in self.manifest.selected_task_ids:
+            raise ValueError("task artifact is not selected by this manifest")
+        if parts[2] == "plan.json":
+            _validate_plan_record(json.loads(path.read_text(encoding="utf-8")))
+        elif parts[2] == "notes.jsonl":
+            for value in _read_jsonl(path):
+                PublicNote.model_validate(value)
+        elif parts[2] == "audit.jsonl":
+            for value in _read_jsonl(path):
+                _validate_audit_record(value)
+        else:
+            raise ValueError("task artifact is not allowlisted")
 
     def _append_task_jsonl(self, task_id: str, filename: str, payload: Any) -> Path:
         directory = self.task_directory(task_id)
@@ -236,17 +344,31 @@ class RunStore:
         }
 
     def _valid_prediction_records(self) -> dict[str, dict[str, Any]]:
-        raw_records = _read_jsonl(self.predictions_path)
+        return self._checkpoint_state().completed
+
+    def _checkpoint_state(self) -> _CheckpointState:
         grouped: dict[str, list[dict[str, Any]]] = {}
-        for raw_record in raw_records:
-            record = _validated_prediction_record(raw_record, self.manifest.selected_task_ids)
+        invalid_task_ids: set[str] = set()
+        unattributed_corruption = False
+        for raw_record in _read_jsonl(self.predictions_path):
+            record = _validated_prediction_record(raw_record, self.manifest.expected_levels)
             if record is not None:
                 grouped.setdefault(record["task_id"], []).append(record)
-        return {
+                continue
+            if isinstance(raw_record, Mapping) and raw_record.get("task_id") in self.manifest.selected_task_ids:
+                invalid_task_ids.add(raw_record["task_id"])
+            else:
+                unattributed_corruption = True
+        repairable = {
             task_id: records[0]
             for task_id, records in grouped.items()
-            if len(records) == 1
+            if len(records) == 1 and task_id not in invalid_task_ids
         }
+        completed = {} if unattributed_corruption else repairable
+        return _CheckpointState(
+            completed=completed,
+            repairable=repairable,
+        )
 
     def _write_prediction_records(self, records: Mapping[str, Mapping[str, Any]]) -> None:
         ordered = [records[task_id] for task_id in self.manifest.selected_task_ids if task_id in records]
@@ -328,7 +450,97 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
+def _public_audit_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    allowed_keys = {
+        "task_id",
+        "tool",
+        "call_number",
+        "argument_keys",
+        "result_keys",
+        "category",
+        "critic_verdict",
+        "step_count",
+        "specialists",
+        "specialist",
+        "step_number",
+        "evidence_ids",
+        "checked_evidence_ids",
+        "has_candidate",
+        "verdict",
+    }
+    if set(payload) - allowed_keys:
+        raise ValueError("audit payload contains an unsupported public key")
+    public: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "task_id":
+            if not isinstance(value, str):
+                raise ValueError("audit task_id must be a public identifier")
+            _validate_task_id(value)
+        elif key == "tool":
+            if value not in _PUBLIC_TOOL_NAMES:
+                raise ValueError("audit tool is not allowlisted")
+        elif key in {"call_number", "step_count", "step_number"}:
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000_000:
+                raise ValueError("audit counter must be a bounded integer")
+        elif key in {"argument_keys", "result_keys"}:
+            if not isinstance(value, list) or any(item not in _PUBLIC_ARGUMENT_KEYS for item in value):
+                raise ValueError("audit key names are not allowlisted")
+            if len(value) > 32:
+                raise ValueError("audit key names exceed the public limit")
+        elif key in {"category", "critic_verdict", "verdict"}:
+            if value not in _PUBLIC_CRITIC_VERDICTS | {item.value for item in TerminalErrorCategory}:
+                raise ValueError("audit category is not allowlisted")
+        elif key == "specialist":
+            if value not in {item.value for item in SpecialistName}:
+                raise ValueError("audit specialist is not allowlisted")
+        elif key == "specialists":
+            if not isinstance(value, list) or any(item not in {role.value for role in SpecialistName} for item in value):
+                raise ValueError("audit specialists are not allowlisted")
+            if len(value) > 32:
+                raise ValueError("audit specialists exceed the public limit")
+        elif key in {"evidence_ids", "checked_evidence_ids"}:
+            if not isinstance(value, list) or any(
+                not isinstance(item, str) or not _OPAQUE_EVIDENCE_ID_PATTERN.fullmatch(item)
+                for item in value
+            ):
+                raise ValueError("audit evidence IDs must be trusted opaque IDs")
+            if len(value) > 9_999:
+                raise ValueError("audit evidence IDs exceed the public limit")
+        elif key == "has_candidate" and not isinstance(value, bool):
+            raise ValueError("audit has_candidate must be boolean")
+        public[key] = value
+    return public
+
+
+def _validate_plan_record(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {"steps"} or not isinstance(value["steps"], list):
+        raise ValueError("plan artifact is not a public plan shape")
+    for index, step in enumerate(value["steps"], start=1):
+        if not isinstance(step, dict) or set(step) != {"index", "specialist"}:
+            raise ValueError("plan artifact contains an unsupported field")
+        if step["index"] != index or step["specialist"] not in {role.value for role in SpecialistName}:
+            raise ValueError("plan artifact contains an invalid public value")
+
+
+def _validate_audit_record(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {"sequence", "event_type", "timestamp", "payload"}:
+        raise ValueError("audit artifact is not a public audit shape")
+    if not isinstance(value["sequence"], int) or value["sequence"] < 1:
+        raise ValueError("audit sequence must be a positive integer")
+    if value["event_type"] not in _PUBLIC_AUDIT_EVENT_TYPES or not isinstance(value["timestamp"], str):
+        raise ValueError("audit event is not public")
+    try:
+        datetime.fromisoformat(value["timestamp"])
+    except ValueError as error:
+        raise ValueError("audit timestamp is invalid") from error
+    if not isinstance(value["payload"], Mapping):
+        raise TypeError("audit payload must be a mapping")
+    _public_audit_payload(value["payload"])
+
+
 def _public_prediction_record(prediction: TaskPrediction) -> dict[str, Any]:
+    if prediction.critic_verdict not in _PUBLIC_CRITIC_VERDICTS:
+        raise ValueError("prediction critic_verdict is not public")
     evidence_ids = [
         evidence_id
         for evidence_id in prediction.evidence_ids
@@ -337,11 +549,11 @@ def _public_prediction_record(prediction: TaskPrediction) -> dict[str, Any]:
     return {
         "task_id": prediction.task_id,
         "level": prediction.level,
-        "answer": _redact_value(prediction.answer),
+        "answer": _redact_answer(prediction.answer),
         "correct": prediction.correct,
         "duration_seconds": prediction.duration_seconds,
         "usage": prediction.usage.model_dump(mode="json"),
-        "critic_verdict": _redact_value(prediction.critic_verdict),
+        "critic_verdict": prediction.critic_verdict,
         "evidence_ids": evidence_ids,
         "error_category": (
             prediction.error_category.value if prediction.error_category is not None else None
@@ -357,13 +569,14 @@ def _prediction_from_record(record: Mapping[str, Any]) -> TaskPrediction:
 
 def _validated_prediction_record(
     record: Any,
-    selected_task_ids: Sequence[str],
+    expected_levels: Mapping[str, Literal[1, 2, 3]],
 ) -> dict[str, Any] | None:
     if not isinstance(record, dict) or set(record) != _PREDICTION_KEYS:
         return None
-    if record.get("task_id") not in selected_task_ids:
+    task_id = record.get("task_id")
+    if task_id not in expected_levels:
         return None
-    if record.get("level") not in {1, 2, 3} or not isinstance(record.get("correct"), bool):
+    if record.get("level") != expected_levels[task_id] or not isinstance(record.get("correct"), bool):
         return None
     if not isinstance(record.get("answer"), str | type(None)):
         return None
@@ -417,33 +630,15 @@ def _read_jsonl(path: Path) -> list[Any]:
     return records
 
 
-def _redact_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        safe: dict[str, Any] = {}
-        for key, item in value.items():
-            string_key = str(key)
-            if _is_blocked_key(string_key):
-                continue
-            if string_key == "evidence_ids":
-                safe[string_key] = [
-                    evidence_id
-                    for evidence_id in item
-                    if isinstance(evidence_id, str)
-                    and _OPAQUE_EVIDENCE_ID_PATTERN.fullmatch(evidence_id)
-                ] if isinstance(item, list | tuple) else []
-            else:
-                safe[string_key] = _redact_value(item)
-        return safe
-    if isinstance(value, list | tuple):
-        return [_redact_value(item) for item in value]
-    if isinstance(value, str):
-        redacted = value
-        for pattern in _SECRET_VALUE_PATTERNS:
-            redacted = pattern.sub("[REDACTED]", redacted)
-        for known_secret in _known_secret_values():
-            redacted = redacted.replace(known_secret, "[REDACTED]")
-        return redacted
-    return value
+def _redact_answer(answer: str | None) -> str | None:
+    if answer is None:
+        return None
+    redacted = answer
+    for pattern in _SECRET_VALUE_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    for known_secret in _known_secret_values():
+        redacted = redacted.replace(known_secret, "[REDACTED]")
+    return redacted
 
 
 def _known_secret_values() -> tuple[str, ...]:
@@ -452,55 +647,3 @@ def _known_secret_values() -> tuple[str, ...]:
         for value in (os.environ.get("OPENAI_API_KEY"), os.environ.get("HF_TOKEN"))
         if value
     )
-
-
-def _is_blocked_key(key: str) -> bool:
-    lowered = key.casefold()
-    return (
-        lowered == "evidence_id"
-        or lowered == "token"
-        or lowered.endswith("_token")
-        or any(part in lowered for part in _BLOCKED_KEY_PARTS)
-    )
-
-
-def _assert_private_json(path: Path) -> None:
-    if path.is_symlink():
-        raise ValueError("run artifacts must not contain symlinks")
-    if path.suffix == ".jsonl":
-        values = _read_jsonl(path)
-    else:
-        try:
-            values = [json.loads(path.read_text(encoding="utf-8"))]
-        except (OSError, json.JSONDecodeError) as error:
-            raise ValueError("public JSON artifact is malformed") from error
-    for value in values:
-        if _contains_private_value(value):
-            raise ValueError("public artifact contains gated or secret material")
-
-
-def _contains_private_value(value: Any) -> bool:
-    if isinstance(value, Mapping):
-        return any(
-            _is_blocked_key(str(key))
-            or (
-                str(key) == "evidence_ids"
-                and (
-                    not isinstance(item, list)
-                    or any(
-                        not isinstance(evidence_id, str)
-                        or not _OPAQUE_EVIDENCE_ID_PATTERN.fullmatch(evidence_id)
-                        for evidence_id in item
-                    )
-                )
-            )
-            or _contains_private_value(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, list | tuple):
-        return any(_contains_private_value(item) for item in value)
-    if isinstance(value, str):
-        return any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS) or any(
-            secret in value for secret in _known_secret_values()
-        )
-    return False

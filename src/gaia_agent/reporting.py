@@ -8,7 +8,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
-from gaia_agent.models import FrozenModel, TaskPrediction, Usage
+from pydantic import model_validator
+
+from gaia_agent.models import FrozenModel, TaskPrediction, TerminalErrorCategory, Usage
 from gaia_agent.persistence import RunStore
 
 
@@ -36,6 +38,34 @@ class EvaluationSummary(FrozenModel):
     p95_seconds: float | None
     critic_verdicts: dict[str, int]
     failure_categories: dict[str, int]
+
+    @model_validator(mode="after")
+    def validate_public_report_values(self) -> EvaluationSummary:
+        if set(self.by_level) != {1, 2, 3}:
+            raise ValueError("by_level must contain all GAIA levels")
+        if set(self.critic_verdicts) - {"approve", "revise", "insufficient_evidence"}:
+            raise ValueError("critic_verdicts contains a non-public verdict")
+        if set(self.failure_categories) - {item.value for item in TerminalErrorCategory}:
+            raise ValueError("failure_categories contains a non-public category")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for values in (self.critic_verdicts, self.failure_categories)
+            for value in values.values()
+        ):
+            raise ValueError("report counters must be non-negative integers")
+        if (
+            self.input_tokens,
+            self.output_tokens,
+            self.reasoning_tokens,
+            self.total_tokens,
+        ) != (
+            self.usage.input_tokens,
+            self.usage.output_tokens,
+            self.usage.reasoning_tokens,
+            self.usage.total_tokens,
+        ):
+            raise ValueError("report token totals must match usage")
+        return self
 
 
 def summarize(predictions: Sequence[TaskPrediction]) -> EvaluationSummary:
@@ -79,8 +109,8 @@ def summarize(predictions: Sequence[TaskPrediction]) -> EvaluationSummary:
 def write_reports(store: RunStore, summary: EvaluationSummary) -> tuple[Path, Path]:
     """Write stable JSON and Markdown views of aggregate-only evaluation results."""
 
-    summary_path = store.write_public_json("summary.json", summary.model_dump(mode="json"))
-    report_path = store.write_public_text("report.md", _markdown_report(store, summary))
+    summary_path = store.write_summary(summary)
+    report_path = store.write_report(summary)
     return summary_path, report_path
 
 
