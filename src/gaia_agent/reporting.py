@@ -6,7 +6,6 @@ import math
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
 
 from pydantic import model_validator
 
@@ -27,7 +26,7 @@ class EvaluationSummary(FrozenModel):
     total: int
     correct: int
     accuracy: float | None
-    by_level: dict[Literal[1, 2, 3], LevelMetrics]
+    by_level: dict[int, LevelMetrics]
     usage: Usage
     input_tokens: int
     output_tokens: int
