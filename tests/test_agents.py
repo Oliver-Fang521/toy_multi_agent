@@ -1,0 +1,557 @@
+import json
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from gaia_agent.agents import (
+    ComputationAgent,
+    CriticAgent,
+    FileAnalysisAgent,
+    LookupAgent,
+    PlannerAgent,
+    VisualAgent,
+)
+from gaia_agent.models import Evidence, PlanStep, SpecialistName, Usage
+
+
+@pytest.mark.asyncio
+async def test_planner_emits_bounded_specialist_steps_without_tools(fake_provider, task) -> None:
+    fake_provider.return_parsed(
+        {
+            "restatement": "Find and verify the requested fact",
+            "steps": [{"specialist": "lookup", "instruction": "Find a primary source"}],
+        }
+    )
+
+    plan = await PlannerAgent(fake_provider, max_steps=4).plan(task)
+
+    assert plan.steps[0].specialist == SpecialistName.LOOKUP
+    assert fake_provider.requests[0].allowed_tools == ()
+    assert fake_provider.executors == [None]
+
+
+def test_specialist_tool_allowlists_are_narrow() -> None:
+    assert LookupAgent.allowed_tool_names == frozenset({"web_search", "read_webpage"})
+    assert ComputationAgent.allowed_tool_names == frozenset({"execute_python"})
+    assert FileAnalysisAgent.allowed_tool_names == frozenset(
+        {"read_attachment", "execute_python"}
+    )
+    assert VisualAgent.allowed_tool_names == frozenset({"read_attachment"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("steps", [[], [{"specialist": "lookup", "instruction": "x"}] * 5])
+async def test_planner_rejects_empty_or_oversized_plans(fake_provider, task, steps) -> None:
+    fake_provider.return_parsed({"restatement": "Bounded plan", "steps": steps})
+
+    with pytest.raises(ValueError, match="between 1 and 4"):
+        await PlannerAgent(fake_provider, max_steps=4).plan(task)
+
+
+@pytest.mark.asyncio
+async def test_planner_request_has_a_recursive_strict_schema_and_baked_in_bounds(
+    fake_provider, task
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "restatement": "Use lookup",
+            "steps": [{"specialist": "lookup", "instruction": "Find a source"}],
+        }
+    )
+
+    await PlannerAgent(fake_provider, max_steps=4).plan(task)
+    schema = fake_provider.requests[0].output_schema
+
+    _assert_all_object_schemas_are_strict(schema)
+    assert schema["properties"]["steps"]["minItems"] == 1
+    assert schema["properties"]["steps"]["maxItems"] == 4
+
+
+@pytest.mark.asyncio
+async def test_planner_context_is_deterministic_and_excludes_reference_answer(
+    fake_provider, image_task
+) -> None:
+    parsed = {
+        "restatement": "Inspect the image",
+        "steps": [{"specialist": "visual", "instruction": "Inspect visible evidence"}],
+    }
+    fake_provider.return_parsed(parsed)
+    fake_provider.return_parsed(parsed)
+    planner = PlannerAgent(fake_provider, max_steps=2)
+
+    await planner.plan(image_task)
+    await planner.plan(image_task)
+    first = fake_provider.requests[0].input_items
+    second = fake_provider.requests[1].input_items
+    context = json.loads(first[0]["content"][0]["text"])
+
+    assert first == second
+    assert context == {
+        "attachment": "synthetic.png",
+        "level": 2,
+        "question": "What is visible in the image?",
+        "task_id": "synthetic-image-task",
+    }
+    assert "Hidden Image Answer" not in repr(first)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_type", "specialist", "tool_names", "kind"),
+    [
+        (LookupAgent, SpecialistName.LOOKUP, ["web_search", "read_webpage"], "source"),
+        (ComputationAgent, SpecialistName.COMPUTATION, ["execute_python"], "computation"),
+    ],
+)
+async def test_specialist_filters_mcp_specs_and_parses_typed_result(
+    fake_provider,
+    fake_tools,
+    task,
+    agent_type,
+    specialist,
+    tool_names,
+    kind,
+) -> None:
+    source_url = "https://primary.example/fact" if kind == "source" else None
+    fake_provider.return_parsed(
+        {
+            "specialist": specialist.value,
+            "evidence": [
+                {
+                    "evidence_id": f"{kind}-1",
+                    "kind": kind,
+                    "summary": "Observable result",
+                    "source_url": source_url,
+                }
+            ],
+            "candidate_answer": "  Marie Curie  ",
+        },
+        usage=Usage(input_tokens=10, output_tokens=4, total_tokens=14),
+    )
+    step = PlanStep(specialist=specialist, instruction="Perform the assigned step")
+
+    result = await agent_type(fake_provider).run(task, step, (), fake_tools)
+
+    assert result.specialist == specialist
+    assert result.candidate_answer == "Marie Curie"
+    assert result.evidence[0].source_url == source_url
+    assert result.usage.total_tokens == 14
+    assert [tool.name for tool in fake_provider.requests[0].allowed_tools] == tool_names
+    assert fake_provider.executors == [fake_tools]
+    assert fake_tools.calls == []
+    _assert_all_object_schemas_are_strict(fake_provider.requests[0].output_schema)
+
+
+@pytest.mark.asyncio
+async def test_file_agent_routes_registered_attachment_without_exposing_gold(
+    fake_provider, fake_tools, image_task
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "specialist": "file",
+            "evidence": [
+                {
+                    "evidence_id": "file-1",
+                    "kind": "file",
+                    "summary": "PNG attachment metadata",
+                    "source_url": None,
+                }
+            ],
+            "candidate_answer": None,
+        }
+    )
+    step = PlanStep(specialist="file", instruction="Inspect the attachment")
+
+    await FileAnalysisAgent(fake_provider).run(image_task, step, (), fake_tools)
+    request = fake_provider.requests[0]
+    context = json.loads(request.input_items[0]["content"][0]["text"])
+
+    assert [tool.name for tool in request.allowed_tools] == [
+        "execute_python",
+        "read_attachment",
+    ]
+    assert context["attachment"]["path"] == str(image_task.attachment_path)
+    assert context["attachment"]["media_type"] == "image/png"
+    assert "Hidden Image Answer" not in repr(request.input_items)
+
+
+@pytest.mark.asyncio
+async def test_visual_agent_sends_high_detail_image_and_retains_read_tool(
+    fake_provider, fake_tools, image_task
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "specialist": "visual",
+            "evidence": [
+                {
+                    "evidence_id": "visual-1",
+                    "kind": "visual",
+                    "summary": "A blue synthetic object is visible",
+                    "source_url": None,
+                }
+            ],
+            "candidate_answer": "blue object",
+        }
+    )
+    step = PlanStep(specialist="visual", instruction="Inspect the image")
+
+    result = await VisualAgent(fake_provider).run(image_task, step, (), fake_tools)
+    request = fake_provider.requests[0]
+    content = request.input_items[0]["content"]
+    image = next(item for item in content if item["type"] == "input_image")
+
+    assert result.evidence[0].kind == "visual"
+    assert image["detail"] == "high"
+    assert image["image_url"].startswith("data:image/png;base64,")
+    assert [tool.name for tool in request.allowed_tools] == ["read_attachment"]
+
+
+@pytest.mark.asyncio
+async def test_specialist_context_serializes_prior_evidence_in_order(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "lookup", "evidence": [], "candidate_answer": None}
+    )
+    evidence = (
+        Evidence(
+            evidence_id="source-2",
+            kind="source",
+            summary="Second",
+            source_url="https://two.example",
+        ),
+        Evidence(
+            evidence_id="source-1",
+            kind="source",
+            summary="First",
+            source_url="https://one.example",
+        ),
+    )
+    step = PlanStep(specialist="lookup", instruction="Cross-check")
+
+    await LookupAgent(fake_provider).run(task, step, evidence, fake_tools)
+    context = json.loads(fake_provider.requests[0].input_items[0]["content"][0]["text"])
+
+    assert [item["evidence_id"] for item in context["evidence"]] == ["source-2", "source-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parsed", "message"),
+    [
+        (
+            {
+                "specialist": "lookup",
+                "evidence": [
+                    {
+                        "evidence_id": "",
+                        "kind": "source",
+                        "summary": "Missing identity",
+                        "source_url": "https://example.test",
+                    }
+                ],
+                "candidate_answer": None,
+            },
+            "evidence IDs must be non-empty",
+        ),
+        (
+            {
+                "specialist": "lookup",
+                "evidence": [
+                    {
+                        "evidence_id": "source-1",
+                        "kind": "source",
+                        "summary": "One",
+                        "source_url": "https://example.test/one",
+                    },
+                    {
+                        "evidence_id": "source-1",
+                        "kind": "source",
+                        "summary": "Two",
+                        "source_url": "https://example.test/two",
+                    },
+                ],
+                "candidate_answer": None,
+            },
+            "evidence IDs must be unique",
+        ),
+        (
+            {
+                "specialist": "lookup",
+                "evidence": [
+                    {
+                        "evidence_id": "source-1",
+                        "kind": "source",
+                        "summary": "No source URL",
+                        "source_url": None,
+                    }
+                ],
+                "candidate_answer": None,
+            },
+            "source evidence must include a URL",
+        ),
+    ],
+)
+async def test_specialist_rejects_untraceable_evidence(
+    fake_provider, fake_tools, task, parsed, message
+) -> None:
+    fake_provider.return_parsed(parsed)
+    step = PlanStep(specialist="lookup", instruction="Find a source")
+
+    with pytest.raises(ValueError, match=message):
+        await LookupAgent(fake_provider).run(task, step, (), fake_tools)
+
+
+@pytest.mark.asyncio
+async def test_specialist_rejects_a_result_for_the_wrong_role(fake_provider, fake_tools, task) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "computation", "evidence": [], "candidate_answer": "42"}
+    )
+    step = PlanStep(specialist="lookup", instruction="Find a source")
+
+    with pytest.raises((ValueError, ValidationError), match="specialist"):
+        await LookupAgent(fake_provider).run(task, step, (), fake_tools)
+
+
+@pytest.mark.asyncio
+async def test_critic_uses_only_verification_tools_and_returns_typed_decision(
+    fake_provider, fake_tools, task
+) -> None:
+    evidence = (
+        Evidence(
+            evidence_id="source-1",
+            kind="source",
+            summary="Primary source supports the candidate",
+            source_url="https://primary.example/fact",
+        ),
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "The cited source supports the candidate.",
+            "checked_evidence_ids": ["source-1"],
+            "corrected_answer": None,
+        }
+    )
+
+    decision = await CriticAgent(fake_provider).verify(
+        task, "Marie Curie", evidence, fake_tools
+    )
+    request = fake_provider.requests[0]
+
+    assert decision.verdict == "approve"
+    assert decision.checked_evidence_ids == ("source-1",)
+    assert [tool.name for tool in request.allowed_tools] == [
+        "web_search",
+        "read_webpage",
+        "execute_python",
+    ]
+    assert fake_provider.executors == [fake_tools]
+    assert fake_tools.calls == []
+    _assert_all_object_schemas_are_strict(request.output_schema)
+    assert request.output_schema["properties"]["verdict"]["enum"] == [
+        "approve",
+        "revise",
+        "insufficient_evidence",
+    ]
+    assert "Hidden Reference Answer" not in repr(request.input_items)
+
+
+@pytest.mark.asyncio
+async def test_critic_approval_must_name_existing_checked_evidence(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "Unsupported approval",
+            "checked_evidence_ids": [],
+            "corrected_answer": None,
+        }
+    )
+
+    with pytest.raises(ValueError, match="approved critic decision must name checked evidence"):
+        await CriticAgent(fake_provider).verify(task, "Marie Curie", (), fake_tools)
+
+
+@pytest.mark.asyncio
+async def test_critic_rejects_unknown_checked_evidence_id(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "Claims to have checked missing evidence",
+            "checked_evidence_ids": ["source-missing"],
+            "corrected_answer": None,
+        }
+    )
+
+    with pytest.raises(ValueError, match="unknown evidence IDs"):
+        await CriticAgent(fake_provider).verify(task, "Marie Curie", (), fake_tools)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "corrected_answer", "message"),
+    [
+        ("revise", None, "revised critic decision must propose one correction"),
+        ("approve", "different answer", "only a revised critic decision may correct"),
+        (
+            "insufficient_evidence",
+            "free answer",
+            "only a revised critic decision may correct",
+        ),
+    ],
+)
+async def test_critic_correction_is_single_and_verdict_scoped(
+    fake_provider, fake_tools, task, verdict, corrected_answer, message
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": verdict,
+            "feedback": "Check the evidence",
+            "checked_evidence_ids": [],
+            "corrected_answer": corrected_answer,
+        }
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await CriticAgent(fake_provider).verify(task, "candidate", (), fake_tools)
+
+
+@pytest.mark.asyncio
+async def test_critic_rejects_an_unknown_verdict(fake_provider, fake_tools, task) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": "maybe",
+            "feedback": "Unstructured indecision",
+            "checked_evidence_ids": [],
+            "corrected_answer": None,
+        }
+    )
+
+    with pytest.raises(ValidationError, match="verdict"):
+        await CriticAgent(fake_provider).verify(task, "candidate", (), fake_tools)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corrected_answer", ["FINAL ANSWER: 42", "42\nExplanation"])
+async def test_critic_rejects_a_non_concise_correction(
+    fake_provider, fake_tools, task, corrected_answer
+) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": "revise",
+            "feedback": "A correction is needed",
+            "checked_evidence_ids": [],
+            "corrected_answer": corrected_answer,
+        }
+    )
+
+    with pytest.raises(ValueError, match="concise GAIA format"):
+        await CriticAgent(fake_provider).verify(task, "candidate", (), fake_tools)
+
+
+@pytest.mark.asyncio
+async def test_critic_cannot_approve_a_missing_candidate(
+    fake_provider, fake_tools, task
+) -> None:
+    evidence = (
+        Evidence(
+            evidence_id="source-1",
+            kind="source",
+            summary="A checked source",
+            source_url="https://example.test",
+        ),
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "No candidate exists",
+            "checked_evidence_ids": ["source-1"],
+            "corrected_answer": None,
+        }
+    )
+
+    with pytest.raises(ValueError, match="cannot approve a missing candidate"):
+        await CriticAgent(fake_provider).verify(task, None, evidence, fake_tools)
+
+
+def test_role_prompts_enforce_grounded_observable_and_concise_behavior() -> None:
+    planner_prompt = PlannerAgent.instructions.lower()
+    assert "do not answer" in planner_prompt
+    assert "observable" in planner_prompt
+    for agent_type in (LookupAgent, ComputationAgent, FileAnalysisAgent, VisualAgent):
+        prompt = agent_type.instructions.lower()
+        assert "observable" in prompt
+        assert "hidden reasoning" in prompt
+        assert "invent" in prompt
+        assert "concise" in prompt or "few words" in prompt
+    critic_prompt = CriticAgent.instructions.lower()
+    assert "insufficient or contradictory" in critic_prompt
+    assert "exactly one concise correction" in critic_prompt
+    assert "do not solve the task freely" in critic_prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidate", ["", "FINAL ANSWER: 42", "42\nExplanation"])
+async def test_specialist_rejects_non_concise_candidate_format(
+    fake_provider, fake_tools, task, candidate
+) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "computation", "evidence": [], "candidate_answer": candidate}
+    )
+    step = PlanStep(specialist="computation", instruction="Calculate")
+
+    with pytest.raises(ValueError, match="concise GAIA format"):
+        await ComputationAgent(fake_provider).run(task, step, (), fake_tools)
+
+
+@pytest.mark.asyncio
+async def test_visual_agent_rejects_non_image_attachment(
+    fake_provider, fake_tools, task, tmp_path
+) -> None:
+    text_path = tmp_path / "notes.txt"
+    text_path.write_text("not an image", encoding="utf-8")
+    text_task = task.model_copy(update={"attachment_path": text_path})
+    step = PlanStep(specialist="visual", instruction="Inspect")
+
+    with pytest.raises(ValueError, match="requires an image attachment"):
+        await VisualAgent(fake_provider).run(text_task, step, (), fake_tools)
+    assert fake_provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_specialist_schema_is_role_specific_and_does_not_ask_model_for_usage(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "computation", "evidence": [], "candidate_answer": "42"}
+    )
+    step = PlanStep(specialist="computation", instruction="Calculate")
+
+    await ComputationAgent(fake_provider).run(task, step, (), fake_tools)
+    schema = fake_provider.requests[0].output_schema
+
+    assert schema["properties"]["specialist"] == {
+        "type": "string",
+        "const": "computation",
+    }
+    assert schema["$defs"]["Evidence"]["properties"]["kind"]["enum"] == [
+        "computation"
+    ]
+    assert "usage" not in schema["properties"]
+
+
+def _assert_all_object_schemas_are_strict(value: Any) -> None:
+    if isinstance(value, dict):
+        if value.get("type") == "object":
+            assert value.get("additionalProperties") is False
+            assert set(value.get("required", ())) == set(value.get("properties", ()))
+        for child in value.values():
+            _assert_all_object_schemas_are_strict(child)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_all_object_schemas_are_strict(child)
