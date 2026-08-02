@@ -29,7 +29,7 @@ from gaia_agent.models import (
     Usage,
 )
 from gaia_agent.providers import ToolSpec
-from gaia_agent.scoring import normalize_number
+from gaia_agent.scoring import parse_number_with_status
 
 
 class Planner(Protocol):
@@ -541,7 +541,8 @@ def _add_usage(first: Usage, second: Usage) -> Usage:
 def _numeric_value(answer: str | None) -> float | None:
     if answer is None:
         return None
-    return normalize_number(answer)
+    success, normalized = parse_number_with_status(answer)
+    return normalized if success else None
 
 
 def _normalize_for_voting(answer: str | None) -> str:

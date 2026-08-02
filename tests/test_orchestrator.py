@@ -932,6 +932,19 @@ def test_choose_majority_uses_scorer_numeric_equivalence(
     assert winner.error_category is None
 
 
+def test_choose_majority_does_not_treat_parse_failure_as_valid_infinity() -> None:
+    result = choose_majority(
+        [
+            _prediction("not a number", 0),
+            _prediction("inf", 1),
+            _prediction("different", 2),
+        ],
+        votes=3,
+    )
+
+    assert result.error_category is TerminalErrorCategory.NO_CONSENSUS
+
+
 def test_choose_majority_returns_typed_no_consensus_without_gold() -> None:
     predictions = [_prediction("A", 0), _prediction("B", 1), _prediction("C", 2)]
 

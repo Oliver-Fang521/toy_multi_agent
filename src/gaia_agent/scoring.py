@@ -2,13 +2,18 @@ import re
 import string
 
 
-def normalize_number(number: str) -> float | None:
+def parse_number_with_status(number: str) -> tuple[bool, float]:
     for char in ["$", "%", ","]:
         number = number.replace(char, "")
     try:
-        return float(number)
+        return True, float(number)
     except ValueError:
-        return None
+        return False, float("inf")
+
+
+def normalize_number(number: str) -> float:
+    _, normalized = parse_number_with_status(number)
+    return normalized
 
 
 def _normalize_string(value: str, *, remove_punctuation: bool = True) -> str:
