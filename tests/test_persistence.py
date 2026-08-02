@@ -492,3 +492,47 @@ def test_credential_shaped_public_identifiers_are_rejected(identifier) -> None:
             reasoning_effort="medium",
             dataset_revision="synthetic-revision",
         )
+
+
+def test_terminal_failure_rejects_extra_known_verdict_without_persisting(tmp_path, prediction) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+
+    with pytest.raises(ValueError, match="terminal_failure"):
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=1,
+                event_type="terminal_failure",
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={
+                    "category": "timeout",
+                    "critic_verdict": "not_run",
+                    "verdict": "gated question and model prompt",
+                },
+            ),
+        )
+
+    assert not (store.task_directory(prediction.task_id) / "audit.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        ("terminal_failure", {"category": "timeout", "critic_verdict": "not_run", "verdict": "approve"}),
+        ("verify_completed", {"verdict": "approve", "category": "timeout"}),
+        ("tool_call_started", {"tool": "web_search", "call_number": 1, "argument_keys": ["query"], "result_keys": ["answer", "sources"]}),
+    ],
+)
+def test_audit_event_rejects_known_keys_from_the_wrong_event(tmp_path, prediction, event_type, payload) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+
+    with pytest.raises(ValueError):
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=1,
+                event_type=event_type,
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload=payload,
+            ),
+        )

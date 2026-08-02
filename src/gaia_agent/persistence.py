@@ -85,6 +85,26 @@ _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
         "submit_completed",
     }
 )
+_PUBLIC_AUDIT_EVENT_KEYS = {
+    "tool_call_started": frozenset({"tool", "call_number", "argument_keys"}),
+    "tool_call_completed": frozenset({"tool", "call_number", "argument_keys", "result_keys"}),
+    "terminal_failure": frozenset({"category", "critic_verdict"}),
+    "plan_started": frozenset({"task_id"}),
+    "plan_completed": frozenset({"task_id", "step_count", "specialists"}),
+    "act_started": frozenset({"specialist", "step_number"}),
+    "act_completed": frozenset({"specialist", "step_number", "evidence_ids", "has_candidate"}),
+    "correction_act_started": frozenset({"specialist", "step_number"}),
+    "correction_act_completed": frozenset(
+        {"specialist", "step_number", "evidence_ids", "has_candidate"}
+    ),
+    "verify_started": frozenset({"evidence_ids", "has_candidate"}),
+    "verify_completed": frozenset({"verdict", "checked_evidence_ids"}),
+    "quality_rejected": frozenset({"category"}),
+    "correction_started": frozenset({"verdict"}),
+    "correction_completed": frozenset({"evidence_ids", "has_candidate"}),
+    "submit_started": frozenset({"evidence_ids"}),
+    "submit_completed": frozenset({"evidence_ids"}),
+}
 _PUBLIC_CRITIC_VERDICTS = frozenset({"approve", "revise", "insufficient_evidence", "not_run"})
 _NORMAL_CRITIC_VERDICTS = _PUBLIC_CRITIC_VERDICTS - {"not_run"}
 _PREDICTION_KEYS = frozenset(
@@ -500,25 +520,8 @@ def _json_text(value: Any) -> str:
 
 
 def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-    allowed_keys = {
-        "task_id",
-        "tool",
-        "call_number",
-        "argument_keys",
-        "result_keys",
-        "category",
-        "critic_verdict",
-        "step_count",
-        "specialists",
-        "specialist",
-        "step_number",
-        "evidence_ids",
-        "checked_evidence_ids",
-        "has_candidate",
-        "verdict",
-    }
-    if set(payload) - allowed_keys:
-        raise ValueError("audit payload contains an unsupported public key")
+    if set(payload) != _PUBLIC_AUDIT_EVENT_KEYS[event_type]:
+        raise ValueError(f"{event_type} payload keys do not match its public schema")
     public: dict[str, Any] = {}
     for key, value in payload.items():
         if key == "task_id":
