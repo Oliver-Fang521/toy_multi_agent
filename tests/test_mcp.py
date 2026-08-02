@@ -1,4 +1,5 @@
 import json
+import socket
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,8 +7,12 @@ from typing import Any
 
 import httpx
 import pytest
+from mcp import Client
 from openpyxl import Workbook
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, NameObject
 
+from gaia_agent import mcp_server
 from gaia_agent.config import RunConfig
 from gaia_agent.mcp_client import MCPToolClient, ToolExecutionError
 from gaia_agent.mcp_server import (
@@ -35,6 +40,14 @@ def fake_backend_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GAIA_MCP_FAKE_BACKEND", "1")
 
 
+@pytest.fixture
+def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolve_public(host: str, port: int, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_public)
+
+
 @pytest.mark.asyncio
 async def test_stdio_client_discovers_and_filters_tools(
     tmp_path: Path, fake_backend_env: None, run_config: RunConfig
@@ -48,6 +61,30 @@ async def test_stdio_client_discovers_and_filters_tools(
         assert client.is_connected
 
     assert not client.is_connected
+
+
+@pytest.mark.asyncio
+async def test_stdio_startup_does_not_import_from_untrusted_task_root(
+    tmp_path: Path, fake_backend_env: None, run_config: RunConfig
+) -> None:
+    marker = tmp_path / "untrusted-code-ran"
+    (tmp_path / "sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    forged_package = tmp_path / "gaia_agent"
+    forged_package.mkdir()
+    (forged_package / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('forged')\n",
+        encoding="utf-8",
+    )
+
+    async with MCPToolClient(
+        task_root=tmp_path, config=run_config, allowed={"submit_answer"}
+    ) as client:
+        assert [tool.name for tool in client.tool_specs] == ["submit_answer"]
+
+    assert not marker.exists()
 
 
 @pytest.mark.asyncio
@@ -216,9 +253,10 @@ async def test_stdio_results_are_recursively_redacted(
 
 
 @pytest.mark.asyncio
-async def test_http_reader_extracts_html_text_and_final_url() -> None:
+async def test_http_reader_extracts_html_text_and_final_url(public_dns: None) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url == httpx.URL("https://example.test/article")
+        assert request.url == httpx.URL("https://93.184.216.34/article")
+        assert request.headers["host"] == "example.test"
         return httpx.Response(
             200,
             headers={"content-type": "text/html; charset=utf-8"},
@@ -242,7 +280,7 @@ async def test_http_reader_extracts_html_text_and_final_url() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_reader_raises_for_http_status() -> None:
+async def test_http_reader_raises_for_http_status(public_dns: None) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="backend unavailable", request=request)
 
@@ -250,6 +288,91 @@ async def test_http_reader_raises_for_http_status() -> None:
         reader = HTTPWebReader(client=client, timeout_seconds=1)
         with pytest.raises(httpx.HTTPStatusError):
             await reader.read("https://example.test/down")
+
+
+@pytest.mark.asyncio
+async def test_http_reader_rejects_private_dns_before_emitting_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[httpx.Request] = []
+
+    def resolve_private(*args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+        ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted.append(request)
+        return httpx.Response(200, text="unsafe", request=request)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_private)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="public"):
+            await HTTPWebReader(client=client, timeout_seconds=1).read(
+                "https://private.test/secret"
+            )
+
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_http_reader_validates_redirect_dns_before_next_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted_hosts: list[str] = []
+
+    def resolve_by_host(host: str, port: int, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        address = "93.184.216.34" if host == "public.test" else "169.254.169.254"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        emitted_hosts.append(request.headers["host"])
+        if request.headers["host"] == "public.test":
+            return httpx.Response(
+                302,
+                headers={"location": "http://metadata.test/latest"},
+                request=request,
+            )
+        return httpx.Response(200, text="credential", request=request)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_by_host)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="public"):
+            await HTTPWebReader(client=client, timeout_seconds=1).read(
+                "https://public.test/start"
+            )
+
+    assert emitted_hosts == ["public.test"]
+
+
+@pytest.mark.asyncio
+async def test_http_reader_pins_validated_address_against_dns_rebinding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolutions = iter(["93.184.216.34", "127.0.0.1"])
+    resolution_count = 0
+
+    def rebinding_dns(host: str, port: int, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        nonlocal resolution_count
+        resolution_count += 1
+        address = next(resolutions)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "93.184.216.34"
+        assert request.headers["host"] == "public.test"
+        assert request.extensions["sni_hostname"] == "public.test"
+        return httpx.Response(200, text="safe", request=request)
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_dns)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await HTTPWebReader(client=client, timeout_seconds=1).read(
+            "https://public.test/article"
+        )
+
+    assert result["url"] == "https://public.test/article"
+    assert resolution_count == 1
 
 
 class FakeFiles:
@@ -430,6 +553,102 @@ def test_attachment_reader_serializes_xlsx_cell_types(tmp_path: Path) -> None:
             "Answers": [["when", "answer"], ["2026-08-02 00:00:00", 42]],
         },
     }
+
+
+def test_attachment_reader_enforces_csv_row_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data.csv"
+    data.write_text("value\n1\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "MAX_TABULAR_ROWS", 1, raising=False)
+    reader = AttachmentReader(tmp_path, {data})
+
+    with pytest.raises(ValueError, match="resource limit.*CSV rows"):
+        reader.read("data.csv")
+
+
+def test_attachment_reader_enforces_json_decoded_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data.json"
+    data.write_text('{"value":"1234"}', encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "MAX_DECODED_TEXT_BYTES", 8, raising=False)
+    reader = AttachmentReader(tmp_path, {data})
+
+    with pytest.raises(ValueError, match="resource limit.*decoded bytes"):
+        reader.read("data.json")
+
+
+def test_attachment_reader_enforces_pdf_page_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.add_blank_page(width=72, height=72)
+    with data.open("wb") as stream:
+        writer.write(stream)
+    monkeypatch.setattr(mcp_server, "MAX_PDF_PAGES", 1, raising=False)
+    reader = AttachmentReader(tmp_path, {data})
+
+    with pytest.raises(ValueError, match="resource limit.*PDF pages"):
+        reader.read("data.pdf")
+
+
+def test_attachment_reader_bounds_pdf_stream_decompression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "compressed.pdf"
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=72, height=72)
+    stream = DecodedStreamObject()
+    stream.set_data(b"q\n" * 100)
+    page[NameObject("/Contents")] = writer._add_object(stream.flate_encode())
+    with data.open("wb") as output:
+        writer.write(output)
+    monkeypatch.setattr(mcp_server, "MAX_PDF_DECODED_STREAM_BYTES", 16, raising=False)
+    reader = AttachmentReader(tmp_path, {data})
+
+    with pytest.raises(ValueError, match="resource limit.*PDF decoded stream bytes"):
+        reader.read("compressed.pdf")
+
+
+def test_attachment_reader_rejects_xlsx_expansion_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data.xlsx"
+    workbook = Workbook()
+    workbook.active.append(["small fixture"])
+    workbook.save(data)
+    monkeypatch.setattr(mcp_server, "MAX_XLSX_UNCOMPRESSED_BYTES", 1, raising=False)
+    reader = AttachmentReader(tmp_path, {data})
+
+    with pytest.raises(ValueError, match="resource limit.*XLSX expanded bytes"):
+        reader.read("data.xlsx")
+
+
+@pytest.mark.asyncio
+async def test_attachment_resource_limit_is_a_structured_mcp_tool_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data.csv"
+    data.write_text("value\n1\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "MAX_TABULAR_ROWS", 1, raising=False)
+    settings = MCPServerSettings.for_fake_backend(
+        task_root=tmp_path,
+        attachments={data},
+        api_key="test",
+        hf_token="test-hf",
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        timeout_seconds=1,
+    )
+
+    async with Client(build_server(settings)) as client:
+        result = await client.call_tool("read_attachment", {"path": "data.csv"})
+
+    assert result.is_error is True
+    assert "resource limit" in result.content[0].text
 
 
 @pytest.mark.asyncio

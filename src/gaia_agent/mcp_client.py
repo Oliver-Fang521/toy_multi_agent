@@ -51,11 +51,12 @@ class MCPToolClient:
     async def __aenter__(self) -> Self:
         if self._client is not None:
             raise RuntimeError("MCP client is already connected")
+        trusted_source_root = Path(__file__).resolve().parents[1]
         parameters = StdioServerParameters(
             command=sys.executable,
-            args=["-m", "gaia_agent.mcp_server"],
+            args=["-P", "-m", "gaia_agent.mcp_server"],
             env=self._minimal_server_env(),
-            cwd=self._task_root,
+            cwd=trusted_source_root,
         )
         self._client_cm = Client(stdio_client(parameters))
         try:
@@ -135,6 +136,7 @@ class MCPToolClient:
     def _minimal_server_env(self) -> dict[str, str]:
         env = {
             "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+            "PYTHONSAFEPATH": "1",
             "GAIA_TASK_ROOT": str(self._task_root),
             "GAIA_ATTACHMENTS": json.dumps([str(path) for path in self._attachments]),
             "GAIA_MODEL": self._config.model,

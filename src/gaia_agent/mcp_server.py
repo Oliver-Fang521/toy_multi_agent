@@ -6,7 +6,12 @@ import ipaddress
 import json
 import mimetypes
 import os
-from collections.abc import Awaitable, Callable
+import socket
+import threading
+import zipfile
+import zlib
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,11 +23,31 @@ from mcp.server import MCPServer
 from openai import AsyncOpenAI
 from openpyxl import load_workbook
 from pypdf import PdfReader
+from pypdf import filters as pypdf_filters
+from pypdf.errors import LimitReachedError
 
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
 MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
+MAX_REDIRECTS = 10
+MAX_DECODED_TEXT_BYTES = 1024 * 1024
+MAX_TABULAR_ROWS = 10_000
+MAX_TABULAR_CELLS = 100_000
+MAX_PDF_PAGES = 100
+MAX_PDF_TEXT_BYTES = 1024 * 1024
+MAX_PDF_DECODED_STREAM_BYTES = 2 * 1024 * 1024
+MAX_XLSX_ARCHIVE_ENTRIES = 1_000
+MAX_XLSX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
+MAX_XLSX_WORKSHEETS = 50
 _SENSITIVE_KEY_PARTS = ("api_key", "authorization", "credential", "password", "secret", "token")
+_PDF_FILTER_LIMIT_NAMES = (
+    "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH",
+    "JBIG2_MAX_OUTPUT_LENGTH",
+    "LZW_MAX_OUTPUT_LENGTH",
+    "RUN_LENGTH_MAX_OUTPUT_LENGTH",
+    "ZLIB_MAX_OUTPUT_LENGTH",
+)
+_PDF_FILTER_LOCK = threading.Lock()
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -101,41 +126,57 @@ class HTTPWebReader:
         timeout_seconds: float = 20,
         max_bytes: int = MAX_DOWNLOAD_BYTES,
     ) -> None:
-        self._client = client or httpx.AsyncClient(follow_redirects=True)
+        self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self._owns_client = client is None
         self._timeout_seconds = timeout_seconds
         self._max_bytes = max_bytes
 
     async def read(self, url: str) -> dict[str, Any]:
-        _validate_public_http_url(url)
-        async with self._client.stream(
-            "GET", url, follow_redirects=True, timeout=self._timeout_seconds
-        ) as response:
-            response.raise_for_status()
-            _validate_public_http_url(str(response.url))
-            content = bytearray()
-            truncated = False
-            async for chunk in response.aiter_bytes():
-                remaining = self._max_bytes - len(content)
-                if len(chunk) > remaining:
-                    content.extend(chunk[:remaining])
-                    truncated = True
-                    break
-                content.extend(chunk)
-            media_type = response.headers.get("content-type", "")
-            text = bytes(content).decode(response.encoding or "utf-8", errors="replace")
-            if "html" in media_type.lower():
-                soup = BeautifulSoup(text, "html.parser")
-                for element in soup(["script", "style", "noscript"]):
-                    element.decompose()
-                text = " ".join(soup.get_text(" ", strip=True).split())
-            return {
-                "url": str(response.url),
-                "status_code": response.status_code,
-                "content_type": media_type,
-                "text": text,
-                "truncated": truncated,
-            }
+        async with asyncio.timeout(self._timeout_seconds):
+            current_url = httpx.URL(url)
+            for _ in range(MAX_REDIRECTS + 1):
+                pinned_url, headers, extensions = await _pin_public_url(current_url)
+                async with self._client.stream(
+                    "GET",
+                    pinned_url,
+                    headers=headers,
+                    extensions=extensions,
+                    follow_redirects=False,
+                    timeout=self._timeout_seconds,
+                ) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if location is None:
+                            response.raise_for_status()
+                        current_url = current_url.join(location)
+                        continue
+                    response.raise_for_status()
+                    content = bytearray()
+                    truncated = False
+                    async for chunk in response.aiter_bytes():
+                        remaining = self._max_bytes - len(content)
+                        if len(chunk) > remaining:
+                            content.extend(chunk[:remaining])
+                            truncated = True
+                            break
+                        content.extend(chunk)
+                    media_type = response.headers.get("content-type", "")
+                    text = bytes(content).decode(
+                        response.encoding or "utf-8", errors="replace"
+                    )
+                    if "html" in media_type.lower():
+                        soup = BeautifulSoup(text, "html.parser")
+                        for element in soup(["script", "style", "noscript"]):
+                            element.decompose()
+                        text = " ".join(soup.get_text(" ", strip=True).split())
+                    return {
+                        "url": str(current_url),
+                        "status_code": response.status_code,
+                        "content_type": media_type,
+                        "text": text,
+                        "truncated": truncated,
+                    }
+            raise ValueError("too many HTTP redirects")
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -157,6 +198,48 @@ def _validate_public_http_url(url: str) -> None:
         return
     if not address.is_global:
         raise ValueError("URL must refer to a public host")
+
+
+async def _pin_public_url(url: httpx.URL) -> tuple[httpx.URL, dict[str, str], dict[str, Any]]:
+    _validate_public_http_url(str(url))
+    hostname = url.host.rstrip(".").lower()
+    port = url.port or (443 if url.scheme == "https" else 80)
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        records = await asyncio.to_thread(
+            socket.getaddrinfo,
+            hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+        addresses = list(dict.fromkeys(record[4][0] for record in records))
+    else:
+        addresses = [str(literal)]
+    if not addresses:
+        raise ValueError("URL hostname did not resolve")
+    parsed_addresses = [ipaddress.ip_address(address) for address in addresses]
+    if any(not _is_global_address(address) for address in parsed_addresses):
+        raise ValueError("URL must refer to a public host")
+    pinned = url.copy_with(host=str(parsed_addresses[0]))
+    host_header = url.netloc.decode("ascii")
+    headers = {"Host": host_header, "Connection": "close"}
+    extensions: dict[str, Any] = {}
+    if url.scheme == "https":
+        extensions["sni_hostname"] = hostname.encode("idna").decode("ascii")
+    return pinned, headers, extensions
+
+
+def _is_global_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        address.is_global
+        and not address.is_private
+        and not address.is_loopback
+        and not address.is_link_local
+        and not address.is_multicast
+        and not address.is_reserved
+        and not address.is_unspecified
+    )
 
 
 class AttachmentReader:
@@ -188,20 +271,40 @@ class AttachmentReader:
         relative = str(resolved.relative_to(self.task_root))
         suffix = resolved.suffix.lower()
         if suffix in {".txt", ".md"}:
-            text = resolved.read_text(encoding="utf-8")
+            text = _read_bounded_utf8(resolved)
             return {"path": relative, "kind": "text", "text": text}
         if suffix in {".csv", ".tsv"}:
+            _require_size_within(resolved.stat().st_size, MAX_DECODED_TEXT_BYTES, "decoded bytes")
+            rows: list[list[str]] = []
+            cell_count = 0
             with resolved.open(encoding="utf-8", newline="") as stream:
-                rows = list(csv.reader(stream, delimiter="\t" if suffix == ".tsv" else ","))
+                for row_number, row in enumerate(
+                    csv.reader(stream, delimiter="\t" if suffix == ".tsv" else ","),
+                    start=1,
+                ):
+                    _require_size_within(row_number, MAX_TABULAR_ROWS, "CSV rows")
+                    cell_count += len(row)
+                    _require_size_within(cell_count, MAX_TABULAR_CELLS, "CSV cells")
+                    rows.append(row)
             return {"path": relative, "kind": "csv", "rows": rows}
         if suffix == ".json":
             return {
                 "path": relative,
                 "kind": "json",
-                "data": json.loads(resolved.read_text(encoding="utf-8")),
+                "data": json.loads(_read_bounded_utf8(resolved)),
             }
         if suffix == ".pdf":
-            pages = [page.extract_text() or "" for page in PdfReader(resolved).pages]
+            with _bounded_pdf_decoding():
+                reader = PdfReader(resolved)
+                _require_size_within(len(reader.pages), MAX_PDF_PAGES, "PDF pages")
+                pages: list[str] = []
+                text_bytes = 0
+                for page in reader.pages:
+                    page.get_contents()
+                    text = page.extract_text() or ""
+                    text_bytes += len(text.encode("utf-8"))
+                    _require_size_within(text_bytes, MAX_PDF_TEXT_BYTES, "PDF text bytes")
+                    pages.append(text)
             return {
                 "path": relative,
                 "kind": "pdf",
@@ -209,14 +312,24 @@ class AttachmentReader:
                 "text": "\n\n".join(pages),
             }
         if suffix == ".xlsx":
+            _validate_xlsx_archive(resolved)
             workbook = load_workbook(resolved, read_only=True, data_only=True)
             sheets: dict[str, list[list[Any]]] = {}
+            row_count = 0
+            cell_count = 0
             try:
+                _require_size_within(
+                    len(workbook.worksheets), MAX_XLSX_WORKSHEETS, "XLSX worksheets"
+                )
                 for sheet in workbook.worksheets:
-                    sheets[sheet.title] = [
-                        [_jsonable(value) for value in row]
-                        for row in sheet.iter_rows(values_only=True)
-                    ]
+                    rows: list[list[Any]] = []
+                    for row in sheet.iter_rows(values_only=True):
+                        row_count += 1
+                        _require_size_within(row_count, MAX_TABULAR_ROWS, "XLSX rows")
+                        cell_count += len(row)
+                        _require_size_within(cell_count, MAX_TABULAR_CELLS, "XLSX cells")
+                        rows.append([_jsonable(value) for value in row])
+                    sheets[sheet.title] = rows
             finally:
                 workbook.close()
             return {"path": relative, "kind": "xlsx", "sheets": sheets}
@@ -233,6 +346,80 @@ class AttachmentReader:
             "media_type": media_type,
             "size_bytes": resolved.stat().st_size,
         }
+
+
+class AttachmentResourceLimitError(ValueError):
+    pass
+
+
+def _require_size_within(actual: int, limit: int, resource: str) -> None:
+    if actual > limit:
+        raise AttachmentResourceLimitError(
+            f"attachment resource limit exceeded for {resource}: {actual} > {limit}"
+        )
+
+
+def _read_bounded_utf8(path: Path) -> str:
+    size = path.stat().st_size
+    _require_size_within(size, MAX_DECODED_TEXT_BYTES, "decoded bytes")
+    return path.read_bytes().decode("utf-8")
+
+
+def _validate_xlsx_archive(path: Path) -> None:
+    with zipfile.ZipFile(path) as archive:
+        entries = archive.infolist()
+        _require_size_within(len(entries), MAX_XLSX_ARCHIVE_ENTRIES, "XLSX archive entries")
+        expanded_bytes = 0
+        for entry in entries:
+            if entry.flag_bits & 1:
+                raise ValueError("encrypted XLSX attachments are not supported")
+            expanded_bytes += entry.file_size
+            _require_size_within(
+                expanded_bytes,
+                MAX_XLSX_UNCOMPRESSED_BYTES,
+                "XLSX expanded bytes",
+            )
+
+
+@contextmanager
+def _bounded_pdf_decoding() -> Iterator[None]:
+    with _PDF_FILTER_LOCK:
+        original_limits = {
+            name: getattr(pypdf_filters, name) for name in _PDF_FILTER_LIMIT_NAMES
+        }
+        original_decompress = pypdf_filters.decompress
+        for name, current_limit in original_limits.items():
+            setattr(
+                pypdf_filters,
+                name,
+                min(current_limit, MAX_PDF_DECODED_STREAM_BYTES),
+            )
+        pypdf_filters.decompress = _bounded_zlib_decompress
+        try:
+            yield
+        except LimitReachedError:
+            raise AttachmentResourceLimitError(
+                "attachment resource limit exceeded for PDF decoded stream bytes"
+            ) from None
+        finally:
+            pypdf_filters.decompress = original_decompress
+            for name, original_limit in original_limits.items():
+                setattr(pypdf_filters, name, original_limit)
+
+
+def _bounded_zlib_decompress(data: bytes) -> bytes:
+    decompressor = zlib.decompressobj()
+    result = decompressor.decompress(data, MAX_PDF_DECODED_STREAM_BYTES + 1)
+    if (
+        len(result) > MAX_PDF_DECODED_STREAM_BYTES
+        or decompressor.unconsumed_tail
+        or not decompressor.eof
+    ):
+        raise LimitReachedError("PDF decoded stream exceeds resource limit")
+    result += decompressor.flush(MAX_PDF_DECODED_STREAM_BYTES + 1 - len(result))
+    if len(result) > MAX_PDF_DECODED_STREAM_BYTES:
+        raise LimitReachedError("PDF decoded stream exceeds resource limit")
+    return result
 
 
 class HostedOpenAIBackend:
