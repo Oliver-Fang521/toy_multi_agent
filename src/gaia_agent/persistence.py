@@ -591,8 +591,8 @@ def _validate_audit_value_context(event_type: str, payload: Mapping[str, Any]) -
         if payload.get("verdict") not in _NORMAL_CRITIC_VERDICTS:
             raise ValueError("verify_completed verdict must be a completed critic verdict")
     elif event_type == "correction_started":
-        if payload.get("verdict") not in _NORMAL_CRITIC_VERDICTS:
-            raise ValueError("correction_started verdict must be a completed critic verdict")
+        if payload.get("verdict") not in {"revise", "insufficient_evidence"}:
+            raise ValueError("correction_started verdict must require correction")
     elif "verdict" in payload:
         raise ValueError("verdict is only public on verification or correction audit events")
     if event_type == "quality_rejected":

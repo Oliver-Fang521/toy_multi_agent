@@ -536,3 +536,19 @@ def test_audit_event_rejects_known_keys_from_the_wrong_event(tmp_path, predictio
                 payload=payload,
             ),
         )
+
+
+@pytest.mark.parametrize("verdict", ["approve", "not_run"])
+def test_correction_started_rejects_non_corrective_verdicts(tmp_path, prediction, verdict) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+
+    with pytest.raises(ValueError, match="correction_started"):
+        store.append_audit(
+            prediction.task_id,
+            AuditEvent(
+                sequence=1,
+                event_type="correction_started",
+                timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+                payload={"verdict": verdict},
+            ),
+        )
