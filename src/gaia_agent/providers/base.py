@@ -1,8 +1,23 @@
+import json
 from typing import Any, Literal, Protocol
 
 from pydantic import Field, field_validator
 
 from gaia_agent.models import FrozenModel, Usage
+
+
+class ToolCallError(RuntimeError):
+    """A recoverable tool failure safe for a provider to report opaquely to the model."""
+
+
+def serialize_tool_output(value: Any) -> str:
+    """Serialize a tool output deterministically without expanding Unicode."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def tool_output_size_bytes(value: Any) -> int:
+    """Return the UTF-8 wire size of a serialized tool output."""
+    return len(serialize_tool_output(value).encode("utf-8"))
 
 
 class ToolSpec(FrozenModel):

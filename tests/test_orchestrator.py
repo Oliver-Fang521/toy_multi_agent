@@ -23,7 +23,7 @@ from gaia_agent.models import (
     TerminalErrorCategory,
     Usage,
 )
-from gaia_agent.orchestrator import Orchestrator, choose_majority
+from gaia_agent.orchestrator import Orchestrator, _BudgetedToolClient, choose_majority
 from gaia_agent.providers import ToolSpec
 
 
@@ -200,6 +200,54 @@ class FakeToolFactory:
     def __call__(self, task: GaiaTask) -> FakeTools:
         self.tasks.append(task)
         return self.tools
+
+
+@pytest.mark.asyncio
+async def test_budgeted_tool_client_audits_recoverable_failure_without_message() -> None:
+    secret = "sk-private-tool-failure"
+
+    class FailingTools:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            raise ToolExecutionError(secret)
+
+    audit: list[tuple[str, dict[str, Any]]] = []
+    client = _BudgetedToolClient(
+        FailingTools(),
+        max_calls=2,
+        audit=lambda event_type, payload: audit.append((event_type, payload)),
+    )
+
+    with pytest.raises(ToolExecutionError):
+        await client.call(
+            "execute_python",
+            {"instruction": "private instruction", "paths": ["private.mp3"]},
+        )
+
+    assert client.call_count == 1
+    assert audit == [
+        (
+            "tool_call_started",
+            {
+                "tool": "execute_python",
+                "call_number": 1,
+                "argument_keys": ["instruction", "paths"],
+            },
+        ),
+        (
+            "tool_call_failed",
+            {
+                "tool": "execute_python",
+                "call_number": 1,
+                "argument_keys": ["instruction", "paths"],
+                "category": "tool_error",
+            },
+        ),
+    ]
+    assert secret not in repr(audit)
+    assert "private instruction" not in repr(audit)
+    assert "private.mp3" not in repr(audit)
 
 
 def _config(**overrides: Any) -> RunConfig:

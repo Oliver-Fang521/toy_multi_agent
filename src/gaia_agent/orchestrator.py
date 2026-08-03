@@ -29,7 +29,7 @@ from gaia_agent.models import (
     TerminalErrorCategory,
     Usage,
 )
-from gaia_agent.providers import ToolSpec
+from gaia_agent.providers import ToolCallError, ToolSpec
 from gaia_agent.scoring import parse_number_with_status
 
 
@@ -131,7 +131,14 @@ class _BudgetedToolClient:
             "argument_keys": sorted(arguments),
         }
         self._audit("tool_call_started", safe_payload)
-        result = await self._client.call(name, arguments)
+        try:
+            result = await self._client.call(name, arguments)
+        except ToolCallError:
+            self._audit(
+                "tool_call_failed",
+                {**safe_payload, "category": "tool_error"},
+            )
+            raise
         self._audit(
             "tool_call_completed",
             {

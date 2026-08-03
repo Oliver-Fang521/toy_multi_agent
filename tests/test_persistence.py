@@ -372,6 +372,31 @@ def test_real_task_six_tool_audit_shapes_persist_only_key_names(tmp_path, predic
     assert "gated question" not in audit
 
 
+def test_recoverable_tool_failure_audit_is_public_and_integrity_safe(
+    tmp_path, prediction
+) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+    store.append_audit(
+        prediction.task_id,
+        AuditEvent(
+            sequence=1,
+            event_type="tool_call_failed",
+            timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+            payload={
+                "tool": "execute_python",
+                "call_number": 1,
+                "argument_keys": ["instruction", "paths"],
+                "category": "tool_error",
+            },
+        ),
+    )
+
+    store.verify_integrity()
+    audit = (store.task_directory(prediction.task_id) / "audit.jsonl").read_text()
+    assert '"event_type":"tool_call_failed"' in audit
+    assert '"category":"tool_error"' in audit
+
+
 def test_manifest_rejects_known_environment_secrets_in_all_public_identifiers(tmp_path, monkeypatch) -> None:
     secret = "env-private-value"
     monkeypatch.setenv("OPENAI_API_KEY", secret)

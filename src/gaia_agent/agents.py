@@ -258,14 +258,18 @@ FileAgent = FileAnalysisAgent
 
 
 class CriticAgent:
-    allowed_tool_names = frozenset({"web_search", "read_webpage", "execute_python"})
+    allowed_tool_names = frozenset(
+        {"web_search", "read_webpage", "execute_python", "transcribe_audio"}
+    )
     instructions = (
         "Independently verify the candidate against the observable evidence. Check sufficiency and "
         "contradictions, reject unsupported research answers, and use the supplied web or Python "
-        "tools only when the existing evidence is insufficient or contradictory. Never request "
-        "hidden reasoning and never invent facts. Approve only evidence-backed candidates. If a "
-        "revision is necessary, propose exactly one concise correction directly supported by the "
-        "checked evidence; do not solve the task freely."
+        "tools only when the existing evidence is insufficient or contradictory. Use "
+        "transcribe_audio for a registered audio attachment; use execute_python only for "
+        "non-audio computation or files. Never request hidden reasoning and never invent facts. "
+        "Approve only evidence-backed candidates. If a revision is necessary, propose exactly one "
+        "concise correction directly supported by the checked evidence; do not solve the task "
+        "freely."
     )
 
     def __init__(
@@ -474,6 +478,8 @@ def _has_tool_contract_evidence(name: str, output: dict[str, Any]) -> bool:
         return _has_meaningful_text(output.get("output_text")) or _has_python_output_content(
             output.get("outputs"), depth=0
         )
+    if name == "transcribe_audio":
+        return _has_meaningful_text(output.get("text"))
     return False
 
 

@@ -29,8 +29,12 @@ from pypdf import filters as pypdf_filters
 from pypdf.errors import LimitReachedError
 
 from gaia_agent.models import HOSTED_USAGE_METADATA_KEY, Usage
+from gaia_agent.providers.base import serialize_tool_output, tool_output_size_bytes
 
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
+MAX_WEB_SEARCH_OUTPUT_BYTES = 16 * 1024
+MAX_WEB_SEARCH_SOURCES = 8
+MAX_DIRECT_WEBPAGE_TIMEOUT_SECONDS = 20.0
 MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
 MAX_AUDIO_ATTACHMENT_BYTES = 25_000_000
@@ -103,10 +107,9 @@ def _bounded_result(
 ) -> dict[str, Any]:
     metadata = metadata or {}
     combined = {**result, **metadata}
-    encoded = json.dumps(combined, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(encoded) <= MAX_TOOL_OUTPUT_BYTES:
+    if tool_output_size_bytes(combined) <= MAX_TOOL_OUTPUT_BYTES:
         return combined
-    payload = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    payload = serialize_tool_output(result).encode("utf-8")
     low = 0
     high = min(len(payload), MAX_TOOL_OUTPUT_BYTES)
     best: dict[str, Any] = {"output": "", "truncated": True, **metadata}
@@ -117,11 +120,46 @@ def _bounded_result(
             "truncated": True,
             **metadata,
         }
-        candidate_size = len(
-            json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
+        candidate_size = tool_output_size_bytes(candidate)
         if candidate_size <= MAX_TOOL_OUTPUT_BYTES:
             best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _bounded_web_search_result(
+    result: dict[str, Any],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = metadata or {}
+    payload = dict(result)
+    answer = str(payload.get("answer") or "")
+    raw_sources = payload.get("sources")
+    sources = list(raw_sources[:MAX_WEB_SEARCH_SOURCES]) if isinstance(raw_sources, list) else []
+    extra = {key: value for key, value in payload.items() if key not in {"answer", "sources"}}
+
+    def candidate(answer_text: str) -> dict[str, Any]:
+        return {"answer": answer_text, "sources": sources, **extra, **metadata}
+
+    if tool_output_size_bytes(candidate("")) > MAX_WEB_SEARCH_OUTPUT_BYTES:
+        extra.clear()
+    while sources and tool_output_size_bytes(candidate("")) > MAX_WEB_SEARCH_OUTPUT_BYTES:
+        sources.pop()
+    full = candidate(answer)
+    if tool_output_size_bytes(full) <= MAX_WEB_SEARCH_OUTPUT_BYTES:
+        return full
+
+    low = 0
+    high = len(answer)
+    best = candidate("")
+    while low <= high:
+        middle = (low + high) // 2
+        bounded = candidate(answer[:middle])
+        if tool_output_size_bytes(bounded) <= MAX_WEB_SEARCH_OUTPUT_BYTES:
+            best = bounded
             low = middle + 1
         else:
             high = middle - 1
@@ -756,7 +794,9 @@ class MCPServerSettings:
         return cls(
             task_root=task_root.resolve(),
             attachment_reader=attachment_reader,
-            web_reader=HTTPWebReader(timeout_seconds=timeout_seconds),
+            web_reader=HTTPWebReader(
+                timeout_seconds=min(timeout_seconds, MAX_DIRECT_WEBPAGE_TIMEOUT_SECONDS)
+            ),
             backend=FakeHostedBackend(api_key, hf_token, attachment_reader),
             api_key=api_key,
             hf_token=hf_token,
@@ -766,6 +806,8 @@ class MCPServerSettings:
 async def _safe_tool_call(
     settings: MCPServerSettings,
     operation: Awaitable[dict[str, Any]] | Callable[[], dict[str, Any]],
+    *,
+    web_result: bool = False,
 ) -> dict[str, Any]:
     try:
         result = await operation if hasattr(operation, "__await__") else operation()
@@ -778,6 +820,8 @@ async def _safe_tool_call(
         )
         redacted = _redact(payload, settings.secrets)
         metadata = {HOSTED_USAGE_METADATA_KEY: usage} if usage is not None else None
+        if web_result:
+            return _bounded_web_search_result(redacted, metadata=metadata)
         return _bounded_result(redacted, metadata=metadata)
     # This is the server boundary: redact arbitrary backend/parser failures before
     # MCP serializes them into consumer-visible tool errors.
@@ -792,7 +836,11 @@ def build_server(settings: MCPServerSettings) -> MCPServer:
     @server.tool()
     async def web_search(query: str) -> dict[str, Any]:
         """Search the public web and return a concise answer with source URLs."""
-        return await _safe_tool_call(settings, settings.backend.web_search(query))
+        return await _safe_tool_call(
+            settings,
+            settings.backend.web_search(query),
+            web_result=True,
+        )
 
     @server.tool()
     async def read_webpage(url: str) -> dict[str, Any]:
@@ -851,7 +899,9 @@ def _settings_from_env() -> MCPServerSettings:
     return MCPServerSettings(
         task_root=task_root,
         attachment_reader=attachment_reader,
-        web_reader=HTTPWebReader(timeout_seconds=timeout_seconds),
+        web_reader=HTTPWebReader(
+            timeout_seconds=min(timeout_seconds, MAX_DIRECT_WEBPAGE_TIMEOUT_SECONDS)
+        ),
         backend=backend,
         api_key=api_key,
         hf_token=hf_token,

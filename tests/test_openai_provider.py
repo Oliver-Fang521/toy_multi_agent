@@ -1,8 +1,11 @@
+import json
 from collections import deque
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from mcp import Client
 from openai import (
     APITimeoutError,
     AuthenticationError,
@@ -13,6 +16,9 @@ from openai import (
 from openai.types.responses import Response
 from pydantic import ValidationError
 
+from gaia_agent import mcp_server, providers
+from gaia_agent.mcp_client import ToolExecutionError
+from gaia_agent.mcp_server import AttachmentReader, MCPServerSettings, build_server
 from gaia_agent.models import Usage
 from gaia_agent.providers import ModelRequest, OpenAIProvider, ToolSpec
 
@@ -234,6 +240,213 @@ async def test_openai_provider_executes_function_call_and_continues(
         "arguments": {"code": "print(6*7)"},
         "output": {"stdout": "42"},
     }
+
+
+@pytest.mark.asyncio
+async def test_unicode_web_output_stays_bounded_through_server_and_provider(
+    tmp_path,
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    secret = "sk-private-unicode-secret"
+    usage = SimpleNamespace(
+        input_tokens=101,
+        output_tokens=17,
+        total_tokens=118,
+        output_tokens_details=SimpleNamespace(reasoning_tokens=3),
+    )
+
+    class UnicodeWebBackend:
+        async def web_search(self, query: str) -> dict[str, Any]:
+            return mcp_server._with_response_usage(
+                {
+                    "answer": secret + "漢字🚀" * 2_400,
+                    "sources": [
+                        {
+                            "url": f"https://source-{index}.example/article",
+                            "title": secret + "來源🚀" * 40,
+                        }
+                        for index in range(12)
+                    ],
+                },
+                SimpleNamespace(usage=usage),
+            )
+
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=SimpleNamespace(),
+        backend=UnicodeWebBackend(),
+        api_key=secret,
+        hf_token="",
+    )
+    async with Client(build_server(settings)) as client:
+        tool_result = await client.call_tool("web_search", {"query": "unicode"})
+    assert isinstance(tool_result.structured_content, dict)
+    public_result = dict(tool_result.structured_content)
+
+    class PoppingExecutor:
+        def __init__(self) -> None:
+            self.usage: dict[str, Any] | None = None
+            self.output: dict[str, Any] | None = None
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.output = dict(public_result)
+            self.usage = self.output.pop("__gaia_usage__")
+            return self.output
+
+    web_tool = ToolSpec(
+        name="web_search",
+        description="Search the web",
+        parameters={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    )
+    fake_responses_client.queue_function_call(
+        "web_search", '{"query":"unicode"}', "call-unicode"
+    )
+    fake_responses_client.queue_text('{"answer":"done"}')
+    executor = PoppingExecutor()
+
+    response = await OpenAIProvider(
+        fake_responses_client, "gpt-5.6-sol"
+    ).complete(
+        model_request(allowed_tools=(web_tool,), max_tool_calls=1),
+        executor,
+    )
+
+    server_bytes = json.dumps(
+        public_result, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    wire_output = fake_responses_client.requests[1]["input"][0]["output"]
+    assert len(server_bytes) <= 16 * 1024
+    assert len(wire_output.encode("utf-8")) <= 16 * 1024
+    assert json.loads(wire_output) == executor.output
+    assert executor.usage == {
+        "input_tokens": 101,
+        "output_tokens": 17,
+        "reasoning_tokens": 3,
+        "total_tokens": 118,
+    }
+    assert response.parsed == {"answer": "done"}
+    assert public_result["answer"].startswith("[REDACTED]漢字🚀")
+    assert len(public_result["sources"]) <= 8
+    assert secret not in repr(public_result)
+    assert secret not in wire_output
+
+
+def test_mcp_tool_execution_error_uses_provider_neutral_recoverable_contract() -> None:
+    tool_call_error = getattr(providers, "ToolCallError", None)
+
+    assert tool_call_error is not None
+    assert issubclass(ToolExecutionError, tool_call_error)
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_recovers_from_tool_failure_without_leaking_message(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_function_call("execute_python", '{"code":"bad"}', "call-1")
+    fake_responses_client.queue_function_call(
+        "web_search", '{"query":"safe fallback"}', "call-2"
+    )
+    fake_responses_client.queue_text('{"answer":"recovered"}')
+    web_tool = ToolSpec(
+        name="web_search",
+        description="Search the web",
+        parameters={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    )
+
+    class RecoveringExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((name, arguments))
+            if name == "execute_python":
+                raise ToolExecutionError("sk-super-secret-tool-message")
+            return {"answer": "fallback succeeded", "sources": []}
+
+    executor = RecoveringExecutor()
+    request = model_request(
+        allowed_tools=(*model_request().allowed_tools, web_tool),
+        max_tool_calls=2,
+    )
+
+    response = await OpenAIProvider(
+        fake_responses_client, "gpt-5.6-sol"
+    ).complete(request, executor)
+
+    assert response.parsed == {"answer": "recovered"}
+    assert executor.calls == [
+        ("execute_python", {"code": "bad"}),
+        ("web_search", {"query": "safe fallback"}),
+    ]
+    assert fake_responses_client.requests[1]["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"error":"tool_failed"}',
+        }
+    ]
+    assert "sk-super-secret-tool-message" not in repr(fake_responses_client.requests[1])
+    assert [event.output for event in response.tool_events] == [
+        {"error": "tool_failed"},
+        {"answer": "fallback succeeded", "sources": []},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_counts_recoverable_failure_against_tool_budget(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_function_call("execute_python", "{}", "call-1")
+    fake_responses_client.queue_function_call("execute_python", "{}", "call-2")
+
+    class FailingExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            raise ToolExecutionError("recoverable failure")
+
+    executor = FailingExecutor()
+
+    with pytest.raises(RuntimeError, match="tool-call budget exhausted"):
+        await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(
+            model_request(max_tool_calls=1), executor
+        )
+
+    assert executor.calls == 1
+    assert fake_responses_client.requests[1]["input"][0]["output"] == (
+        '{"error":"tool_failed"}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_does_not_swallow_nonrecoverable_executor_error(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_function_call("execute_python", "{}", "call-1")
+
+    class BrokenExecutor:
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("tool budget sentinel")
+
+    with pytest.raises(RuntimeError, match="tool budget sentinel"):
+        await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(
+            model_request(), BrokenExecutor()
+        )
+
+    assert len(fake_responses_client.requests) == 1
 
 
 @pytest.mark.asyncio

@@ -8,8 +8,10 @@ from gaia_agent.providers.base import (
     Citation,
     ModelRequest,
     ModelResponse,
+    ToolCallError,
     ToolEvent,
     ToolExecutor,
+    serialize_tool_output,
 )
 
 
@@ -59,12 +61,15 @@ class OpenAIProvider:
                 arguments = json.loads(call.arguments)
                 if not isinstance(arguments, dict):
                     raise TypeError("function-call arguments must decode to an object")
-                result = await executor.call(call.name, arguments)
+                try:
+                    result = await executor.call(call.name, arguments)
+                except ToolCallError:
+                    result = {"error": "tool_failed"}
                 outputs.append(
                     {
                         "type": "function_call_output",
                         "call_id": call.call_id,
-                        "output": json.dumps(result, separators=(",", ":")),
+                        "output": serialize_tool_output(result),
                     }
                 )
                 tool_events.append(

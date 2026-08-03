@@ -519,7 +519,10 @@ async def test_critic_uses_only_verification_tools_and_returns_typed_decision(
         "web_search",
         "read_webpage",
         "execute_python",
+        "transcribe_audio",
     ]
+    assert "transcribe_audio" in request.instructions
+    assert "non-audio" in request.instructions.lower()
     assert fake_provider.executors == [fake_tools]
     assert fake_tools.calls == []
     _assert_all_object_schemas_are_strict(request.output_schema)
@@ -707,6 +710,11 @@ async def test_critic_accepts_revision_grounded_in_known_evidence(
             "execute_python",
             {"instruction": "Independently calculate the answer"},
             {"output_text": "", "outputs": [{"type": "logs", "logs": "42"}]},
+        ),
+        (
+            "transcribe_audio",
+            {"path": "sample.mp3"},
+            {"text": "The spoken answer is 42."},
         ),
     ],
 )

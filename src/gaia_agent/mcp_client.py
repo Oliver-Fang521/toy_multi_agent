@@ -16,7 +16,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from gaia_agent.config import RunConfig
 from gaia_agent.models import HOSTED_USAGE_METADATA_KEY, Usage
-from gaia_agent.providers.base import ToolSpec
+from gaia_agent.providers.base import ToolCallError, ToolSpec
 
 _PUBLIC_TOOLS = frozenset(
     {
@@ -32,7 +32,7 @@ _MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
 _ATTACHMENT_READ_CHUNK_BYTES = 1024 * 1024
 
 
-class ToolExecutionError(RuntimeError):
+class ToolExecutionError(ToolCallError):
     pass
 
 

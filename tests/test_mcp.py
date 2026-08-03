@@ -926,6 +926,110 @@ async def test_hosted_search_requires_web_tool_and_extracts_sources(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_hosted_search_bounds_result_and_sources_while_preserving_usage(
+    tmp_path: Path,
+) -> None:
+    sources = [
+        SimpleNamespace(url=f"https://source-{index}.example/article", title=f"Source {index}")
+        for index in range(20)
+    ]
+    response = SimpleNamespace(
+        output_text="answer-" + "x" * (64 * 1024),
+        usage=SimpleNamespace(
+            input_tokens=101,
+            output_tokens=17,
+            total_tokens=118,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=3),
+        ),
+        output=[SimpleNamespace(type="web_search_call", action=SimpleNamespace(sources=sources))],
+    )
+    backend = HostedOpenAIBackend(
+        client=FakeHostedClient(response),
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        timeout_seconds=1,
+    )
+
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=SimpleNamespace(),
+        backend=backend,
+        api_key="",
+        hf_token="",
+    )
+    async with Client(build_server(settings)) as client:
+        tool_result = await client.call_tool("web_search", {"query": "question"})
+    assert isinstance(tool_result.structured_content, dict)
+    result = dict(tool_result.structured_content)
+
+    encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= 16 * 1024
+    assert result["answer"].startswith("answer-")
+    assert result["sources"][0] == {
+        "url": "https://source-0.example/article",
+        "title": "Source 0",
+    }
+    assert len(result["sources"]) <= 8
+    assert result["__gaia_usage__"] == {
+        "input_tokens": 101,
+        "output_tokens": 17,
+        "reasoning_tokens": 3,
+        "total_tokens": 118,
+    }
+
+
+@pytest.mark.asyncio
+async def test_safe_web_bound_is_rechecked_after_redaction_expands_payload(
+    tmp_path: Path,
+) -> None:
+    secret = "key"
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=13,
+            output_tokens=5,
+            total_tokens=18,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=2),
+        )
+    )
+
+    class ExpandingWebBackend:
+        async def web_search(self, query: str) -> dict[str, Any]:
+            return mcp_server._with_response_usage(
+                {
+                    "answer": secret * 4_000,
+                    "sources": [
+                        {"url": "https://source.example", "title": secret * 100}
+                    ],
+                },
+                response,
+            )
+
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=SimpleNamespace(),
+        backend=ExpandingWebBackend(),
+        api_key=secret,
+        hf_token="",
+    )
+
+    async with Client(build_server(settings)) as client:
+        tool_result = await client.call_tool("web_search", {"query": "question"})
+
+    assert isinstance(tool_result.structured_content, dict)
+    result = dict(tool_result.structured_content)
+    encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= 16 * 1024
+    assert set(result) == {"answer", "sources", "__gaia_usage__"}
+    assert result["answer"].startswith("[REDACTED]")
+    assert result["sources"]
+    assert result["__gaia_usage__"]["total_tokens"] == 18
+    assert secret not in repr(result)
+
+
+@pytest.mark.asyncio
 async def test_hosted_audio_transcription_uses_registered_mp3_and_maps_usage(
     tmp_path: Path,
 ) -> None:
@@ -1578,3 +1682,58 @@ async def test_build_server_exposes_exact_public_tool_plane(tmp_path: Path) -> N
         "transcribe_audio",
         "submit_answer",
     ]
+
+
+@pytest.mark.parametrize(
+    ("global_timeout", "expected_webpage_timeout"),
+    [(300.0, 20.0), (12.5, 12.5)],
+)
+def test_settings_caps_direct_webpage_timeout_without_shortening_hosted_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    global_timeout: float,
+    expected_webpage_timeout: float,
+) -> None:
+    class CapturingWebReader:
+        def __init__(self, *, timeout_seconds: float) -> None:
+            self.timeout_seconds = timeout_seconds
+
+    monkeypatch.setenv("GAIA_TASK_ROOT", str(tmp_path))
+    monkeypatch.setenv("GAIA_ATTACHMENTS", "[]")
+    monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", str(global_timeout))
+    monkeypatch.delenv("GAIA_MCP_FAKE_BACKEND", raising=False)
+    monkeypatch.setattr(mcp_server, "HTTPWebReader", CapturingWebReader)
+    monkeypatch.setattr(
+        mcp_server,
+        "AsyncOpenAI",
+        lambda **kwargs: SimpleNamespace(config=kwargs),
+    )
+
+    settings = mcp_server._settings_from_env()
+
+    assert settings.web_reader.timeout_seconds == expected_webpage_timeout
+    assert isinstance(settings.backend, HostedOpenAIBackend)
+    assert settings.backend._timeout_seconds == global_timeout
+
+
+def test_fake_settings_caps_direct_webpage_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CapturingWebReader:
+        def __init__(self, *, timeout_seconds: float) -> None:
+            self.timeout_seconds = timeout_seconds
+
+    monkeypatch.setattr(mcp_server, "HTTPWebReader", CapturingWebReader)
+
+    settings = MCPServerSettings.for_fake_backend(
+        task_root=tmp_path,
+        attachments=set(),
+        api_key="test",
+        hf_token="test-hf",
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        timeout_seconds=300,
+    )
+
+    assert settings.web_reader.timeout_seconds == 20
