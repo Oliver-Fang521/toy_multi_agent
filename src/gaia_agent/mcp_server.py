@@ -34,6 +34,7 @@ from gaia_agent.providers.base import serialize_tool_output, tool_output_size_by
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
 MAX_WEB_SEARCH_OUTPUT_BYTES = 16 * 1024
 MAX_WEB_SEARCH_SOURCES = 8
+MAX_HOSTED_WEB_SEARCH_TIMEOUT_SECONDS = 60.0
 MAX_DIRECT_WEBPAGE_TIMEOUT_SECONDS = 20.0
 MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
@@ -596,6 +597,9 @@ class HostedOpenAIBackend:
         self._reasoning_effort = reasoning_effort
         self._attachments = attachment_reader
         self._timeout_seconds = timeout_seconds
+        self._web_search_timeout_seconds = min(
+            timeout_seconds, MAX_HOSTED_WEB_SEARCH_TIMEOUT_SECONDS
+        )
         self._remote_file_ids: dict[Path, str] = {}
 
     async def web_search(self, query: str) -> dict[str, Any]:
@@ -608,7 +612,7 @@ class HostedOpenAIBackend:
                 include=["web_search_call.action.sources"],
                 reasoning={"effort": self._reasoning_effort},
             ),
-            timeout=self._timeout_seconds,
+            timeout=self._web_search_timeout_seconds,
         )
         sources: list[dict[str, Any]] = []
         for item in response.output:

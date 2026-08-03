@@ -431,6 +431,8 @@ async def test_openai_provider_finalizes_after_recoverable_failure_reaches_tool_
     assert fake_responses_client.requests[1]["input"][0]["output"] == (
         '{"error":"tool_failed"}'
     )
+    assert fake_responses_client.requests[1]["tools"] == []
+    assert "max_tool_calls" not in fake_responses_client.requests[1]
     assert fake_responses_client.requests[2]["input"] == [
         {
             "type": "function_call_output",
@@ -438,6 +440,67 @@ async def test_openai_provider_finalizes_after_recoverable_failure_reaches_tool_
             "output": '{"error":"tool_budget_exhausted"}',
         }
     ]
+    assert len(fake_responses_client.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_proactively_finalizes_when_executed_batch_reaches_cap() -> None:
+    client = FakeResponsesClient()
+    client.queued.append(
+        _response(
+            "resp-exact-cap",
+            [
+                {
+                    "type": "function_call",
+                    "id": "fc-call-1",
+                    "call_id": "call-1",
+                    "name": "execute_python",
+                    "arguments": '{"code":"one"}',
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc-call-2",
+                    "call_id": "call-2",
+                    "name": "execute_python",
+                    "arguments": '{"code":"two"}',
+                    "status": "completed",
+                },
+            ],
+            usage=_usage(10, 4, 1),
+        )
+    )
+    client.queue_text('{"answer":"finalized"}', usage=_usage(3, 2, 0))
+    executor = RecordingExecutor({"stdout": "observable"})
+
+    response = await OpenAIProvider(client, "gpt-5.6-sol").complete(
+        model_request(max_tool_calls=2), executor
+    )
+
+    assert response.parsed == {"answer": "finalized"}
+    assert response.usage.total_tokens == 19
+    assert executor.calls == [
+        ("execute_python", {"code": "one"}),
+        ("execute_python", {"code": "two"}),
+    ]
+    assert [event.call_id for event in response.tool_events] == ["call-1", "call-2"]
+    finalization = client.requests[1]
+    assert finalization["previous_response_id"] == "resp-exact-cap"
+    assert finalization["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"stdout":"observable"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-2",
+            "output": '{"stdout":"observable"}',
+        },
+    ]
+    assert finalization["tools"] == []
+    assert "max_tool_calls" not in finalization
+    assert len(client.requests) == 2
 
 
 @pytest.mark.asyncio

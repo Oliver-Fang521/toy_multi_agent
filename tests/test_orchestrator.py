@@ -23,7 +23,12 @@ from gaia_agent.models import (
     TerminalErrorCategory,
     Usage,
 )
-from gaia_agent.orchestrator import Orchestrator, _BudgetedToolClient, choose_majority
+from gaia_agent.orchestrator import (
+    Orchestrator,
+    _BudgetedToolClient,
+    _ToolBudgetExhausted,
+    choose_majority,
+)
 from gaia_agent.providers import ToolSpec
 
 
@@ -266,6 +271,124 @@ async def test_budgeted_tool_client_allows_same_transcription_in_a_later_scope()
         ("transcribe_audio", arguments),
         ("transcribe_audio", arguments),
     ]
+
+
+@pytest.mark.asyncio
+async def test_budgeted_tool_client_reuses_one_audio_result_without_double_charging() -> None:
+    class AudioTools:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.usage = Usage()
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            self.usage = Usage(input_tokens=11, output_tokens=4, total_tokens=15)
+            return {"text": "observable transcript"}
+
+    backend = AudioTools()
+    audit: list[tuple[str, dict[str, Any]]] = []
+    client = _BudgetedToolClient(
+        backend,
+        max_calls=3,
+        audit=lambda event_type, payload: audit.append((event_type, payload)),
+    )
+    client.start_scope("act:file:1")
+    arguments = {"path": "sample.mp3"}
+
+    first = await client.call("transcribe_audio", arguments)
+    second = await client.call("transcribe_audio", arguments)
+
+    assert first == second == {"text": "observable transcript"}
+    assert backend.calls == 1
+    assert client.call_count == 2
+    assert backend.usage == Usage(input_tokens=11, output_tokens=4, total_tokens=15)
+    assert audit[-1] == (
+        "tool_call_reused",
+        {
+            "tool": "transcribe_audio",
+            "call_number": 2,
+            "argument_keys": ["path"],
+            "result_keys": ["text"],
+        },
+    )
+    assert "sample.mp3" not in repr(audit)
+    assert "observable transcript" not in repr(audit)
+
+
+@pytest.mark.asyncio
+async def test_budgeted_tool_client_returns_a_safe_copy_of_cached_result() -> None:
+    class MutableTools:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            return {
+                "answer": "observable",
+                "sources": [{"url": "https://source.example"}],
+            }
+
+    backend = MutableTools()
+    client = _BudgetedToolClient(backend, max_calls=3, audit=lambda *_: None)
+    client.start_scope("act:lookup:1")
+    arguments = {"query": "public query"}
+
+    first = await client.call("web_search", arguments)
+    first["sources"][0]["url"] = "caller mutation"
+    second = await client.call("web_search", arguments)
+
+    assert second == {
+        "answer": "observable",
+        "sources": [{"url": "https://source.example"}],
+    }
+    assert backend.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_budgeted_tool_client_checks_global_budget_before_cached_reuse() -> None:
+    tools = FakeTools([])
+    client = _BudgetedToolClient(tools, max_calls=1, audit=lambda *_: None)
+    client.start_scope("verify:1")
+    arguments = {"query": "same query"}
+    await client.call("web_search", arguments)
+
+    with pytest.raises(_ToolBudgetExhausted):
+        await client.call("web_search", arguments)
+
+    assert client.call_count == 1
+    assert tools.call_arguments == [("web_search", arguments)]
+
+
+@pytest.mark.asyncio
+async def test_budgeted_tool_client_does_not_cache_failed_result() -> None:
+    class RecoveringTools:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls == 1:
+                raise ToolExecutionError("temporary failure")
+            return {"text": "retry succeeded"}
+
+    backend = RecoveringTools()
+    client = _BudgetedToolClient(backend, max_calls=3, audit=lambda *_: None)
+    client.start_scope("act:file:1")
+    arguments = {"path": "sample.mp3"}
+
+    with pytest.raises(ToolExecutionError):
+        await client.call("transcribe_audio", arguments)
+    result = await client.call("transcribe_audio", arguments)
+
+    assert result == {"text": "retry succeeded"}
+    assert backend.calls == 2
+    assert client.call_count == 2
 
 
 def _config(**overrides: Any) -> RunConfig:
@@ -681,11 +804,11 @@ async def test_identical_tool_call_across_specialist_and_critic_scopes_is_allowe
 
 
 @pytest.mark.asyncio
-async def test_identical_tool_call_within_one_verify_scope_stops_as_a_loop() -> None:
+async def test_third_identical_tool_call_within_one_verify_scope_stops_as_a_loop() -> None:
     calls: list[str] = []
     repeated = ("web_search", {"query": "same query"})
     source = _evidence("source-1", "source")
-    result = await _orchestrator(
+    orchestrator = _orchestrator(
         planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
         specialists={
             SpecialistName.LOOKUP: FakeSpecialist(
@@ -697,13 +820,16 @@ async def test_identical_tool_call_within_one_verify_scope_stops_as_a_loop() -> 
         critic=FakeCritic(
             calls,
             [_decision("approve", ("evidence-0001",))],
-            tool_calls=[repeated, repeated],
+            tool_calls=[repeated, repeated, repeated],
         ),
         tools=FakeTools(calls),
-    ).run(_task())
+    )
+
+    result = await orchestrator.run(_task())
 
     assert result.error_category == TerminalErrorCategory.LOOP_DETECTED
     assert calls.count("web_search") == 1
+    assert orchestrator.tool_call_count == 2
     assert "submit_answer" not in calls
 
 

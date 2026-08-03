@@ -926,6 +926,48 @@ async def test_hosted_search_requires_web_tool_and_extracts_sources(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("global_timeout", "expected_web_timeout"),
+    [(300.0, 60.0), (12.5, 12.5)],
+)
+async def test_hosted_web_search_caps_only_its_response_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    global_timeout: float,
+    expected_web_timeout: float,
+) -> None:
+    response = SimpleNamespace(
+        output_text="answer",
+        output=[],
+        usage=SimpleNamespace(
+            input_tokens=2,
+            output_tokens=1,
+            total_tokens=3,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+        ),
+    )
+    observed_timeouts: list[float] = []
+
+    async def capturing_wait_for(awaitable: Any, *, timeout: float) -> Any:
+        observed_timeouts.append(timeout)
+        return await awaitable
+
+    monkeypatch.setattr(mcp_server.asyncio, "wait_for", capturing_wait_for)
+    backend = HostedOpenAIBackend(
+        client=FakeHostedClient(response),
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        timeout_seconds=global_timeout,
+    )
+
+    await backend.web_search("question")
+
+    assert observed_timeouts == [expected_web_timeout]
+    assert backend._timeout_seconds == global_timeout
+
+
+@pytest.mark.asyncio
 async def test_hosted_search_bounds_result_and_sources_while_preserving_usage(
     tmp_path: Path,
 ) -> None:
@@ -1685,14 +1727,15 @@ async def test_build_server_exposes_exact_public_tool_plane(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
-    ("global_timeout", "expected_webpage_timeout"),
-    [(300.0, 20.0), (12.5, 12.5)],
+    ("global_timeout", "expected_webpage_timeout", "expected_hosted_web_timeout"),
+    [(300.0, 20.0, 60.0), (12.5, 12.5, 12.5)],
 )
 def test_settings_caps_direct_webpage_timeout_without_shortening_hosted_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     global_timeout: float,
     expected_webpage_timeout: float,
+    expected_hosted_web_timeout: float,
 ) -> None:
     class CapturingWebReader:
         def __init__(self, *, timeout_seconds: float) -> None:
@@ -1714,6 +1757,7 @@ def test_settings_caps_direct_webpage_timeout_without_shortening_hosted_tools(
     assert settings.web_reader.timeout_seconds == expected_webpage_timeout
     assert isinstance(settings.backend, HostedOpenAIBackend)
     assert settings.backend._timeout_seconds == global_timeout
+    assert settings.backend._web_search_timeout_seconds == expected_hosted_web_timeout
 
 
 def test_fake_settings_caps_direct_webpage_timeout(

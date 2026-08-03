@@ -397,6 +397,31 @@ def test_recoverable_tool_failure_audit_is_public_and_integrity_safe(
     assert '"category":"tool_error"' in audit
 
 
+def test_reused_tool_audit_is_public_and_integrity_safe(tmp_path, prediction) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+    store.append_audit(
+        prediction.task_id,
+        AuditEvent(
+            sequence=1,
+            event_type="tool_call_reused",
+            timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+            payload={
+                "tool": "transcribe_audio",
+                "call_number": 2,
+                "argument_keys": ["path"],
+                "result_keys": ["text"],
+            },
+        ),
+    )
+
+    store.verify_integrity()
+    audit = (store.task_directory(prediction.task_id) / "audit.jsonl").read_text()
+    assert '"event_type":"tool_call_reused"' in audit
+    assert '"argument_keys":["path"]' in audit
+    assert "sample.mp3" not in audit
+    assert "observable transcript" not in audit
+
+
 def test_manifest_rejects_known_environment_secrets_in_all_public_identifiers(tmp_path, monkeypatch) -> None:
     secret = "env-private-value"
     monkeypatch.setenv("OPENAI_API_KEY", secret)

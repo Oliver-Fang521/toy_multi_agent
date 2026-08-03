@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import re
@@ -80,6 +81,12 @@ class _AttachmentUnavailable(RuntimeError):
 
 
 @dataclass
+class _CachedToolResult:
+    result: dict[str, Any]
+    reused: bool = False
+
+
+@dataclass
 class _TaskState:
     plan: AgentPlan | None = None
     evidence: list[Evidence] = field(default_factory=list)
@@ -105,7 +112,7 @@ class _BudgetedToolClient:
         self._max_calls = max_calls
         self._audit = audit
         self._scope = "unscoped"
-        self._signatures_by_scope: dict[str, set[str]] = defaultdict(set)
+        self._results_by_scope: dict[str, dict[str, _CachedToolResult]] = defaultdict(dict)
         self.call_count = 0
 
     @property
@@ -126,12 +133,24 @@ class _BudgetedToolClient:
             sort_keys=True,
             separators=(",", ":"),
         )
-        signatures = self._signatures_by_scope[self._scope]
-        if signature in signatures:
-            raise _RepeatedToolCall(f"repeated tool call: {name}")
         if self.call_count >= self._max_calls:
             raise _ToolBudgetExhausted("global tool-call budget exhausted")
-        signatures.add(signature)
+        cached = self._results_by_scope[self._scope].get(signature)
+        if cached is not None:
+            if cached.reused:
+                raise _RepeatedToolCall(f"repeated tool call: {name}")
+            cached.reused = True
+            self.call_count += 1
+            self._audit(
+                "tool_call_reused",
+                {
+                    "tool": name,
+                    "call_number": self.call_count,
+                    "argument_keys": sorted(arguments),
+                    "result_keys": sorted(cached.result),
+                },
+            )
+            return copy.deepcopy(cached.result)
         self.call_count += 1
         safe_payload = {
             "tool": name,
@@ -147,6 +166,9 @@ class _BudgetedToolClient:
                 {**safe_payload, "category": "tool_error"},
             )
             raise
+        self._results_by_scope[self._scope][signature] = _CachedToolResult(
+            result=copy.deepcopy(result)
+        )
         self._audit(
             "tool_call_completed",
             {

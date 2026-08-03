@@ -45,11 +45,11 @@ class OpenAIProvider:
         tool_events: list[ToolEvent] = []
         tool_call_count = 0
         allowed_tool_names = {tool.name for tool in request.allowed_tools}
+        tool_free_common = {**common, "tools": []}
+        tool_free_common.pop("max_tool_calls", None)
 
         while calls := [item for item in response.output if item.type == "function_call"]:
             if tool_call_count + len(calls) > request.max_tool_calls:
-                finalization_common = {**common, "tools": []}
-                finalization_common.pop("max_tool_calls", None)
                 response = await self._create_with_retry(
                     previous_response_id=response.id,
                     input=[
@@ -60,7 +60,7 @@ class OpenAIProvider:
                         }
                         for call in calls
                     ],
-                    **finalization_common,
+                    **tool_free_common,
                 )
                 responses.append(response)
                 break
@@ -96,10 +96,15 @@ class OpenAIProvider:
                     )
                 )
             tool_call_count += len(calls)
+            next_common = (
+                tool_free_common
+                if tool_call_count == request.max_tool_calls
+                else common
+            )
             response = await self._create_with_retry(
                 previous_response_id=response.id,
                 input=outputs,
-                **common,
+                **next_common,
             )
             responses.append(response)
 

@@ -245,7 +245,7 @@ def test_complete_injected_composition_requires_non_production_identity(
 
 @pytest.mark.parametrize(
     ("global_limit", "agent_limit"),
-    [(24, 8), (5, 5)],
+    [(24, 6), (5, 5)],
 )
 def test_build_runner_caps_each_specialist_and_critic_request(
     tmp_path: Path,

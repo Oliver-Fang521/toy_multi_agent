@@ -87,7 +87,7 @@ _FORBIDDEN_PUBLIC_KEYS = frozenset(
         "token",
     }
 )
-_MAX_AGENT_TOOL_CALLS = 8
+_MAX_AGENT_TOOL_CALLS = 6
 
 
 class TaskOrchestrator(Protocol):
