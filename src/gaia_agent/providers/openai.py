@@ -35,8 +35,9 @@ class OpenAIProvider:
             },
             "reasoning": {"effort": request.reasoning_effort},
             "max_output_tokens": request.max_output_tokens,
-            "max_tool_calls": request.max_tool_calls,
         }
+        if request.max_tool_calls > 0:
+            common["max_tool_calls"] = request.max_tool_calls
         response = await self._create_with_retry(input=request.input_items, **common)
         responses = [response]
         tool_events: list[ToolEvent] = []

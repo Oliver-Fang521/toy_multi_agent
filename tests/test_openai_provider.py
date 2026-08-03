@@ -283,6 +283,21 @@ async def test_openai_provider_maps_reasoning_schema_and_function_tools_strictly
 
 
 @pytest.mark.asyncio
+async def test_openai_provider_omits_zero_tool_call_limit_for_tool_free_request(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_text('{"answer":"42"}')
+
+    await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(
+        model_request(allowed_tools=(), max_tool_calls=0)
+    )
+
+    sent = fake_responses_client.requests[0]
+    assert sent["tools"] == []
+    assert "max_tool_calls" not in sent
+
+
+@pytest.mark.asyncio
 async def test_openai_provider_aggregates_usage_and_extracts_sources(
     fake_responses_client: FakeResponsesClient,
 ) -> None:
