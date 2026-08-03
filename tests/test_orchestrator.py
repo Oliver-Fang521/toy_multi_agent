@@ -250,6 +250,24 @@ async def test_budgeted_tool_client_audits_recoverable_failure_without_message()
     assert "private.mp3" not in repr(audit)
 
 
+@pytest.mark.asyncio
+async def test_budgeted_tool_client_allows_same_transcription_in_a_later_scope() -> None:
+    tools = FakeTools([])
+    client = _BudgetedToolClient(tools, max_calls=3, audit=lambda *_: None)
+    arguments = {"path": "sample.mp3"}
+
+    client.start_scope("act:file:1")
+    await client.call("transcribe_audio", arguments)
+    client.start_scope("verify:1")
+    await client.call("transcribe_audio", arguments)
+
+    assert client.call_count == 2
+    assert tools.call_arguments == [
+        ("transcribe_audio", arguments),
+        ("transcribe_audio", arguments),
+    ]
+
+
 def _config(**overrides: Any) -> RunConfig:
     values: dict[str, Any] = {
         "openai_api_key": "sk-test",
@@ -628,7 +646,7 @@ async def test_submit_cannot_bypass_global_tool_call_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_identical_tool_call_across_roles_stops_as_a_loop() -> None:
+async def test_identical_tool_call_across_specialist_and_critic_scopes_is_allowed() -> None:
     calls: list[str] = []
     repeated = [("web_search", {"query": "same query"})]
     source = _evidence("source-1", "source")
@@ -650,8 +668,84 @@ async def test_identical_tool_call_across_roles_stops_as_a_loop() -> None:
         tools=FakeTools(calls),
     ).run(_task())
 
+    assert result.answer == "Marie Curie"
+    assert result.error_category is None
+    assert calls == [
+        "planner",
+        "lookup",
+        "web_search",
+        "critic",
+        "web_search",
+        "submit_answer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_identical_tool_call_within_one_verify_scope_stops_as_a_loop() -> None:
+    calls: list[str] = []
+    repeated = ("web_search", {"query": "same query"})
+    source = _evidence("source-1", "source")
+    result = await _orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
+            )
+        },
+        critic=FakeCritic(
+            calls,
+            [_decision("approve", ("evidence-0001",))],
+            tool_calls=[repeated, repeated],
+        ),
+        tools=FakeTools(calls),
+    ).run(_task())
+
     assert result.error_category == TerminalErrorCategory.LOOP_DETECTED
+    assert calls.count("web_search") == 1
     assert "submit_answer" not in calls
+
+
+@pytest.mark.asyncio
+async def test_identical_tool_call_in_second_verify_scope_is_allowed() -> None:
+    calls: list[str] = []
+    source = _evidence("source-1", "source")
+    tools = FakeTools(calls)
+    result = await _orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "Polonium")],
+            )
+        },
+        critic=FakeCritic(
+            calls,
+            [
+                _decision(
+                    "revise",
+                    ("evidence-0001",),
+                    corrected_answer="Radium",
+                ),
+                _decision("approve", ("evidence-0001",)),
+            ],
+            tool_calls=[("web_search", {"query": "same query"})],
+        ),
+        tools=tools,
+    ).run(_task())
+
+    assert result.answer == "Radium"
+    assert result.error_category is None
+    assert tools.call_arguments == [
+        ("web_search", {"query": "same query"}),
+        ("web_search", {"query": "same query"}),
+        (
+            "submit_answer",
+            {"answer": "Radium", "evidence_ids": ["evidence-0001"]},
+        ),
+    ]
 
 
 @pytest.mark.asyncio

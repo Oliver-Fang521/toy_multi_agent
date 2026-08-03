@@ -87,6 +87,7 @@ _FORBIDDEN_PUBLIC_KEYS = frozenset(
         "token",
     }
 )
+_MAX_AGENT_TOOL_CALLS = 8
 
 
 class TaskOrchestrator(Protocol):
@@ -321,6 +322,7 @@ def build_runner(
     if runtime.fake_mcp_backend and runtime.evaluation_mode != "test":
         raise ValueError("fake MCP backend requires an injected test runtime")
     provider = runtime.provider
+    agent_tool_calls = min(config.max_tool_calls, _MAX_AGENT_TOOL_CALLS)
     planner = PlannerAgent(
         provider,
         max_steps=config.max_steps,
@@ -330,28 +332,28 @@ def build_runner(
         SpecialistName.LOOKUP: LookupAgent(
             provider,
             reasoning_effort=config.reasoning_effort,
-            max_tool_calls=config.max_tool_calls,
+            max_tool_calls=agent_tool_calls,
         ),
         SpecialistName.COMPUTATION: ComputationAgent(
             provider,
             reasoning_effort=config.reasoning_effort,
-            max_tool_calls=config.max_tool_calls,
+            max_tool_calls=agent_tool_calls,
         ),
         SpecialistName.FILE: FileAnalysisAgent(
             provider,
             reasoning_effort=config.reasoning_effort,
-            max_tool_calls=config.max_tool_calls,
+            max_tool_calls=agent_tool_calls,
         ),
         SpecialistName.VISUAL: VisualAgent(
             provider,
             reasoning_effort=config.reasoning_effort,
-            max_tool_calls=config.max_tool_calls,
+            max_tool_calls=agent_tool_calls,
         ),
     }
     critic = CriticAgent(
         provider,
         reasoning_effort=config.reasoning_effort,
-        max_tool_calls=config.max_tool_calls,
+        max_tool_calls=agent_tool_calls,
     )
 
     def orchestrator_factory(task: GaiaTask) -> Orchestrator:

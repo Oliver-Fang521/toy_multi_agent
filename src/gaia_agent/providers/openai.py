@@ -48,7 +48,22 @@ class OpenAIProvider:
 
         while calls := [item for item in response.output if item.type == "function_call"]:
             if tool_call_count + len(calls) > request.max_tool_calls:
-                raise RuntimeError("tool-call budget exhausted")
+                finalization_common = {**common, "tools": []}
+                finalization_common.pop("max_tool_calls", None)
+                response = await self._create_with_retry(
+                    previous_response_id=response.id,
+                    input=[
+                        {
+                            "type": "function_call_output",
+                            "call_id": call.call_id,
+                            "output": '{"error":"tool_budget_exhausted"}',
+                        }
+                        for call in calls
+                    ],
+                    **finalization_common,
+                )
+                responses.append(response)
+                break
             if undeclared := next(
                 (call.name for call in calls if call.name not in allowed_tool_names), None
             ):

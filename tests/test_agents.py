@@ -43,6 +43,14 @@ def test_specialist_tool_allowlists_are_narrow() -> None:
     assert VisualAgent.allowed_tool_names == frozenset({"read_attachment"})
 
 
+def test_lookup_prompt_bounds_web_research_before_synthesis() -> None:
+    prompt = LookupAgent.instructions.casefold()
+
+    assert "at most three web searches" in prompt
+    assert "at most three webpage reads" in prompt
+    assert "then synthesize" in prompt
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("steps", [[], [{"specialist": "lookup", "instruction": "x"}] * 5])
 async def test_planner_rejects_empty_or_oversized_plans(fake_provider, task, steps) -> None:

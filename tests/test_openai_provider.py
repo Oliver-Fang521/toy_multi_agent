@@ -20,6 +20,7 @@ from gaia_agent import mcp_server, providers
 from gaia_agent.mcp_client import ToolExecutionError
 from gaia_agent.mcp_server import AttachmentReader, MCPServerSettings, build_server
 from gaia_agent.models import Usage
+from gaia_agent.orchestrator import _RepeatedToolCall, _ToolBudgetExhausted
 from gaia_agent.providers import ModelRequest, OpenAIProvider, ToolSpec
 
 
@@ -404,11 +405,12 @@ async def test_openai_provider_recovers_from_tool_failure_without_leaking_messag
 
 
 @pytest.mark.asyncio
-async def test_openai_provider_counts_recoverable_failure_against_tool_budget(
+async def test_openai_provider_finalizes_after_recoverable_failure_reaches_tool_budget(
     fake_responses_client: FakeResponsesClient,
 ) -> None:
     fake_responses_client.queue_function_call("execute_python", "{}", "call-1")
     fake_responses_client.queue_function_call("execute_python", "{}", "call-2")
+    fake_responses_client.queue_text('{"answer":"budget-finalized"}')
 
     class FailingExecutor:
         def __init__(self) -> None:
@@ -420,15 +422,22 @@ async def test_openai_provider_counts_recoverable_failure_against_tool_budget(
 
     executor = FailingExecutor()
 
-    with pytest.raises(RuntimeError, match="tool-call budget exhausted"):
-        await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(
-            model_request(max_tool_calls=1), executor
-        )
+    response = await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(
+        model_request(max_tool_calls=1), executor
+    )
 
+    assert response.parsed == {"answer": "budget-finalized"}
     assert executor.calls == 1
     assert fake_responses_client.requests[1]["input"][0]["output"] == (
         '{"error":"tool_failed"}'
     )
+    assert fake_responses_client.requests[2]["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-2",
+            "output": '{"error":"tool_budget_exhausted"}',
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -634,15 +643,84 @@ async def test_openai_provider_maps_refusal_without_attempting_json_parse(
 
 
 @pytest.mark.asyncio
-async def test_openai_provider_enforces_global_tool_call_budget(
+async def test_openai_provider_finalizes_structured_output_without_executing_over_cap_call(
     fake_responses_client: FakeResponsesClient,
+) -> None:
+    secret = "private-over-budget-arguments"
+    fake_responses_client.queue_function_call(
+        "execute_python",
+        json.dumps({"code": secret}),
+        "call-1",
+        usage=_usage(7, 3, 1),
+    )
+    fake_responses_client.queue_text(
+        '{"answer":"bounded"}',
+        usage=_usage(5, 2, 0),
+    )
+    executor = RecordingExecutor({"stdout": "must not execute"})
+
+    response = await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(
+        model_request(max_tool_calls=0), executor
+    )
+
+    assert response.parsed == {"answer": "bounded"}
+    assert response.usage.total_tokens == 17
+    assert response.tool_events == ()
+    assert executor.calls == []
+    finalization = fake_responses_client.requests[1]
+    assert finalization["previous_response_id"] == "resp-1"
+    assert finalization["input"] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"error":"tool_budget_exhausted"}',
+        }
+    ]
+    assert finalization["tools"] == []
+    assert "max_tool_calls" not in finalization
+    assert finalization["text"] == fake_responses_client.requests[0]["text"]
+    assert secret not in repr(finalization)
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_propagates_budget_finalization_api_error() -> None:
+    client = FakeResponsesClient()
+    client.queue_function_call("execute_python", "{}", "call-1")
+    client.queued.append(_status_error(BadRequestError, 400))
+
+    with pytest.raises(BadRequestError):
+        await OpenAIProvider(client, "gpt-5.6-sol").complete(
+            model_request(max_tool_calls=0), RecordingExecutor({})
+        )
+
+    assert len(client.requests) == 2
+    assert client.requests[1]["tools"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_error",
+    [
+        _ToolBudgetExhausted("global tool-call budget exhausted"),
+        _RepeatedToolCall("repeated tool call"),
+    ],
+)
+async def test_openai_provider_does_not_swallow_global_tool_guards(
+    fake_responses_client: FakeResponsesClient,
+    terminal_error: RuntimeError,
 ) -> None:
     fake_responses_client.queue_function_call("execute_python", "{}", "call-1")
 
-    with pytest.raises(RuntimeError, match="tool-call budget exhausted"):
+    class GuardedExecutor:
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            raise terminal_error
+
+    with pytest.raises(type(terminal_error), match=str(terminal_error)):
         await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(
-            model_request(max_tool_calls=0), RecordingExecutor({})
+            model_request(max_tool_calls=1), GuardedExecutor()
         )
+
+    assert len(fake_responses_client.requests) == 1
 
 
 @pytest.mark.asyncio

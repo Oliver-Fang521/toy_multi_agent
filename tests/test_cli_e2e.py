@@ -243,6 +243,34 @@ def test_complete_injected_composition_requires_non_production_identity(
     assert not (tmp_path / "manifest.json").exists()
 
 
+@pytest.mark.parametrize(
+    ("global_limit", "agent_limit"),
+    [(24, 8), (5, 5)],
+)
+def test_build_runner_caps_each_specialist_and_critic_request(
+    tmp_path: Path,
+    global_limit: int,
+    agent_limit: int,
+) -> None:
+    runner = build_runner(
+        _config(tmp_path, max_tool_calls=global_limit),
+        dataset_loader=lambda _config: _fixture_tasks(),
+        provider_factory=lambda _config: ProviderRuntime(
+            provider=_OfflineProvider(),
+            provider_name="offline-fixture",
+            evaluation_mode="test",
+            fake_mcp_backend=True,
+        ),
+    )
+    orchestrator = runner._orchestrator_factory(_fixture_tasks()[0][0])
+
+    assert {agent.max_tool_calls for agent in orchestrator._specialists.values()} == {
+        agent_limit
+    }
+    assert orchestrator._critic.max_tool_calls == agent_limit
+    assert orchestrator._config.max_tool_calls == global_limit
+
+
 def test_evaluate_cli_runs_four_planes_over_real_stdio_and_writes_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

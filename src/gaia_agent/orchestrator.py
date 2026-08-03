@@ -89,6 +89,7 @@ class _TaskState:
     candidate: str | None = None
     usage: Usage = field(default_factory=Usage)
     step_count: int = 0
+    verify_count: int = 0
     critic_verdict: str = "not_run"
 
 
@@ -103,7 +104,8 @@ class _BudgetedToolClient:
         self._client = client
         self._max_calls = max_calls
         self._audit = audit
-        self._signatures: set[str] = set()
+        self._scope = "unscoped"
+        self._signatures_by_scope: dict[str, set[str]] = defaultdict(set)
         self.call_count = 0
 
     @property
@@ -113,17 +115,23 @@ class _BudgetedToolClient:
     async def read_attachment_bytes(self, path: Path | str) -> bytes:
         return await self._client.read_attachment_bytes(path)
 
+    def start_scope(self, scope: str) -> None:
+        if not scope.strip():
+            raise ValueError("tool-call scope must be non-empty")
+        self._scope = scope
+
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         signature = json.dumps(
             {"name": name, "arguments": arguments},
             sort_keys=True,
             separators=(",", ":"),
         )
-        if signature in self._signatures:
+        signatures = self._signatures_by_scope[self._scope]
+        if signature in signatures:
             raise _RepeatedToolCall(f"repeated tool call: {name}")
         if self.call_count >= self._max_calls:
             raise _ToolBudgetExhausted("global tool-call budget exhausted")
-        self._signatures.add(signature)
+        signatures.add(signature)
         self.call_count += 1
         safe_payload = {
             "tool": name,
@@ -316,6 +324,12 @@ class Orchestrator:
         state.step_count += 1
         self.step_count = state.step_count
         event_prefix = "correction_act" if correction else "act"
+        scope = (
+            f"correction:{self.correction_count}"
+            if correction
+            else f"act:{state.step_count}"
+        )
+        tools.start_scope(scope)
         self._audit(
             f"{event_prefix}_started",
             {
@@ -383,6 +397,8 @@ class Orchestrator:
         task: GaiaTask,
         tools: _BudgetedToolClient,
     ) -> CriticDecision:
+        state.verify_count += 1
+        tools.start_scope(f"verify:{state.verify_count}")
         self._audit(
             "verify_started",
             {
@@ -455,6 +471,7 @@ class Orchestrator:
         if self.correction_count:
             raise _CorrectionUnavailable("only one correction cycle is allowed")
         self.correction_count = 1
+        tools.start_scope(f"correction:{self.correction_count}")
         self._audit(
             "correction_started",
             {"verdict": decision.verdict},
@@ -528,6 +545,7 @@ class Orchestrator:
         if state.candidate is None:
             raise ValueError("cannot submit a missing candidate")
         evidence_ids = tuple(item.evidence_id for item in state.evidence)
+        tools.start_scope("submit")
         self._audit(
             "submit_started",
             {"evidence_ids": list(evidence_ids)},

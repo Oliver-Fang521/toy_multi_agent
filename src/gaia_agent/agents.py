@@ -210,9 +210,10 @@ class LookupAgent(SpecialistAgent):
     allowed_evidence_kinds = frozenset({"source"})
     instructions = (
         "Use only the supplied web tools to find observable evidence, prioritizing primary "
-        "sources. Return source URLs and concise summaries; do not invent unavailable facts or "
-        "request hidden reasoning. A candidate answer must follow the GAIA format: a number, as "
-        "few words as possible, or an ordered comma-separated list without prose."
+        "sources. Use at most three web searches and at most three webpage reads, then synthesize "
+        "the evidence. Return source URLs and concise summaries; do not invent unavailable facts "
+        "or request hidden reasoning. A candidate answer must follow the GAIA format: a number, "
+        "as few words as possible, or an ordered comma-separated list without prose."
     )
 
 
