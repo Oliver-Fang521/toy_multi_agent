@@ -38,7 +38,7 @@ def test_specialist_tool_allowlists_are_narrow() -> None:
     assert LookupAgent.allowed_tool_names == frozenset({"web_search", "read_webpage"})
     assert ComputationAgent.allowed_tool_names == frozenset({"execute_python"})
     assert FileAnalysisAgent.allowed_tool_names == frozenset(
-        {"read_attachment", "execute_python"}
+        {"read_attachment", "execute_python", "transcribe_audio"}
     )
     assert VisualAgent.allowed_tool_names == frozenset({"read_attachment"})
 
@@ -307,6 +307,7 @@ async def test_file_agent_routes_registered_attachment_without_exposing_gold(
     assert [tool.name for tool in request.allowed_tools] == [
         "execute_python",
         "read_attachment",
+        "transcribe_audio",
     ]
     assert context["attachment"]["path"] == str(image_task.attachment_path)
     assert context["attachment"]["media_type"] == "image/png"

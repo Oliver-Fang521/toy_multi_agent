@@ -37,13 +37,21 @@ _SECRET_VALUE_PATTERNS = (
 _PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _PUBLIC_PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _PUBLIC_TOOL_NAMES = frozenset(
-    {"web_search", "read_webpage", "execute_python", "read_attachment", "submit_answer"}
+    {
+        "web_search",
+        "read_webpage",
+        "execute_python",
+        "read_attachment",
+        "transcribe_audio",
+        "submit_answer",
+    }
 )
 _PUBLIC_TOOL_ARGUMENT_KEYS = {
     "web_search": frozenset({"query"}),
     "read_webpage": frozenset({"url"}),
     "execute_python": frozenset({"instruction", "code", "paths", "attachment_ids", "file_ids"}),
     "read_attachment": frozenset({"path"}),
+    "transcribe_audio": frozenset({"path"}),
     "submit_answer": frozenset({"answer", "evidence_ids"}),
 }
 _PUBLIC_TOOL_NORMAL_RESULT_SHAPES = {
@@ -62,6 +70,7 @@ _PUBLIC_TOOL_NORMAL_RESULT_SHAPES = {
             frozenset({"path", "kind", "media_type", "size_bytes"}),
         }
     ),
+    "transcribe_audio": frozenset({frozenset({"text"})}),
     "submit_answer": frozenset({frozenset({"answer", "evidence_ids"})}),
 }
 _BOUNDED_RESULT_KEYS = frozenset({"output", "truncated"})

@@ -230,12 +230,16 @@ class ComputationAgent(SpecialistAgent):
 
 class FileAnalysisAgent(SpecialistAgent):
     name = SpecialistName.FILE
-    allowed_tool_names = frozenset({"read_attachment", "execute_python"})
+    allowed_tool_names = frozenset(
+        {"read_attachment", "execute_python", "transcribe_audio"}
+    )
     allowed_evidence_kinds = frozenset({"file", "computation"})
     instructions = (
-        "Inspect only the registered task attachment through read_attachment or execute_python. "
-        "Return observable file or computation evidence; do not invent missing content or request "
-        "hidden reasoning. Keep any candidate answer in the concise GAIA answer format."
+        "Inspect only the registered task attachment through read_attachment, transcribe_audio, "
+        "or execute_python. Use transcribe_audio for registered audio instead of uploading audio "
+        "to Code Interpreter. Return observable file or computation evidence; do not invent "
+        "missing content or request hidden reasoning. Keep any candidate answer in the concise "
+        "GAIA answer format."
     )
 
 

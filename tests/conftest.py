@@ -84,6 +84,16 @@ class FakeToolClient:
                 },
             ),
             ToolSpec(
+                name="transcribe_audio",
+                description="Transcribe a registered audio attachment",
+                parameters={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+            ),
+            ToolSpec(
                 name="submit_answer",
                 description="Submit a terminal answer",
                 parameters={

@@ -336,6 +336,7 @@ def test_real_task_six_tool_audit_shapes_persist_only_key_names(tmp_path, predic
         ("read_webpage", ["url"], ["url", "status_code", "content_type", "text", "truncated"]),
         ("execute_python", ["code", "paths"], ["output_text", "outputs"]),
         ("read_attachment", ["path"], ["path", "kind", "text"]),
+        ("transcribe_audio", ["path"], ["text"]),
         ("submit_answer", ["answer", "evidence_ids"], ["answer", "evidence_ids"]),
     )
     sequence = 1

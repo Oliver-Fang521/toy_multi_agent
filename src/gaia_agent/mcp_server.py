@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import io
 import ipaddress
 import json
 import mimetypes
 import os
 import socket
+import stat
 import threading
 import zipfile
 import zlib
@@ -31,6 +33,7 @@ from gaia_agent.models import HOSTED_USAGE_METADATA_KEY, Usage
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
 MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
+MAX_AUDIO_ATTACHMENT_BYTES = 25_000_000
 MAX_REDIRECTS = 10
 MAX_DECODED_TEXT_BYTES = 1024 * 1024
 MAX_TABULAR_ROWS = 10_000
@@ -42,6 +45,9 @@ MAX_XLSX_ARCHIVE_ENTRIES = 1_000
 MAX_XLSX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
 MAX_XLSX_WORKSHEETS = 50
 _SENSITIVE_KEY_PARTS = ("api_key", "authorization", "credential", "password", "secret", "token")
+_AUDIO_TRANSCRIPTION_SUFFIXES = frozenset(
+    {".flac", ".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".ogg", ".wav", ".webm"}
+)
 _PDF_FILTER_LIMIT_NAMES = (
     "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH",
     "JBIG2_MAX_OUTPUT_LENGTH",
@@ -50,6 +56,10 @@ _PDF_FILTER_LIMIT_NAMES = (
     "ZLIB_MAX_OUTPUT_LENGTH",
 )
 _PDF_FILTER_LOCK = threading.Lock()
+
+
+class _TrustedHostedResult(dict[str, Any]):
+    pass
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -86,18 +96,26 @@ def _redact(value: Any, secrets: tuple[str, ...]) -> Any:
     return value
 
 
-def _bounded_result(result: dict[str, Any]) -> dict[str, Any]:
-    encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+def _bounded_result(
+    result: dict[str, Any],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = metadata or {}
+    combined = {**result, **metadata}
+    encoded = json.dumps(combined, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) <= MAX_TOOL_OUTPUT_BYTES:
-        return result
+        return combined
+    payload = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     low = 0
-    high = min(len(encoded), MAX_TOOL_OUTPUT_BYTES)
-    best: dict[str, Any] = {"output": "", "truncated": True}
+    high = min(len(payload), MAX_TOOL_OUTPUT_BYTES)
+    best: dict[str, Any] = {"output": "", "truncated": True, **metadata}
     while low <= high:
         middle = (low + high) // 2
         candidate = {
-            "output": encoded[:middle].decode("utf-8", errors="ignore"),
+            "output": payload[:middle].decode("utf-8", errors="ignore"),
             "truncated": True,
+            **metadata,
         }
         candidate_size = len(
             json.dumps(candidate, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -118,6 +136,8 @@ class HostedBackend(Protocol):
     async def web_search(self, query: str) -> dict[str, Any]: ...
 
     async def execute_python(self, instruction: str, paths: list[str]) -> dict[str, Any]: ...
+
+    async def transcribe_audio(self, path: str) -> dict[str, Any]: ...
 
 
 class HTTPWebReader:
@@ -273,13 +293,20 @@ class AttachmentReader:
     def __init__(self, task_root: Path, registered: set[Path] | frozenset[Path]) -> None:
         self.task_root = task_root.resolve()
         resolved: set[Path] = set()
+        registered_file_identities: dict[Path, tuple[int, int]] = {}
         for path in registered:
             candidate = path if path.is_absolute() else self.task_root / path
             candidate = candidate.resolve()
             if not _is_relative_to(candidate, self.task_root):
                 raise ValueError(f"attachment is outside task root: {path}")
             resolved.add(candidate)
+            try:
+                identity = os.stat(candidate, follow_symlinks=False)
+            except OSError:
+                continue
+            registered_file_identities[candidate] = (identity.st_dev, identity.st_ino)
         self.registered = frozenset(resolved)
+        self._registered_file_identities = registered_file_identities
 
     def resolve_registered(self, path: str) -> Path:
         candidate = (self.task_root / path).resolve()
@@ -373,6 +400,73 @@ class AttachmentReader:
             "media_type": media_type,
             "size_bytes": resolved.stat().st_size,
         }
+
+
+class _NamedBytesIO(io.BytesIO):
+    def __init__(self, content: bytes, name: str) -> None:
+        super().__init__(content)
+        self.name = name
+
+
+def _audio_file_state(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _require_audio_stat(value: os.stat_result) -> None:
+    if not stat.S_ISREG(value.st_mode):
+        raise ValueError("attachment could not be safely read")
+    if value.st_size > MAX_AUDIO_ATTACHMENT_BYTES:
+        raise ValueError("attachment exceeds audio size limit")
+
+
+def _snapshot_registered_audio(reader: AttachmentReader, path: str) -> _NamedBytesIO:
+    descriptor: int | None = None
+    try:
+        resolved = reader.resolve_registered(path)
+        if resolved.suffix.lower() not in _AUDIO_TRANSCRIPTION_SUFFIXES:
+            raise ValueError("attachment is not a supported audio format")
+        before = os.stat(resolved, follow_symlinks=False)
+        _require_audio_stat(before)
+        descriptor = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        _require_audio_stat(opened)
+        registered_identity = reader._registered_file_identities.get(resolved)
+        if registered_identity != (opened.st_dev, opened.st_ino):
+            raise ValueError("attachment could not be safely read")
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("attachment could not be safely read")
+
+        content = bytearray()
+        while len(content) <= MAX_AUDIO_ATTACHMENT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, MAX_AUDIO_ATTACHMENT_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > MAX_AUDIO_ATTACHMENT_BYTES:
+            raise ValueError("attachment exceeds audio size limit")
+
+        after = os.fstat(descriptor)
+        _require_audio_stat(after)
+        if _audio_file_state(opened) != _audio_file_state(after) or len(content) != after.st_size:
+            raise ValueError("attachment could not be safely read")
+        return _NamedBytesIO(bytes(content), resolved.name)
+    except OSError:
+        raise ValueError("attachment could not be safely read") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise ValueError("attachment could not be safely read") from None
 
 
 class AttachmentResourceLimitError(ValueError):
@@ -519,8 +613,20 @@ class HostedOpenAIBackend:
         result = {"output_text": response.output_text, "outputs": outputs}
         return _with_response_usage(result, response)
 
+    async def transcribe_audio(self, path: str) -> dict[str, Any]:
+        async with asyncio.timeout(self._timeout_seconds):
+            stream = await asyncio.to_thread(_snapshot_registered_audio, self._attachments, path)
+            with stream:
+                response = await self._client.audio.transcriptions.create(
+                    model="gpt-4o-mini-transcribe",
+                    file=stream,
+                )
+        return _with_response_usage({"text": response.text}, response)
+
     async def _upload_registered(self, path: str) -> str:
         resolved = self._attachments.resolve_registered(path)
+        if resolved.suffix.lower() in _AUDIO_TRANSCRIPTION_SUFFIXES:
+            raise ValueError("audio attachments must use transcribe_audio")
         if remote_id := self._remote_file_ids.get(resolved):
             return remote_id
         with resolved.open("rb") as stream:
@@ -543,16 +649,31 @@ def _with_response_usage(result: dict[str, Any], response: Any) -> dict[str, Any
     if raw_usage is None:
         return result
     output_details = _field(raw_usage, "output_tokens_details")
-    usage = Usage(
-        input_tokens=_field(raw_usage, "input_tokens", 0) or 0,
-        output_tokens=_field(raw_usage, "output_tokens", 0) or 0,
-        reasoning_tokens=_field(output_details, "reasoning_tokens", 0) or 0,
-        total_tokens=_field(raw_usage, "total_tokens", 0) or 0,
+    usage = _validated_hosted_usage(
+        {
+            "input_tokens": _field(raw_usage, "input_tokens", 0),
+            "output_tokens": _field(raw_usage, "output_tokens", 0),
+            "reasoning_tokens": _field(output_details, "reasoning_tokens", 0),
+            "total_tokens": _field(raw_usage, "total_tokens", 0),
+        }
     )
-    return {
+    return _TrustedHostedResult({
         **result,
-        HOSTED_USAGE_METADATA_KEY: usage.model_dump(mode="json"),
-    }
+        HOSTED_USAGE_METADATA_KEY: usage,
+    })
+
+
+def _validated_hosted_usage(value: Any) -> dict[str, int]:
+    expected = set(Usage.model_fields)
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("invalid hosted usage metadata")
+    try:
+        usage = Usage.model_validate(value, strict=True)
+    except (TypeError, ValueError):
+        raise ValueError("invalid hosted usage metadata") from None
+    if any(getattr(usage, field) < 0 for field in expected):
+        raise ValueError("invalid hosted usage metadata")
+    return usage.model_dump(mode="json")
 
 
 def _jsonable(value: Any) -> Any:
@@ -564,9 +685,15 @@ def _jsonable(value: Any) -> Any:
 
 
 class FakeHostedBackend:
-    def __init__(self, api_key: str, hf_token: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        hf_token: str,
+        attachment_reader: AttachmentReader,
+    ) -> None:
         self._api_key = api_key
         self._hf_token = hf_token
+        self._attachments = attachment_reader
 
     async def web_search(self, query: str) -> dict[str, Any]:
         if query == "__GAIA_TIMEOUT__":
@@ -593,6 +720,11 @@ class FakeHostedBackend:
         if instruction == "__GAIA_ESCAPED_OUTPUT__":
             return {"output_text": '"\\' * MAX_TOOL_OUTPUT_BYTES, "outputs": []}
         return {"output_text": f"deterministic code result for {instruction}", "outputs": []}
+
+    async def transcribe_audio(self, path: str) -> dict[str, Any]:
+        with _snapshot_registered_audio(self._attachments, path):
+            pass
+        return {"text": "deterministic audio transcript"}
 
 
 @dataclass(frozen=True)
@@ -625,7 +757,7 @@ class MCPServerSettings:
             task_root=task_root.resolve(),
             attachment_reader=attachment_reader,
             web_reader=HTTPWebReader(timeout_seconds=timeout_seconds),
-            backend=FakeHostedBackend(api_key, hf_token),
+            backend=FakeHostedBackend(api_key, hf_token, attachment_reader),
             api_key=api_key,
             hf_token=hf_token,
         )
@@ -637,12 +769,16 @@ async def _safe_tool_call(
 ) -> dict[str, Any]:
     try:
         result = await operation if hasattr(operation, "__await__") else operation()
-        redacted = _redact(result, settings.secrets)
-        usage = redacted.pop(HOSTED_USAGE_METADATA_KEY, None)
-        bounded = _bounded_result(redacted)
-        if usage is not None:
-            bounded[HOSTED_USAGE_METADATA_KEY] = usage
-        return bounded
+        payload = dict(result)
+        raw_usage = payload.pop(HOSTED_USAGE_METADATA_KEY, None)
+        usage = (
+            _validated_hosted_usage(raw_usage)
+            if isinstance(result, _TrustedHostedResult) and raw_usage is not None
+            else None
+        )
+        redacted = _redact(payload, settings.secrets)
+        metadata = {HOSTED_USAGE_METADATA_KEY: usage} if usage is not None else None
+        return _bounded_result(redacted, metadata=metadata)
     # This is the server boundary: redact arbitrary backend/parser failures before
     # MCP serializes them into consumer-visible tool errors.
     except Exception as error:  # noqa: BLE001
@@ -676,6 +812,11 @@ def build_server(settings: MCPServerSettings) -> MCPServer:
         return await _safe_tool_call(settings, lambda: settings.attachment_reader.read(path))
 
     @server.tool()
+    async def transcribe_audio(path: str) -> dict[str, Any]:
+        """Transcribe a registered audio attachment with hosted speech recognition."""
+        return await _safe_tool_call(settings, settings.backend.transcribe_audio(path))
+
+    @server.tool()
     async def submit_answer(answer: str, evidence_ids: list[str]) -> dict[str, Any]:
         """Return the concise terminal answer and evidence references."""
         return await _safe_tool_call(
@@ -697,7 +838,7 @@ def _settings_from_env() -> MCPServerSettings:
     hf_token = os.environ.get("HF_TOKEN", "")
     timeout_seconds = float(os.environ.get("GAIA_TIMEOUT_SECONDS", "300"))
     if os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1":
-        backend: HostedBackend = FakeHostedBackend(api_key, hf_token)
+        backend: HostedBackend = FakeHostedBackend(api_key, hf_token, attachment_reader)
     else:
         client = AsyncOpenAI(api_key=api_key, max_retries=0)
         backend = HostedOpenAIBackend(

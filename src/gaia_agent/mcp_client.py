@@ -19,7 +19,14 @@ from gaia_agent.models import HOSTED_USAGE_METADATA_KEY, Usage
 from gaia_agent.providers.base import ToolSpec
 
 _PUBLIC_TOOLS = frozenset(
-    {"web_search", "read_webpage", "execute_python", "read_attachment", "submit_answer"}
+    {
+        "web_search",
+        "read_webpage",
+        "execute_python",
+        "read_attachment",
+        "transcribe_audio",
+        "submit_answer",
+    }
 )
 _MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
 _ATTACHMENT_READ_CHUNK_BYTES = 1024 * 1024
