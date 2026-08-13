@@ -50,7 +50,7 @@ The evaluator also supports `--resume` to continue an interrupted run and
 least three and divisible by three because the evaluation is evenly stratified
 across all GAIA difficulty levels.
 
-## Architecture
+## Architecture 
 
 The implementation mirrors the reference architecture with four planes.
 

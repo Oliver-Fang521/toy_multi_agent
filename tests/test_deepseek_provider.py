@@ -1,0 +1,373 @@
+import json
+from collections import deque
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+import pytest
+from openai import BadRequestError, RateLimitError
+
+from gaia_agent.models import Usage
+from gaia_agent.providers import DeepSeekProvider, ModelRequest, ToolSpec
+
+
+def test_deepseek_provider_declares_no_native_vision_support() -> None:
+    assert DeepSeekProvider.supports_vision is False
+
+
+class FakeChatClient:
+    def __init__(self) -> None:
+        self.chat = self
+        self.completions = self
+        self.queued: deque[Any] = deque()
+        self.requests: list[dict[str, Any]] = []
+        self.configured_max_retries: list[int] = []
+
+    def with_options(self, *, max_retries: int) -> "FakeChatClient":
+        self.configured_max_retries.append(max_retries)
+        return self
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.requests.append(kwargs)
+        value = self.queued.popleft()
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+@pytest.fixture
+def fake_chat_client() -> FakeChatClient:
+    return FakeChatClient()
+
+
+def _status_error(error_type: type[Exception], status_code: int) -> Exception:
+    request = httpx.Request("POST", "https://api.deepseek.com/chat/completions")
+    response = httpx.Response(status_code, request=request)
+    return error_type("synthetic failure", response=response, body={})  # type: ignore[call-arg]
+
+
+def _chat_message(
+    *,
+    content: str | None = None,
+    tool_calls: list[Any] | None = None,
+    reasoning_content: str | None = None,
+    refusal: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=content,
+        tool_calls=tool_calls,
+        refusal=refusal,
+        reasoning_content=reasoning_content,
+    )
+
+
+def _chat_response(message: Any, usage: Any = None) -> SimpleNamespace:
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+
+
+def _tool_call(call_id: str, name: str, arguments: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _usage(prompt: int = 0, completion: int = 0, reasoning: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=prompt + completion,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=reasoning),
+    )
+
+
+def model_request(**updates: Any) -> ModelRequest:
+    values: dict[str, Any] = {
+        "instructions": "answer with JSON",
+        "input_items": ({"role": "user", "content": "What is six times seven?"},),
+        "output_schema": {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+        "allowed_tools": (
+            ToolSpec(
+                name="execute_python",
+                description="Run Python code",
+                parameters={
+                    "type": "object",
+                    "properties": {"code": {"type": "string"}},
+                    "required": ["code"],
+                    "additionalProperties": False,
+                },
+            ),
+        ),
+        "max_output_tokens": 500,
+        "max_tool_calls": 4,
+        "reasoning_effort": "medium",
+    }
+    values.update(updates)
+    return ModelRequest(**values)
+
+
+class RecordingExecutor:
+    def __init__(self, result: dict[str, Any]) -> None:
+        self.result = result
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((name, arguments))
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_executes_tool_loop_and_echoes_reasoning(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.append(
+        _chat_response(
+            _chat_message(
+                content="",
+                tool_calls=[
+                    _tool_call("call-1", "execute_python", '{"code":"print(6*7)"}'),
+                    _tool_call("call-2", "execute_python", '{"code":"print(8*8)"}'),
+                ],
+                reasoning_content="I should compute both products.",
+            ),
+            usage=_usage(10, 5, 4),
+        )
+    )
+    fake_chat_client.queued.append(
+        _chat_response(
+            _chat_message(content='Here is the result:\n\n```json\n{"answer":"42"}\n```'),
+            usage=_usage(20, 8, 6),
+        )
+    )
+    executor = RecordingExecutor({"stdout": "42"})
+    provider = DeepSeekProvider(client=fake_chat_client, model="deepseek-v4-flash")
+
+    response = await provider.complete(model_request(), executor)
+
+    assert executor.calls == [
+        ("execute_python", {"code": "print(6*7)"}),
+        ("execute_python", {"code": "print(8*8)"}),
+    ]
+    first = fake_chat_client.requests[0]
+    assert first["messages"] == [
+        {
+            "role": "system",
+            "content": (
+                "answer with JSON\n\nRespond with a single JSON object only, conforming "
+                "exactly to this schema:\n"
+                + json.dumps(
+                    {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    sort_keys=True,
+                )
+            ),
+        },
+        {"role": "user", "content": "What is six times seven?"},
+    ]
+    assert first["response_format"] == {"type": "json_object"}
+    assert first["max_tokens"] == 6000
+    assert first["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_python",
+                "description": "Run Python code",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"code": {"type": "string"}},
+                    "required": ["code"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    second_messages = fake_chat_client.requests[1]["messages"]
+    assert second_messages[2] == {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "I should compute both products.",
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "execute_python", "arguments": '{"code":"print(6*7)"}'},
+            },
+            {
+                "id": "call-2",
+                "type": "function",
+                "function": {"name": "execute_python", "arguments": '{"code":"print(8*8)"}'},
+            },
+        ],
+    }
+    assert second_messages[3] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": '{"stdout":"42"}',
+    }
+    assert second_messages[4] == {
+        "role": "tool",
+        "tool_call_id": "call-2",
+        "content": '{"stdout":"42"}',
+    }
+    assert response.parsed == {"answer": "42"}
+    assert response.usage == Usage(input_tokens=30, output_tokens=13, reasoning_tokens=10, total_tokens=43)
+    assert len(response.tool_events) == 2
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_does_not_retry_terminal_errors(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.append(_status_error(BadRequestError, 400))
+
+    with pytest.raises(BadRequestError):
+        await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(model_request())
+
+    assert len(fake_chat_client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_retries_transient_error_once(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.append(_status_error(RateLimitError, 429))
+    fake_chat_client.queued.append(
+        _chat_response(_chat_message(content='{"answer":"42"}'))
+    )
+
+    response = await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(model_request())
+
+    assert response.parsed == {"answer": "42"}
+    assert len(fake_chat_client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_rejects_undeclared_tool(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.append(
+        _chat_response(
+            _chat_message(
+                content="",
+                tool_calls=[_tool_call("call-1", "rm_rf", "{}")],
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="undeclared tool"):
+        await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(
+            model_request(), RecordingExecutor({})
+        )
+
+    assert len(fake_chat_client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_maps_refusal_to_none(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.append(
+        _chat_response(_chat_message(content=None, refusal="I cannot help with that."))
+    )
+
+    response = await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(model_request())
+
+    assert response.parsed is None
+    assert response.output_text == "I cannot help with that."
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_recovers_once_from_wrong_schema_response(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.append(
+        _chat_response(_chat_message(content='{"wrong_key": "nope"}'))
+    )
+    fake_chat_client.queued.append(
+        _chat_response(_chat_message(content='{"answer": "42"}'))
+    )
+
+    response = await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(
+        model_request()
+    )
+
+    assert response.parsed == {"answer": "42"}
+    assert len(fake_chat_client.requests) == 2
+    recovery_messages = fake_chat_client.requests[1]["messages"]
+    assert recovery_messages[-1]["role"] == "user"
+    assert "exactly matching the schema" in recovery_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_does_not_recover_more_than_once(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.append(
+        _chat_response(_chat_message(content="no usable json here"))
+    )
+    fake_chat_client.queued.append(
+        _chat_response(_chat_message(content="still not json"))
+    )
+
+    response = await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(
+        model_request()
+    )
+
+    assert response.parsed is None
+    assert len(fake_chat_client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_recovers_from_nested_schema_violation(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    nested_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "items": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/Item"},
+            },
+        },
+        "required": ["answer", "items"],
+        "additionalProperties": False,
+        "$defs": {
+            "Item": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            }
+        },
+    }
+    fake_chat_client.queued.append(
+        _chat_response(
+            _chat_message(
+                content='{"answer":"x","items":[{"value":"a"},{"bad":1}]}'
+            )
+        )
+    )
+    fake_chat_client.queued.append(
+        _chat_response(
+            _chat_message(
+                content='{"answer":"x","items":[{"value":"a"},{"value":"b"}]}'
+            )
+        )
+    )
+
+    response = await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(
+        model_request(output_schema=nested_schema)
+    )
+
+    assert response.parsed == {"answer": "x", "items": [{"value": "a"}, {"value": "b"}]}
+    assert len(fake_chat_client.requests) == 2

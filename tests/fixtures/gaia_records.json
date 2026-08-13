@@ -1,0 +1,11 @@
+[
+  {"task_id": "synthetic-l1-a", "Question": "Synthetic question 1A", "Level": "1", "Final answer": "synthetic gold 1A", "file_path": ""},
+  {"task_id": "synthetic-l1-b", "Question": "Synthetic question 1B", "Level": "1", "Final answer": "synthetic gold 1B", "file_path": ""},
+  {"task_id": "synthetic-l1-c", "Question": "Synthetic question 1C", "Level": "1", "Final answer": "synthetic gold 1C", "file_path": ""},
+  {"task_id": "synthetic-l2-a", "Question": "Synthetic question 2A", "Level": "2", "Final answer": "synthetic gold 2A", "file_path": ""},
+  {"task_id": "synthetic-l2-b", "Question": "Synthetic question 2B", "Level": "2", "Final answer": "synthetic gold 2B", "file_path": ""},
+  {"task_id": "synthetic-l2-c", "Question": "Synthetic question 2C", "Level": "2", "Final answer": "synthetic gold 2C", "file_path": ""},
+  {"task_id": "synthetic-l3-a", "Question": "Synthetic question 3A", "Level": "3", "Final answer": "synthetic gold 3A", "file_path": ""},
+  {"task_id": "synthetic-l3-b", "Question": "Synthetic question 3B", "Level": "3", "Final answer": "synthetic gold 3B", "file_path": ""},
+  {"task_id": "synthetic-l3-c", "Question": "Synthetic question 3C", "Level": "3", "Final answer": "synthetic gold 3C", "file_path": ""}
+]
