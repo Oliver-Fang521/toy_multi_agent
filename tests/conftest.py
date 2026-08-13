@@ -30,6 +30,14 @@ class FakeProvider:
             )
         )
 
+    def return_text(self, text: str, *, usage: Usage | None = None) -> None:
+        self._responses.append(
+            ModelResponse(
+                output_text=text,
+                usage=usage or Usage(),
+            )
+        )
+
     async def complete(
         self,
         request: ModelRequest,

@@ -39,9 +39,10 @@ from gaia_agent.models import (
     TerminalErrorCategory,
     Usage,
 )
+from gaia_agent.observability import Observability
 from gaia_agent.orchestrator import Orchestrator, choose_majority
 from gaia_agent.persistence import RunManifest, RunStore
-from gaia_agent.providers import ModelProvider, OpenAIProvider
+from gaia_agent.providers import DeepSeekProvider, ModelProvider, OpenAIProvider
 from gaia_agent.reporting import (
     EvaluationSummary,
     LevelMetrics,
@@ -131,6 +132,7 @@ class EvaluationRunner:
         sleep: Sleep = asyncio.sleep,
         provider_name: str = "injected",
         evaluation_mode: Literal["production", "test"] = "test",
+        observability: Observability | None = None,
     ) -> None:
         self._config = config
         self._dataset_loader = dataset_loader
@@ -138,8 +140,15 @@ class EvaluationRunner:
         self._sleep = sleep
         self._provider_name = provider_name
         self._evaluation_mode = evaluation_mode
+        self._observability = observability or Observability()
 
     async def run(self) -> EvaluationSummary:
+        try:
+            return await self._run()
+        finally:
+            self._observability.flush()
+
+    async def _run(self) -> EvaluationSummary:
         validate_config(self._config)
         tasks, revision = self._dataset_loader(self._config)
         selected = sample_stratified(tasks, self._config.sample_size, self._config.seed)
@@ -191,7 +200,27 @@ class EvaluationRunner:
         audit_events: list[AuditEvent] = []
         first_plan: AgentPlan | None = None
         for run_index in range(self._config.votes):
-            vote = await self._run_vote(task)
+            trace = self._observability.start_task(
+                task.task_id,
+                level=task.level,
+                model=self._config.model,
+                reasoning_effort=self._config.reasoning_effort,
+                run_index=run_index,
+                evaluation_mode=self._evaluation_mode,
+            )
+            vote: _TaskRun | None = None
+            try:
+                vote = await self._run_vote(task)
+            finally:
+                status = "ok"
+                close_metadata: dict[str, object] | None = None
+                if vote is None or vote.prediction.error_category is not None:
+                    status = "error"
+                    if vote is not None and vote.prediction.error_category is not None:
+                        close_metadata = {"category": vote.prediction.error_category.value}
+                trace.close(status=status, metadata=close_metadata)
+                self._observability.flush()
+            assert vote is not None
             predictions.append(vote.prediction.model_copy(update={"run_index": run_index}))
             audit_events.extend(vote.audit_events)
             first_plan = first_plan or vote.plan
@@ -296,19 +325,34 @@ def build_runner(
         raise ValueError("dataset_loader and provider_factory must be injected together")
 
     validate_config(config)
+    observability = Observability()
     if not injected_dataset:
         dataset_loader = lambda active: load_gaia_validation(
             active.hf_token.get_secret_value()
         )
-        runtime = ProviderRuntime(
-            provider=OpenAIProvider(
-                AsyncOpenAI(
-                    api_key=config.openai_api_key.get_secret_value(),
-                    max_retries=0,
-                ),
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        client = AsyncOpenAI(
+            api_key=config.openai_api_key.get_secret_value(),
+            max_retries=0,
+        )
+        if base_url and "api.openai.com" not in base_url:
+            provider: ModelProvider = DeepSeekProvider(
+                client,
                 model=config.model,
-            ),
-            provider_name="openai",
+                observability=observability,
+            )
+            provider_name = "deepseek"
+        else:
+            provider = OpenAIProvider(
+                client,
+                model=config.model,
+                use_previous_response_id=base_url is None,
+                observability=observability,
+            )
+            provider_name = "openai"
+        runtime = ProviderRuntime(
+            provider=provider,
+            provider_name=provider_name,
             evaluation_mode="production",
         )
     else:
@@ -365,8 +409,10 @@ def build_runner(
                 active_task,
                 config,
                 fake_backend=runtime.fake_mcp_backend,
+                observability=observability,
             ),
             config=config,
+            observability=observability,
         )
 
     return EvaluationRunner(
@@ -375,6 +421,7 @@ def build_runner(
         orchestrator_factory=orchestrator_factory,
         provider_name=runtime.provider_name,
         evaluation_mode=runtime.evaluation_mode,
+        observability=observability,
     )
 
 
@@ -477,6 +524,7 @@ def _manifest_for(
         provider_name=provider_name,
         evaluation_mode=evaluation_mode,
         reasoning_effort=config.reasoning_effort,
+        quality_policy=config.quality_policy,
         dataset_revision=revision,
         limits={
             "max_steps": config.max_steps,
@@ -503,6 +551,7 @@ async def _stdio_client(
     config: RunConfig,
     *,
     fake_backend: bool,
+    observability: Observability | None = None,
 ) -> Any:
     task_root = task.attachment_path.parent if task.attachment_path is not None else Path.cwd()
     attachments = (task.attachment_path,) if task.attachment_path is not None else ()
@@ -510,7 +559,12 @@ async def _stdio_client(
     os.environ.pop("GAIA_MCP_FAKE_BACKEND", None)
     if fake_backend:
         os.environ["GAIA_MCP_FAKE_BACKEND"] = "1"
-    client = MCPToolClient(task_root=task_root, config=config, attachments=attachments)
+    client = MCPToolClient(
+        task_root=task_root,
+        config=config,
+        attachments=attachments,
+        observability=observability,
+    )
     try:
         entered = await client.__aenter__()
     finally:

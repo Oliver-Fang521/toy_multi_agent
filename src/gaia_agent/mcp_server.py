@@ -839,7 +839,7 @@ def build_server(settings: MCPServerSettings) -> MCPServer:
 
     @server.tool()
     async def web_search(query: str) -> dict[str, Any]:
-        """Search the public web and return a concise answer with source URLs."""
+        """Search the public and return a concise answer with source URLs."""
         return await _safe_tool_call(
             settings,
             settings.backend.web_search(query),

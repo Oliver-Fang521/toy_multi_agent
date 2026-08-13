@@ -1,7 +1,7 @@
 import asyncio
 import os
 from collections import deque
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -23,9 +23,11 @@ from gaia_agent.models import (
     TerminalErrorCategory,
     Usage,
 )
+from gaia_agent.observability import Observability, ObservabilityConfig
 from gaia_agent.orchestrator import (
     Orchestrator,
     _BudgetedToolClient,
+    _TaskState,
     _ToolBudgetExhausted,
     choose_majority,
 )
@@ -399,6 +401,7 @@ def _config(**overrides: Any) -> RunConfig:
         "max_steps": 8,
         "max_tool_calls": 24,
         "timeout_seconds": 1,
+        "quality_policy": "strict",
     }
     values.update(overrides)
     return RunConfig(
@@ -490,6 +493,78 @@ def _orchestrator(
     )
 
 
+def test_benchmark_quality_policy_keeps_a_critic_approved_candidate() -> None:
+    evidence = _evidence("computation-1", "computation")
+    state = _TaskState(
+        plan=_plan(SpecialistName.COMPUTATION),
+        evidence=[evidence],
+        evidence_origins={evidence.evidence_id: 1},
+        candidate_origins={1: "42"},
+        candidate="42",
+    )
+    decision = _decision("approve", (evidence.evidence_id,))
+
+    benchmark = _orchestrator(
+        planner=FakePlanner([], _plan(SpecialistName.COMPUTATION)),
+        specialists={},
+        critic=FakeCritic([], []),
+        tools=FakeTools([]),
+        config=_config(quality_policy="benchmark"),
+    )
+    strict = _orchestrator(
+        planner=FakePlanner([], _plan(SpecialistName.COMPUTATION)),
+        specialists={},
+        critic=FakeCritic([], []),
+        tools=FakeTools([]),
+        config=_config(quality_policy="strict"),
+    )
+
+    assert benchmark._apply_quality_policy(state, decision).verdict == "approve"
+    assert strict._apply_quality_policy(state, decision).verdict == "insufficient_evidence"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_executes_compiled_graph() -> None:
+    class RecordingGraph:
+        def __init__(self) -> None:
+            self.calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+        async def ainvoke(
+            self,
+            graph_input: dict[str, Any],
+            config: dict[str, Any],
+        ) -> dict[str, Any]:
+            self.calls.append((graph_input, config))
+            return {
+                "prediction": TaskPrediction(
+                    task_id="orchestration-task",
+                    level=1,
+                    answer="graph result",
+                    critic_verdict="approve",
+                )
+            }
+
+    orchestrator = _orchestrator(
+        planner=FakePlanner([], _plan(SpecialistName.LOOKUP)),
+        specialists={},
+        critic=FakeCritic([], []),
+        tools=FakeTools([]),
+    )
+    graph = RecordingGraph()
+    orchestrator._graph = graph
+
+    result = await orchestrator.run(_task())
+
+    assert result.answer == "graph result"
+    assert len(graph.calls) == 1
+    graph_input, config = graph.calls[0]
+    assert graph_input["task"].final_answer == ""
+    assert isinstance(graph_input["runtime"], _TaskState)
+    assert isinstance(graph_input["tools"], _BudgetedToolClient)
+    assert graph_input["next_step_index"] == 0
+    assert config["recursion_limit"] > orchestrator._config.max_steps
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_runs_plan_act_verify_submit() -> None:
     calls: list[str] = []
@@ -517,6 +592,98 @@ async def test_orchestrator_runs_plan_act_verify_submit() -> None:
     assert tools.call_arguments == [
         ("submit_answer", {"answer": "Marie Curie", "evidence_ids": ["evidence-0001"]})
     ]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_publishes_safe_reasoning_summaries() -> None:
+    class TraceObservation:
+        def __init__(self, *, name: str, as_type: str, kwargs: dict[str, Any]) -> None:
+            self.name = name
+            self.as_type = as_type
+            self.kwargs = kwargs
+            self.updates: list[dict[str, Any]] = []
+
+        def update(self, **kwargs: Any) -> None:
+            self.updates.append(kwargs)
+
+    class TraceContext(AbstractContextManager[TraceObservation]):
+        def __init__(self, observation: TraceObservation) -> None:
+            self.observation = observation
+
+        def __enter__(self) -> TraceObservation:
+            return self.observation
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            return None
+
+    class TraceClient:
+        def __init__(self) -> None:
+            self.observations: list[TraceObservation] = []
+
+        def start_as_current_observation(
+            self, *, as_type: str, name: str, **kwargs: Any
+        ) -> TraceContext:
+            observation = TraceObservation(name=name, as_type=as_type, kwargs=kwargs)
+            self.observations.append(observation)
+            return TraceContext(observation)
+
+    calls: list[str] = []
+    source = _evidence("source-1", "source")
+    planner = FakePlanner(calls, _plan(SpecialistName.LOOKUP))
+    lookup = FakeSpecialist(
+        SpecialistName.LOOKUP,
+        calls,
+        [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
+    )
+    critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
+    tools = FakeTools(calls)
+    client = TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=client,
+    )
+    trace = observability.start_task(
+        "summary-task",
+        level=1,
+        model="test-model",
+        reasoning_effort="low",
+        run_index=0,
+        evaluation_mode="test",
+    )
+
+    orchestrator = Orchestrator(
+        planner=planner,
+        specialists={SpecialistName.LOOKUP: lookup},
+        critic=critic,
+        tool_client_factory=FakeToolFactory(tools),
+        config=_config(quality_policy="benchmark"),
+        observability=observability,
+    )
+    result = await orchestrator.run(_task())
+    trace.close()
+
+    assert result.answer == "Marie Curie"
+    by_name = {observation.name: observation for observation in client.observations}
+    assert {
+        "planner",
+        "specialist",
+        "critic",
+        "submit",
+    }.issubset(by_name)
+    summaries = [
+        observation.updates[-1]["output"]["reasoning_summary"]
+        for observation in by_name.values()
+        if observation.updates and "output" in observation.updates[-1]
+    ]
+    assert {summary.get("route") for summary in summaries} & {"lookup"}
+    assert any(summary.get("verdict") == "approve" for summary in summaries)
+    assert any(summary.get("decision") == "submit" for summary in summaries)
+    assert all("Marie Curie" not in repr(summary) for summary in summaries)
 
 
 @pytest.mark.asyncio

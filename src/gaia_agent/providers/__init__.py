@@ -10,10 +10,12 @@ from gaia_agent.providers.base import (
     serialize_tool_output,
     tool_output_size_bytes,
 )
+from gaia_agent.providers.deepseek import DeepSeekProvider
 from gaia_agent.providers.openai import OpenAIProvider
 
 __all__ = [
     "Citation",
+    "DeepSeekProvider",
     "ModelProvider",
     "ModelRequest",
     "ModelResponse",

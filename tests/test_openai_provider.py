@@ -20,8 +20,13 @@ from gaia_agent import mcp_server, providers
 from gaia_agent.mcp_client import ToolExecutionError
 from gaia_agent.mcp_server import AttachmentReader, MCPServerSettings, build_server
 from gaia_agent.models import Usage
+from gaia_agent.observability import Observability, ObservabilityConfig
 from gaia_agent.orchestrator import _RepeatedToolCall, _ToolBudgetExhausted
 from gaia_agent.providers import ModelRequest, OpenAIProvider, ToolSpec
+
+
+def test_openai_provider_declares_native_vision_support() -> None:
+    assert OpenAIProvider.supports_vision is True
 
 
 def _usage(input_tokens: int, output_tokens: int, reasoning_tokens: int) -> dict[str, Any]:
@@ -187,6 +192,37 @@ class RecordingExecutor:
         return self.result
 
 
+class _TraceObservation:
+    def __init__(self, name: str, kwargs: dict[str, Any]) -> None:
+        self.name = name
+        self.kwargs = kwargs
+        self.updates: list[dict[str, Any]] = []
+
+    def update(self, **kwargs: Any) -> None:
+        self.updates.append(kwargs)
+
+
+class _TraceContext:
+    def __init__(self, observation: _TraceObservation) -> None:
+        self.observation = observation
+
+    def __enter__(self) -> _TraceObservation:
+        return self.observation
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class _TraceClient:
+    def __init__(self) -> None:
+        self.observations: list[_TraceObservation] = []
+
+    def start_as_current_observation(self, *, name: str, as_type: str, **kwargs: Any):
+        observation = _TraceObservation(name, {"as_type": as_type, **kwargs})
+        self.observations.append(observation)
+        return _TraceContext(observation)
+
+
 def model_request(**updates: Any) -> ModelRequest:
     values: dict[str, Any] = {
         "instructions": "answer with JSON",
@@ -241,6 +277,154 @@ async def test_openai_provider_executes_function_call_and_continues(
         "arguments": {"code": "print(6*7)"},
         "output": {"stdout": "42"},
     }
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_records_safe_generation_metadata(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_text('{"answer":"42"}', usage=_usage(3, 4, 1))
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "task-1",
+        level=1,
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        run_index=0,
+        evaluation_mode="test",
+    )
+    response = await OpenAIProvider(
+        fake_responses_client,
+        model="gpt-5.6-sol",
+        observability=observability,
+    ).complete(model_request())
+    trace.close()
+
+    assert response.parsed == {"answer": "42"}
+    generation = trace_client.observations[-1]
+    assert generation.name == "provider-generation"
+    assert generation.kwargs["metadata"] == {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "medium",
+    }
+    assert generation.updates[-1]["metadata"] == {
+        "parsed": True,
+        "refused": False,
+        "tool_call_count": 0,
+        "status": "ok",
+    }
+    assert generation.updates[-1]["output"]["reasoning_summary"] == {
+        "decision": "parsed",
+        "parsed": True,
+        "refused": False,
+        "tool_call_count": 0,
+    }
+    assert generation.updates[-1]["usage_details"] == {
+        "input_tokens": 3,
+        "output_tokens": 4,
+        "reasoning_tokens": 1,
+        "total_tokens": 7,
+    }
+@pytest.mark.asyncio
+async def test_openai_provider_stateless_loop_resends_full_history_without_previous_id(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_function_call("execute_python", '{"code":"print(6*7)"}', "call-1")
+    fake_responses_client.queue_text('{"answer":"42"}')
+    executor = RecordingExecutor({"stdout": "42"})
+    provider = OpenAIProvider(
+        client=fake_responses_client,
+        model="gpt-5.6-sol",
+        use_previous_response_id=False,
+    )
+
+    response = await provider.complete(model_request(), executor)
+
+    assert executor.calls == [("execute_python", {"code": "print(6*7)"})]
+    continuation = fake_responses_client.requests[1]
+    assert "previous_response_id" not in continuation
+    assert continuation["input"] == [
+        {"role": "user", "content": "What is six times seven?"},
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "execute_python",
+            "arguments": '{"code":"print(6*7)"}',
+        },
+        {"type": "function_call_output", "call_id": "call-1", "output": '{"stdout":"42"}'},
+    ]
+    assert response.parsed == {"answer": "42"}
+
+
+@pytest.mark.asyncio
+async def test_stateless_loop_echoes_reasoning_and_groups_parallel_calls(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queued.append(
+        _response(
+            "resp-1",
+            [
+                {
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "status": "completed",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "plan the work"}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc-1",
+                    "call_id": "call-1",
+                    "name": "execute_python",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc-2",
+                    "call_id": "call-2",
+                    "name": "execute_python",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+            ],
+        )
+    )
+    fake_responses_client.queue_text('{"answer":"42"}')
+    provider = OpenAIProvider(
+        client=fake_responses_client,
+        model="gpt-5.6-sol",
+        use_previous_response_id=False,
+    )
+
+    await provider.complete(model_request(), RecordingExecutor({"stdout": "42"}))
+
+    continuation = fake_responses_client.requests[1]
+    assert continuation["input"] == [
+        {"role": "user", "content": "What is six times seven?"},
+        {
+            "type": "reasoning",
+            "content": [{"type": "reasoning_text", "text": "plan the work"}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "execute_python",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-2",
+            "name": "execute_python",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call-1", "output": '{"stdout":"42"}'},
+        {"type": "function_call_output", "call_id": "call-2", "output": '{"stdout":"42"}'},
+    ]
 
 
 @pytest.mark.asyncio
@@ -703,6 +887,30 @@ async def test_openai_provider_maps_refusal_without_attempting_json_parse(
 
     assert response.parsed is None
     assert response.output_text == "I cannot help with that request."
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_extracts_json_wrapped_in_markdown_prose(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_text(
+        'Based on my search I can answer.\n\n```json\n{"answer": "42"}\n```\n\nHope this helps.'
+    )
+
+    response = await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(model_request())
+
+    assert response.parsed == {"answer": "42"}
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_returns_none_for_non_json_prose(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_text("I looked but could not find a usable answer.")
+
+    response = await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(model_request())
+
+    assert response.parsed is None
 
 
 @pytest.mark.asyncio

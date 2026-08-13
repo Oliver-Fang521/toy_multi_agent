@@ -124,7 +124,7 @@ target-version = "py311"
 Add `.gitignore` entries for `.env`, `.venv/`, `__pycache__/`, `.pytest_cache/`, `.ruff_cache/`, `.hf/`, `data/`, and `results/`. Add `.env.example` with names only: `OPENAI_API_KEY=`, `HF_TOKEN=`, `GAIA_MODEL=gpt-5.6-sol`, and `GAIA_REASONING_EFFORT=medium`.
 
 - [ ] **Step 2: Write failing configuration and model tests**
-
+      
 ```python
 from pydantic import ValidationError
 import pytest

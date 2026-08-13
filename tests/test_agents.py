@@ -34,6 +34,67 @@ async def test_planner_emits_bounded_specialist_steps_without_tools(fake_provide
     assert fake_provider.executors == [None]
 
 
+@pytest.mark.asyncio
+async def test_planner_repairs_one_malformed_response_locally(fake_provider, task) -> None:
+    fake_provider.return_text("not valid planner output")
+    fake_provider.return_parsed(
+        {
+            "restatement": "Find and verify the requested fact",
+            "steps": [{"specialist": "lookup", "instruction": "Find a primary source"}],
+        }
+    )
+
+    plan = await PlannerAgent(fake_provider, max_steps=4).plan(task)
+
+    assert plan.steps[0].specialist == SpecialistName.LOOKUP
+    assert len(fake_provider.requests) == 2
+    assert fake_provider.requests[1].allowed_tools == ()
+    assert fake_provider.requests[1].max_tool_calls == 0
+    assert "only the JSON object" in fake_provider.requests[1].instructions
+
+
+@pytest.mark.asyncio
+async def test_planner_falls_back_to_a_deterministic_route_after_two_failures(
+    fake_provider, task
+) -> None:
+    fake_provider.return_text("not valid planner output")
+    fake_provider.return_text("still not valid planner output")
+
+    plan = await PlannerAgent(fake_provider, max_steps=4).plan(task)
+
+    assert plan.steps[0].specialist == SpecialistName.LOOKUP
+    assert plan.steps[0].instruction
+    assert len(fake_provider.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_max_reasoning_uses_a_larger_output_budget(fake_provider, task) -> None:
+    fake_provider.return_parsed(
+        {
+            "restatement": "Find and verify the requested fact",
+            "steps": [{"specialist": "lookup", "instruction": "Find a primary source"}],
+        }
+    )
+
+    await PlannerAgent(fake_provider, reasoning_effort="max").plan(task)
+
+    assert fake_provider.requests[0].max_output_tokens == 8_000
+
+
+@pytest.mark.asyncio
+async def test_non_max_reasoning_keeps_the_default_output_budget(fake_provider, task) -> None:
+    fake_provider.return_parsed(
+        {
+            "restatement": "Find and verify the requested fact",
+            "steps": [{"specialist": "lookup", "instruction": "Find a primary source"}],
+        }
+    )
+
+    await PlannerAgent(fake_provider, reasoning_effort="high").plan(task)
+
+    assert fake_provider.requests[0].max_output_tokens == 2_000
+
+
 def test_specialist_tool_allowlists_are_narrow() -> None:
     assert LookupAgent.allowed_tool_names == frozenset({"web_search", "read_webpage"})
     assert ComputationAgent.allowed_tool_names == frozenset({"execute_python"})
@@ -105,6 +166,24 @@ async def test_planner_context_is_deterministic_and_excludes_reference_answer(
         "task_id": "synthetic-image-task",
     }
     assert "Hidden Image Answer" not in repr(first)
+
+
+@pytest.mark.asyncio
+async def test_planner_routes_visual_steps_to_file_for_non_vision_provider(
+    fake_provider, image_task
+) -> None:
+    fake_provider.supports_vision = False
+    fake_provider.return_parsed(
+        {
+            "restatement": "Inspect the image",
+            "steps": [{"specialist": "visual", "instruction": "Inspect pixels"}],
+        }
+    )
+
+    plan = await PlannerAgent(fake_provider, max_steps=2).plan(image_task)
+
+    assert plan.steps[0].specialist == SpecialistName.FILE
+    assert "no native image-input capability" in plan.steps[0].instruction
 
 
 @pytest.mark.asyncio
@@ -213,6 +292,67 @@ async def test_specialist_filters_mcp_specs_and_parses_typed_result(
 
 
 @pytest.mark.asyncio
+async def test_specialist_repairs_one_malformed_response_without_tools(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_text("not valid specialist output")
+    fake_provider.return_parsed(
+        {
+            "specialist": "lookup",
+            "evidence": [
+                {
+                    "evidence_id": "source-1",
+                    "kind": "source",
+                    "summary": "Observable result",
+                    "source_url": "https://primary.example/fact",
+                }
+            ],
+            "candidate_answer": "Marie Curie",
+        }
+    )
+
+    result = await LookupAgent(fake_provider).run(
+        task,
+        PlanStep(specialist="lookup", instruction="Find a source"),
+        (),
+        fake_tools,
+    )
+
+    assert result.candidate_answer == "Marie Curie"
+    assert len(fake_provider.requests) == 2
+    assert fake_provider.executors == [fake_tools, None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_text, expected", [("FINAL ANSWER: 42", "42"), ("42", "42")])
+async def test_specialist_extracts_a_concise_answer_from_non_json_text(
+    fake_provider, fake_tools, task, output_text, expected
+) -> None:
+    fake_provider.return_text(output_text)
+    step = PlanStep(specialist="computation", instruction="Calculate")
+
+    result = await ComputationAgent(fake_provider).run(task, step, (), fake_tools)
+
+    assert result.candidate_answer == expected
+    assert result.evidence == ()
+
+
+@pytest.mark.asyncio
+async def test_specialist_defaults_missing_result_fields_while_schema_stays_strict(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed({"specialist": "lookup"})
+    step = PlanStep(specialist="lookup", instruction="Find a source")
+
+    result = await LookupAgent(fake_provider).run(task, step, (), fake_tools)
+
+    schema = fake_provider.requests[0].output_schema
+    assert set(schema["required"]) == set(schema["properties"])
+    assert result.evidence == ()
+    assert result.candidate_answer is None
+
+
+@pytest.mark.asyncio
 async def test_specialist_usage_survives_malformed_semantic_output(
     fake_provider, fake_tools, task
 ) -> None:
@@ -286,6 +426,61 @@ async def test_specialist_usage_resets_before_a_provider_failure(
         await agent.run(task, step, (), fake_tools)
 
     assert agent.last_usage == Usage()
+
+
+@pytest.mark.asyncio
+async def test_critic_repairs_one_malformed_response_locally(fake_provider, fake_tools, task) -> None:
+    fake_provider.return_text("not valid critic output")
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "Evidence supports the candidate",
+            "checked_evidence_ids": ["source-1"],
+            "corrected_answer": None,
+        }
+    )
+
+    decision = await CriticAgent(fake_provider).verify(
+        task,
+        "Marie Curie",
+        (
+            Evidence(
+                evidence_id="source-1",
+                kind="source",
+                summary="Observable result",
+                source_url="https://primary.example/fact",
+            ),
+        ),
+        fake_tools,
+    )
+
+    assert decision.verdict == "approve"
+    assert len(fake_provider.requests) == 2
+    assert fake_provider.executors == [fake_tools, None]
+
+
+@pytest.mark.asyncio
+async def test_critic_uses_an_evidence_preserving_fallback_after_two_malformed_responses(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_text("not valid critic output")
+    fake_provider.return_text("still not valid critic output")
+    evidence = Evidence(
+        evidence_id="source-1",
+        kind="source",
+        summary="Observable result",
+        source_url="https://primary.example/fact",
+    )
+
+    decision = await CriticAgent(fake_provider).verify(
+        task,
+        "Marie Curie",
+        (evidence,),
+        fake_tools,
+    )
+
+    assert decision.verdict == "approve"
+    assert decision.checked_evidence_ids == ("source-1",)
 
 
 @pytest.mark.asyncio

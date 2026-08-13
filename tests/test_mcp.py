@@ -27,6 +27,7 @@ from gaia_agent.mcp_server import (
     build_server,
 )
 from gaia_agent.models import Usage
+from gaia_agent.observability import Observability, ObservabilityConfig
 
 
 @pytest.fixture
@@ -38,6 +39,15 @@ def run_config(tmp_path: Path) -> RunConfig:
         timeout_seconds=0.2,
         output_dir=tmp_path / "results",
     )
+
+
+def test_mcp_server_env_propagates_openai_base_url(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com")
+    client = MCPToolClient(task_root=tmp_path, config=run_config)
+
+    assert client._minimal_server_env()["OPENAI_BASE_URL"] == "https://api.deepseek.com"
 
 
 @pytest.fixture
@@ -54,6 +64,37 @@ def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
         ]
 
     monkeypatch.setattr(socket, "getaddrinfo", resolve_public)
+
+
+class _TraceObservation:
+    def __init__(self, name: str, kwargs: dict[str, Any]) -> None:
+        self.name = name
+        self.kwargs = kwargs
+        self.updates: list[dict[str, Any]] = []
+
+    def update(self, **kwargs: Any) -> None:
+        self.updates.append(kwargs)
+
+
+class _TraceContext:
+    def __init__(self, observation: _TraceObservation) -> None:
+        self.observation = observation
+
+    def __enter__(self) -> _TraceObservation:
+        return self.observation
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class _TraceClient:
+    def __init__(self) -> None:
+        self.observations: list[_TraceObservation] = []
+
+    def start_as_current_observation(self, *, name: str, as_type: str, **kwargs: Any):
+        observation = _TraceObservation(name, {"as_type": as_type, **kwargs})
+        self.observations.append(observation)
+        return _TraceContext(observation)
 
 
 @pytest.mark.asyncio
@@ -108,6 +149,56 @@ async def test_stdio_client_calls_real_server_and_rejects_disallowed_tool(
         assert result == {"answer": "forty-two", "evidence_ids": ["source-1"]}
         with pytest.raises(ToolExecutionError, match="not allowed"):
             await client.call("web_search", {"query": "ignored"})
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_records_tool_shape_without_arguments_or_results(
+    tmp_path: Path,
+    fake_backend_env: None,
+    run_config: RunConfig,
+) -> None:
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "task-1",
+        level=1,
+        model="test-model",
+        reasoning_effort="low",
+        run_index=0,
+        evaluation_mode="test",
+    )
+    async with MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        allowed={"submit_answer"},
+        observability=observability,
+    ) as client:
+        result = await client.call(
+            "submit_answer", {"answer": "secret answer", "evidence_ids": ["secret-id"]}
+        )
+    trace.close()
+
+    assert result["answer"] == "secret answer"
+    tool_span = trace_client.observations[-1]
+    assert tool_span.name == "mcp-tool"
+    assert tool_span.kwargs["metadata"] == {"tool": "submit_answer", "call_number": 1}
+    assert tool_span.kwargs["input"] == {
+        "argument_count": 2,
+        "argument_keys": ["answer", "evidence_ids"],
+    }
+    assert tool_span.updates[-1]["metadata"] == {
+        "result_key_count": 2,
+        "status": "ok",
+    }
+    assert tool_span.updates[-1]["output"] == {
+        "result_key_count": 2,
+        "result_keys": ["answer", "evidence_ids"],
+    }
+    assert "secret answer" not in repr(tool_span.kwargs)
+    assert "secret-id" not in repr(tool_span.kwargs)
 
     with pytest.raises(ToolExecutionError, match="not connected"):
         await client.call("submit_answer", {"answer": "42", "evidence_ids": []})

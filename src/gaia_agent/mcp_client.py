@@ -16,6 +16,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from gaia_agent.config import RunConfig
 from gaia_agent.models import HOSTED_USAGE_METADATA_KEY, Usage
+from gaia_agent.observability import Observability
 from gaia_agent.providers.base import ToolCallError, ToolSpec
 
 _PUBLIC_TOOLS = frozenset(
@@ -48,6 +49,7 @@ class MCPToolClient:
         config: RunConfig | None = None,
         allowed: set[str] | frozenset[str] | None = None,
         attachments: Iterable[Path] = (),
+        observability: Observability | None = None,
     ) -> None:
         self._task_root = task_root.resolve()
         self._config = config or RunConfig.from_env()
@@ -61,6 +63,8 @@ class MCPToolClient:
         self.tool_specs: tuple[ToolSpec, ...] = ()
         self._usage = Usage()
         self._usage_lock = asyncio.Lock()
+        self._call_count = 0
+        self._observability = observability
 
     @property
     def is_connected(self) -> bool:
@@ -74,6 +78,7 @@ class MCPToolClient:
         if self._client is not None:
             raise RuntimeError("MCP client is already connected")
         self._usage = Usage()
+        self._call_count = 0
         trusted_source_root = Path(__file__).resolve().parents[1]
         parameters = StdioServerParameters(
             command=sys.executable,
@@ -116,6 +121,42 @@ class MCPToolClient:
             await client_cm.__aexit__(None, None, None)
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self._call_count += 1
+        trace = self._observability.current_trace() if self._observability else None
+        span = (
+            trace.span(
+                "mcp-tool",
+                {"tool": name, "call_number": self._call_count},
+                input={
+                    "argument_count": len(arguments),
+                    "argument_keys": sorted(arguments),
+                },
+            )
+            if trace is not None
+            else None
+        )
+        try:
+            result = await self._call_impl(name, arguments)
+        except Exception as error:
+            if span is not None:
+                span.end(
+                    status="error",
+                    metadata={"error_type": type(error).__name__},
+                    output={"result_key_count": 0, "result_keys": []},
+                )
+            raise
+        if span is not None:
+            span.end(
+                status="ok",
+                metadata={"result_key_count": len(result)},
+                output={
+                    "result_key_count": len(result),
+                    "result_keys": sorted(result),
+                },
+            )
+        return result
+
+    async def _call_impl(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if self._client is None:
             raise ToolExecutionError("MCP client is not connected")
         if name not in self._allowed:
@@ -251,6 +292,8 @@ class MCPToolClient:
         }
         if os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1":
             env["GAIA_MCP_FAKE_BACKEND"] = "1"
+        if os.environ.get("OPENAI_BASE_URL"):
+            env["OPENAI_BASE_URL"] = os.environ["OPENAI_BASE_URL"]
         return env
 
     def _redact(self, message: str) -> str:

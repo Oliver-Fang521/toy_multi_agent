@@ -9,11 +9,13 @@ import string
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, Required, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from gaia_agent.config import RunConfig
 from gaia_agent.mcp_client import AttachmentPolicyError, ToolExecutionError
@@ -30,6 +32,7 @@ from gaia_agent.models import (
     TerminalErrorCategory,
     Usage,
 )
+from gaia_agent.observability import Observability, TaskTrace
 from gaia_agent.providers import ToolCallError, ToolSpec
 from gaia_agent.scoring import parse_number_with_status
 
@@ -112,6 +115,7 @@ class _BudgetedToolClient:
         self._max_calls = max_calls
         self._audit = audit
         self._scope = "unscoped"
+        self._scope_tool_names: set[str] = set()
         self._results_by_scope: dict[str, dict[str, _CachedToolResult]] = defaultdict(dict)
         self.call_count = 0
 
@@ -126,6 +130,11 @@ class _BudgetedToolClient:
         if not scope.strip():
             raise ValueError("tool-call scope must be non-empty")
         self._scope = scope
+        self._scope_tool_names = set()
+
+    @property
+    def scope_tool_names(self) -> tuple[str, ...]:
+        return tuple(sorted(self._scope_tool_names))
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         signature = json.dumps(
@@ -135,6 +144,7 @@ class _BudgetedToolClient:
         )
         if self.call_count >= self._max_calls:
             raise _ToolBudgetExhausted("global tool-call budget exhausted")
+        self._scope_tool_names.add(name)
         cached = self._results_by_scope[self._scope].get(signature)
         if cached is not None:
             if cached.reused:
@@ -179,6 +189,15 @@ class _BudgetedToolClient:
         return result
 
 
+class _GraphState(TypedDict, total=False):
+    task: Required[GaiaTask]
+    runtime: Required[_TaskState]
+    tools: Required[_BudgetedToolClient]
+    next_step_index: int
+    decision: CriticDecision
+    prediction: TaskPrediction
+
+
 class Orchestrator:
     """Run one bounded, provider-neutral Plan -> Act -> Verify -> Submit attempt."""
 
@@ -190,6 +209,7 @@ class Orchestrator:
         critic: Critic,
         tool_client_factory: Callable[[GaiaTask], AbstractAsyncContextManager[Any]],
         config: RunConfig,
+        observability: Observability | None = None,
     ) -> None:
         if config.max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -205,10 +225,13 @@ class Orchestrator:
         self._critic = critic
         self._tool_client_factory = tool_client_factory
         self._config = config
+        self._observability = observability or Observability()
+        self._trace: TaskTrace | None = None
         self._audit_events: list[AuditEvent] = []
         self.correction_count = 0
         self.step_count = 0
         self.tool_call_count = 0
+        self._graph = self._build_graph()
 
     @property
     def audit_events(self) -> tuple[AuditEvent, ...]:
@@ -220,6 +243,7 @@ class Orchestrator:
         self.correction_count = 0
         self.step_count = 0
         self.tool_call_count = 0
+        self._trace = self._observability.current_trace()
         state = _TaskState()
         execution_task = task.model_copy(update={"final_answer": ""})
         budgeted_tools: _BudgetedToolClient | None = None
@@ -294,11 +318,72 @@ class Orchestrator:
         task: GaiaTask,
         tools: _BudgetedToolClient,
     ) -> TaskPrediction:
+        result = await self._graph.ainvoke(
+            {
+                "task": task,
+                "runtime": state,
+                "tools": tools,
+                "next_step_index": 0,
+            },
+            config={"recursion_limit": self._graph_recursion_limit()},
+        )
+        prediction = result.get("prediction")
+        if not isinstance(prediction, TaskPrediction):
+            raise TypeError("graph completed without a prediction")
+        return prediction
+
+    def _build_graph(self) -> Any:
+        graph = StateGraph(_GraphState)
+        graph.add_node("plan", self._graph_plan)
+        graph.add_node("act", self._graph_act)
+        graph.add_node("verify", self._graph_verify)
+        graph.add_node("correct", self._graph_correct)
+        graph.add_node("reject", self._graph_reject)
+        graph.add_node("submit", self._graph_submit)
+        graph.add_edge(START, "plan")
+        graph.add_edge("plan", "act")
+        graph.add_conditional_edges(
+            "act",
+            self._route_after_act,
+            {"act": "act", "verify": "verify"},
+        )
+        graph.add_conditional_edges(
+            "verify",
+            self._route_after_verify,
+            {"correct": "correct", "reject": "reject", "submit": "submit"},
+        )
+        graph.add_edge("correct", "verify")
+        graph.add_edge("reject", END)
+        graph.add_edge("submit", END)
+        return graph.compile()
+
+    def _graph_recursion_limit(self) -> int:
+        return max(25, self._config.max_steps + 8)
+
+    async def _graph_plan(self, graph_state: _GraphState) -> dict[str, Any]:
+        state = graph_state["runtime"]
+        task = graph_state["task"]
         self._audit("plan_started", {"task_id": task.task_id})
-        try:
-            plan = await self._planner.plan(task)
-        finally:
-            state.usage = _add_usage(state.usage, self._planner.last_usage)
+        with self._stage_span("planner", {"stage": "planner"}) as planner_span:
+            try:
+                plan = await self._planner.plan(task)
+            finally:
+                state.usage = _add_usage(state.usage, self._planner.last_usage)
+            if planner_span is not None:
+                specialists = [step.specialist.value for step in plan.steps]
+                planner_span.set_summary(
+                    {
+                        "route": specialists[0] if len(set(specialists)) == 1 else "multi_stage",
+                        "specialists": specialists,
+                        "step_count": len(plan.steps),
+                        "repair_attempted": bool(
+                            getattr(self._planner, "last_repair_attempted", False)
+                        ),
+                        "fallback_used": bool(
+                            getattr(self._planner, "last_fallback_used", False)
+                        ),
+                    }
+                )
         if not plan.steps or len(plan.steps) > self._config.max_steps:
             raise ValueError("planner exceeded the global step budget")
         state.plan = plan
@@ -310,20 +395,85 @@ class Orchestrator:
                 "specialists": [step.specialist.value for step in plan.steps],
             },
         )
+        return {"runtime": state, "next_step_index": 0}
 
-        for step in plan.steps:
-            await self._act(state, task, step, tools, correction=False)
+    async def _graph_act(self, graph_state: _GraphState) -> dict[str, Any]:
+        state = graph_state["runtime"]
+        task = graph_state["task"]
+        tools = graph_state["tools"]
+        if state.plan is None:
+            raise ValueError("graph act node requires a plan")
+        step_index = graph_state.get("next_step_index", 0)
+        if step_index < 0 or step_index >= len(state.plan.steps):
+            raise ValueError("graph act node received an invalid plan index")
+        await self._act(
+            state,
+            task,
+            state.plan.steps[step_index],
+            tools,
+            correction=False,
+        )
+        return {"runtime": state, "next_step_index": step_index + 1}
 
+    def _route_after_act(self, graph_state: _GraphState) -> Literal["act", "verify"]:
+        state = graph_state["runtime"]
+        if state.plan is None:
+            raise ValueError("graph act router requires a plan")
+        step_index = graph_state.get("next_step_index", 0)
+        if step_index < len(state.plan.steps):
+            return "act"
+        if step_index == len(state.plan.steps):
+            return "verify"
+        raise ValueError("graph act router received an invalid plan index")
+
+    async def _graph_verify(self, graph_state: _GraphState) -> dict[str, Any]:
+        state = graph_state["runtime"]
+        task = graph_state["task"]
+        tools = graph_state["tools"]
         decision = await self._verify(state, task, tools)
         decision = self._apply_quality_policy(state, decision)
-        if decision.verdict != "approve":
-            await self._correct_once(state, task, decision, tools)
-            decision = await self._verify(state, task, tools)
-            decision = self._apply_quality_policy(state, decision)
+        return {"runtime": state, "decision": decision}
 
-        if decision.verdict != "approve":
-            raise _CorrectionUnavailable("critic rejected the candidate after correction")
-        return await self._submit(state, task, decision, tools)
+    def _route_after_verify(
+        self,
+        graph_state: _GraphState,
+    ) -> Literal["correct", "reject", "submit"]:
+        decision = graph_state.get("decision")
+        if decision is None:
+            raise ValueError("graph verify router requires a critic decision")
+        if decision.verdict == "approve":
+            return "submit"
+        if not self.correction_count:
+            return "correct"
+        return "reject"
+
+    async def _graph_correct(self, graph_state: _GraphState) -> dict[str, Any]:
+        state = graph_state["runtime"]
+        decision = graph_state.get("decision")
+        if decision is None:
+            raise ValueError("graph correction node requires a critic decision")
+        await self._correct_once(
+            state,
+            graph_state["task"],
+            decision,
+            graph_state["tools"],
+        )
+        return {"runtime": state}
+
+    async def _graph_reject(self, graph_state: _GraphState) -> dict[str, Any]:
+        raise _CorrectionUnavailable("critic rejected the candidate after correction")
+
+    async def _graph_submit(self, graph_state: _GraphState) -> dict[str, Any]:
+        decision = graph_state.get("decision")
+        if decision is None:
+            raise ValueError("graph submit node requires a critic decision")
+        prediction = await self._submit(
+            graph_state["runtime"],
+            graph_state["task"],
+            decision,
+            graph_state["tools"],
+        )
+        return {"prediction": prediction}
 
     async def _act(
         self,
@@ -359,10 +509,32 @@ class Orchestrator:
                 "step_number": state.step_count,
             },
         )
-        try:
-            result = await specialist.run(task, step, tuple(state.evidence), tools)
-        finally:
-            state.usage = _add_usage(state.usage, specialist.last_usage)
+        with self._stage_span(
+            "specialist",
+            {
+                "stage": "act",
+                "specialist": step.specialist.value,
+                "step_number": state.step_count,
+            },
+        ) as specialist_span:
+            try:
+                result = await specialist.run(task, step, tuple(state.evidence), tools)
+            finally:
+                state.usage = _add_usage(state.usage, specialist.last_usage)
+            if specialist_span is not None:
+                specialist_span.set_summary(
+                    {
+                        "specialist": step.specialist.value,
+                        "step_number": state.step_count,
+                        "tool_names": list(tools.scope_tool_names),
+                        "evidence_count": len(result.evidence),
+                        "evidence_kinds": sorted({item.kind for item in result.evidence}),
+                        "candidate_present": result.candidate_answer is not None,
+                        "repair_attempted": bool(
+                            getattr(specialist, "last_repair_attempted", False)
+                        ),
+                    }
+                )
         trusted_evidence_ids = self._record_result(state, step, result)
         self._audit(
             f"{event_prefix}_completed",
@@ -428,15 +600,36 @@ class Orchestrator:
                 "has_candidate": state.candidate is not None,
             },
         )
-        try:
-            decision = await self._critic.verify(
-                task,
-                state.candidate,
-                tuple(state.evidence),
-                tools,
-            )
-        finally:
-            state.usage = _add_usage(state.usage, self._critic.last_usage)
+        with self._stage_span(
+            "critic",
+            {
+                "stage": "verify",
+                "evidence_count": len(state.evidence),
+                "has_candidate": state.candidate is not None,
+            },
+        ) as critic_span:
+            try:
+                decision = await self._critic.verify(
+                    task,
+                    state.candidate,
+                    tuple(state.evidence),
+                    tools,
+                )
+            finally:
+                state.usage = _add_usage(state.usage, self._critic.last_usage)
+            if critic_span is not None:
+                critic_span.set_summary(
+                    {
+                        "verdict": decision.verdict,
+                        "decision": decision.verdict,
+                        "checked_count": len(decision.checked_evidence_ids),
+                        "tool_names": list(tools.scope_tool_names),
+                        "candidate_present": state.candidate is not None,
+                        "repair_attempted": bool(
+                            getattr(self._critic, "last_repair_attempted", False)
+                        ),
+                    }
+                )
         known_ids = {item.evidence_id for item in state.evidence}
         checked_ids = decision.checked_evidence_ids
         if len(checked_ids) != len(set(checked_ids)):
@@ -467,6 +660,21 @@ class Orchestrator:
         decision: CriticDecision,
     ) -> CriticDecision:
         if decision.verdict != "approve":
+            return decision
+        if self._config.quality_policy == "benchmark":
+            if not decision.checked_evidence_ids:
+                raise ValueError("critic approval must check evidence")
+            if not state.evidence:
+                state.critic_verdict = "insufficient_evidence"
+                self._audit(
+                    "quality_rejected",
+                    {"category": "insufficient_evidence"},
+                )
+                return CriticDecision(
+                    verdict="insufficient_evidence",
+                    feedback="critic approval did not include usable evidence",
+                    checked_evidence_ids=decision.checked_evidence_ids,
+                )
             return decision
         if self._has_sufficient_evidence(state):
             if not decision.checked_evidence_ids:
@@ -572,10 +780,23 @@ class Orchestrator:
             "submit_started",
             {"evidence_ids": list(evidence_ids)},
         )
-        await tools.call(
-            "submit_answer",
-            {"answer": state.candidate, "evidence_ids": list(evidence_ids)},
-        )
+        with self._stage_span(
+            "submit",
+            {"stage": "submit", "evidence_count": len(evidence_ids)},
+        ) as submit_span:
+            await tools.call(
+                "submit_answer",
+                {"answer": state.candidate, "evidence_ids": list(evidence_ids)},
+            )
+            if submit_span is not None:
+                submit_span.set_summary(
+                    {
+                        "decision": "submit",
+                        "evidence_count": len(evidence_ids),
+                        "candidate_present": True,
+                        "tool_names": list(tools.scope_tool_names),
+                    }
+                )
         self._audit(
             "submit_completed",
             {"evidence_ids": list(evidence_ids)},
@@ -598,6 +819,11 @@ class Orchestrator:
                 payload=payload,
             )
         )
+
+    def _stage_span(self, name: str, metadata: dict[str, object]) -> Any:
+        if self._trace is None:
+            return nullcontext()
+        return self._trace.span(name, metadata)
 
 
 def _add_usage(first: Usage, second: Usage) -> Usage:

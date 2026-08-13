@@ -54,8 +54,9 @@ environment variable, which overrides the built-in default.
 
 | CLI option | Environment variable | Default |
 | --- | --- | --- |
-| `--model` | `GAIA_MODEL` | `gpt-5.6-sol` |
+| `--model` | `GAIA_MODEL` | `deepseek-v4-flash` |
 | `--reasoning-effort` | `GAIA_REASONING_EFFORT` | `medium` |
+| *(quality policy)* | `GAIA_QUALITY_POLICY` | `benchmark` |
 | `--sample-size` | `GAIA_SAMPLE_SIZE` | `15` |
 | `--seed` | `GAIA_SEED` | `42` |
 | `--max-steps` | `GAIA_MAX_STEPS` | `8` |
@@ -69,20 +70,42 @@ The sample size must be at least three and divisible by three so the run contain
 GAIA levels 1, 2, and 3. Votes must be a positive odd number. Run `uv run gaia-agent evaluate
 --help` for the current CLI surface.
 
+`GAIA_QUALITY_POLICY=benchmark` keeps a critic-approved, scorer-valid answer eligible for the
+official GAIA comparison even when the internal evidence-density gate is inconclusive. Set it to
+`strict` for the older audit-oriented evidence gate. This is an internal policy switch; it does
+not change GAIA's official answer scorer.
+
+### Langfuse observability
+
+Tracing is optional. Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` together to enable it;
+`LANGFUSE_ENABLED=false` always disables tracing. `LANGFUSE_BASE_URL` defaults to
+`https://cloud.langfuse.com`, and `LANGFUSE_PROJECT_NAME` is an optional project label. The CLI
+does not load `.env` automatically, so export these variables in the shell that runs the command
+or source a local, ignored `.env` file first.
+
+Each task trace contains only stable identifiers and configuration. Planner, specialist, critic,
+submit, model-generation, and MCP-tool observations contain stage names, statuses, counts, model
+name, reasoning setting, and token totals. New traces also include a bounded `reasoning_summary`
+with route, step/tool/evidence counts, critic verdict, and repair/fallback status so the visible
+decision path can be inspected without exposing hidden chain-of-thought. Questions, reference
+answers, candidate text, attachments, prompts, model output, tool arguments/results, and credentials are excluded. Langfuse transport failures
+are swallowed and cannot change scoring or retries. Call `flush` at run completion is handled by
+the runner; no Langfuse data is written into the public result artifacts.
+
 ## Run and verify
 
 A bounded three-task smoke run selects one task per level and limits each attempt to one planned
 step:
 
 ```console
-GAIA_MAX_STEPS=1 uv run gaia-agent evaluate --sample-size 3 --seed 42 --model gpt-5.6-sol --output-dir results/smoke-3
+GAIA_MAX_STEPS=1 uv run gaia-agent evaluate --sample-size 3 --seed 42 --model deepseek-v4-flash --output-dir results/smoke-3
 uv run gaia-agent verify-results results/smoke-3
 ```
 
 Run the deterministic 15-task evaluation and independently verify its public artifacts:
 
 ```console
-uv run gaia-agent evaluate --sample-size 15 --seed 42 --model gpt-5.6-sol --output-dir results/gaia-15-seed42
+uv run gaia-agent evaluate --sample-size 15 --seed 42 --model deepseek-v4-flash --output-dir results/gaia-15-seed42
 uv run gaia-agent verify-results results/gaia-15-seed42
 ```
 

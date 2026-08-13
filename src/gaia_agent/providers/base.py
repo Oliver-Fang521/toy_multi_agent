@@ -93,6 +93,8 @@ class ToolExecutor(Protocol):
 
 
 class ModelProvider(Protocol):
+    supports_vision: bool
+
     async def complete(
         self, request: ModelRequest, executor: ToolExecutor | None = None
     ) -> ModelResponse:

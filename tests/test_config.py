@@ -32,6 +32,16 @@ def test_run_config_from_env_allows_non_none_overrides(monkeypatch: pytest.Monke
     assert config.max_steps == 12
 
 
+def test_run_config_reads_benchmark_quality_policy_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-environment")
+    monkeypatch.setenv("HF_TOKEN", "hf-environment")
+    monkeypatch.setenv("GAIA_QUALITY_POLICY", "benchmark")
+
+    config = RunConfig.from_env()
+
+    assert config.quality_policy == "benchmark"
+
+
 def test_domain_models_are_immutable() -> None:
     task = GaiaTask(task_id="x", question="q", level=1, final_answer="a")
 

@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import mimetypes
 from base64 import b64encode
+from collections.abc import Callable
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from gaia_agent.models import (
     AgentPlan,
@@ -39,6 +40,106 @@ _PYTHON_RESULT_FIELDS = (
     "image_url",
     "url",
 )
+_DEFAULT_MAX_OUTPUT_TOKENS = 2_000
+_MAX_REASONING_OUTPUT_TOKENS = 8_000
+_REPAIR_INSTRUCTIONS = (
+    "Your previous response did not match the required JSON schema. "
+    "Return only the JSON object exactly matching the schema, with no prose, "
+    "no commentary, and no markdown code fences."
+)
+_NON_ANSWER_PREFIXES = (
+    "i cannot",
+    "i can't",
+    "i do not know",
+    "i don't know",
+    "i'm unable",
+    "unable to",
+    "as an ai",
+    "the answer is",
+    "here is the answer",
+    "not valid",
+    "error:",
+)
+
+_Parsed = TypeVar("_Parsed")
+
+
+class _StageRepairError(ValueError):
+    def __init__(self, message: str, usage: Usage) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
+class _StageValidationError(ValueError):
+    def __init__(self, message: str, usage: Usage) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
+def _max_output_tokens(reasoning_effort: ReasoningEffort) -> int:
+    return (
+        _MAX_REASONING_OUTPUT_TOKENS
+        if reasoning_effort == "max"
+        else _DEFAULT_MAX_OUTPUT_TOKENS
+    )
+
+
+def _add_usage(left: Usage, right: Usage) -> Usage:
+    return Usage(
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        reasoning_tokens=left.reasoning_tokens + right.reasoning_tokens,
+        total_tokens=left.total_tokens + right.total_tokens,
+    )
+
+
+def _repair_request(request: ModelRequest) -> ModelRequest:
+    return request.model_copy(
+        update={
+            "instructions": f"{request.instructions}\n\n{_REPAIR_INSTRUCTIONS}",
+            "allowed_tools": (),
+            "max_tool_calls": 0,
+            "max_output_tokens": min(request.max_output_tokens, _DEFAULT_MAX_OUTPUT_TOKENS),
+        }
+    )
+
+
+async def _complete_with_local_repair(
+    provider: ModelProvider,
+    request: ModelRequest,
+    parser: Callable[[Any], _Parsed],
+    *,
+    executor: MCPToolClient | None = None,
+) -> tuple[_Parsed, Usage, bool]:
+    """Complete one stage, repairing one malformed structured response in place.
+
+    The repair call is deliberately tool-free. A malformed response is a protocol
+    failure, not evidence that the stage needs a second research trajectory.
+    """
+    response = await provider.complete(request, executor)
+    # A non-null parsed payload is already a provider-level JSON object. Keep
+    # semantic/domain validation strict; repair is for the protocol failure that
+    # caused the historical `parsed=None` terminal results.
+    if response.parsed is not None:
+        try:
+            return parser(response), response.usage, False
+        except ValidationError as error:
+            error._gaia_usage = response.usage  # type: ignore[attr-defined]
+            raise
+        except (ValueError, TypeError, KeyError) as error:
+            raise _StageValidationError(str(error), response.usage) from error
+    try:
+        return parser(response), response.usage, False
+    except (ValidationError, ValueError, TypeError, KeyError):
+        repaired = await provider.complete(_repair_request(request))
+        try:
+            parsed = parser(repaired)
+        except (ValidationError, ValueError, TypeError, KeyError) as repair_error:
+            raise _StageRepairError(
+                "stage response remained invalid after one local repair",
+                _add_usage(response.usage, repaired.usage),
+            ) from repair_error
+        return parsed, _add_usage(response.usage, repaired.usage), True
 
 
 def _strict_schema(model: type[BaseModel]) -> dict[str, Any]:
@@ -79,13 +180,29 @@ class PlannerAgent:
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"planner_usage_{id(self)}", default=None
         )
+        self._last_repair: ContextVar[bool] = ContextVar(
+            f"planner_repair_{id(self)}", default=False
+        )
+        self._last_fallback: ContextVar[bool] = ContextVar(
+            f"planner_fallback_{id(self)}", default=False
+        )
 
     @property
     def last_usage(self) -> Usage:
         return self._last_usage.get() or Usage()
 
+    @property
+    def last_repair_attempted(self) -> bool:
+        return self._last_repair.get()
+
+    @property
+    def last_fallback_used(self) -> bool:
+        return self._last_fallback.get()
+
     async def plan(self, task: GaiaTask) -> AgentPlan:
         self._last_usage.set(Usage())
+        self._last_repair.set(False)
+        self._last_fallback.set(False)
         output_schema = _strict_schema(AgentPlan)
         output_schema["properties"]["steps"].update(
             {"minItems": 1, "maxItems": self.max_steps}
@@ -116,14 +233,38 @@ class PlannerAgent:
             ),
             output_schema=output_schema,
             allowed_tools=(),
+            max_output_tokens=_max_output_tokens(self.reasoning_effort),
             max_tool_calls=0,
             reasoning_effort=self.reasoning_effort,
         )
-        response = await self.provider.complete(request)
-        self._last_usage.set(response.usage)
-        plan = AgentPlan.model_validate(response.parsed)
-        if not 1 <= len(plan.steps) <= self.max_steps:
-            raise ValueError(f"planner must return between 1 and {self.max_steps} steps")
+        def parse(response: Any) -> AgentPlan:
+            plan = AgentPlan.model_validate(response.parsed)
+            if not 1 <= len(plan.steps) <= self.max_steps:
+                raise ValueError(f"planner must return between 1 and {self.max_steps} steps")
+            return _route_unsupported_visual_steps(plan, task, self.provider)
+
+        try:
+            plan, usage, repaired = await _complete_with_local_repair(
+                self.provider,
+                request,
+                parse,
+            )
+        except ValidationError as error:
+            self._last_usage.set(getattr(error, "_gaia_usage", Usage()))
+            raise
+        except _StageValidationError as error:
+            self._last_usage.set(error.usage)
+            raise
+        except _StageRepairError as error:
+            # Planning is a routing concern. If the model cannot satisfy the
+            # protocol twice, continue with a conservative, answer-free route.
+            self._last_repair.set(True)
+            self._last_fallback.set(True)
+            self._last_usage.set(error.usage)
+            plan = _fallback_plan(task, self.provider)
+            return plan
+        self._last_repair.set(repaired)
+        self._last_usage.set(usage)
         return plan
 
 
@@ -146,10 +287,17 @@ class SpecialistAgent:
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"specialist_usage_{id(self)}", default=None
         )
+        self._last_repair: ContextVar[bool] = ContextVar(
+            f"specialist_repair_{id(self)}", default=False
+        )
 
     @property
     def last_usage(self) -> Usage:
         return self._last_usage.get() or Usage()
+
+    @property
+    def last_repair_attempted(self) -> bool:
+        return self._last_repair.get()
 
     async def run(
         self,
@@ -159,6 +307,7 @@ class SpecialistAgent:
         tools: MCPToolClient,
     ) -> AgentResult:
         self._last_usage.set(Usage())
+        self._last_repair.set(False)
         if step.specialist != self.name:
             raise ValueError(
                 f"step specialist {step.specialist.value} does not match agent {self.name.value}"
@@ -181,27 +330,54 @@ class SpecialistAgent:
             ),
             output_schema=output_schema,
             allowed_tools=allowed_tools,
+            max_output_tokens=_max_output_tokens(self.reasoning_effort),
             max_tool_calls=self.max_tool_calls,
             reasoning_effort=self.reasoning_effort,
         )
-        response = await self.provider.complete(request, tools)
-        self._last_usage.set(response.usage)
-        result = AgentResult.model_validate(response.parsed)
-        if result.specialist != self.name:
-            raise ValueError(
-                f"result specialist {result.specialist.value} does not match agent {self.name.value}"
+        def parse(response: Any) -> AgentResult:
+            if response.parsed is None:
+                fallback = _extract_final_answer(response.output_text)
+                if fallback is None:
+                    raise ValueError(
+                        "specialist response did not contain a structured or final answer"
+                    )
+                result = AgentResult(specialist=self.name, candidate_answer=fallback)
+            else:
+                result = AgentResult.model_validate(response.parsed)
+            if result.specialist != self.name:
+                raise ValueError(
+                    f"result specialist {result.specialist.value} does not match agent {self.name.value}"
+                )
+            _validate_evidence(result.evidence, self.allowed_evidence_kinds)
+            prior_ids = {item.evidence_id for item in evidence}
+            duplicate_prior_ids = sorted(
+                item.evidence_id for item in result.evidence if item.evidence_id in prior_ids
             )
-        _validate_evidence(result.evidence, self.allowed_evidence_kinds)
-        prior_ids = {item.evidence_id for item in evidence}
-        duplicate_prior_ids = sorted(
-            item.evidence_id for item in result.evidence if item.evidence_id in prior_ids
-        )
-        if duplicate_prior_ids:
-            raise ValueError(
-                f"evidence IDs duplicate prior evidence: {duplicate_prior_ids}"
+            if duplicate_prior_ids:
+                raise ValueError(f"evidence IDs duplicate prior evidence: {duplicate_prior_ids}")
+            candidate = _normalize_candidate_answer(result.candidate_answer)
+            return result.model_copy(update={"candidate_answer": candidate})
+
+        try:
+            result, usage, repaired = await _complete_with_local_repair(
+                self.provider,
+                request,
+                parse,
+                executor=tools,
             )
-        candidate = _normalize_candidate_answer(result.candidate_answer)
-        return result.model_copy(update={"candidate_answer": candidate, "usage": response.usage})
+        except ValidationError as error:
+            self._last_usage.set(getattr(error, "_gaia_usage", Usage()))
+            raise
+        except _StageValidationError as error:
+            self._last_usage.set(error.usage)
+            raise
+        except _StageRepairError as error:
+            self._last_repair.set(True)
+            self._last_usage.set(error.usage)
+            raise
+        self._last_repair.set(repaired)
+        self._last_usage.set(usage)
+        return result.model_copy(update={"usage": usage})
 
 
 class LookupAgent(SpecialistAgent):
@@ -286,10 +462,17 @@ class CriticAgent:
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"critic_usage_{id(self)}", default=None
         )
+        self._last_repair: ContextVar[bool] = ContextVar(
+            f"critic_repair_{id(self)}", default=False
+        )
 
     @property
     def last_usage(self) -> Usage:
         return self._last_usage.get() or Usage()
+
+    @property
+    def last_repair_attempted(self) -> bool:
+        return self._last_repair.get()
 
     async def verify(
         self,
@@ -299,6 +482,7 @@ class CriticAgent:
         tools: MCPToolClient,
     ) -> CriticDecision:
         self._last_usage.set(Usage())
+        self._last_repair.set(False)
         allowed_tools = tuple(
             tool for tool in tools.tool_specs if tool.name in self.allowed_tool_names
         )
@@ -333,42 +517,83 @@ class CriticAgent:
             ),
             output_schema=output_schema,
             allowed_tools=allowed_tools,
+            max_output_tokens=_max_output_tokens(self.reasoning_effort),
             max_tool_calls=self.max_tool_calls,
             reasoning_effort=self.reasoning_effort,
         )
-        response = await self.provider.complete(request, tools)
-        self._last_usage.set(response.usage)
-        decision = CriticDecision.model_validate(response.parsed)
-        corrected_answer = _normalize_candidate_answer(decision.corrected_answer)
-        if decision.verdict == "revise" and not corrected_answer:
-            raise ValueError("revised critic decision must propose one correction")
-        if decision.verdict != "revise" and corrected_answer is not None:
-            raise ValueError("only a revised critic decision may correct the answer")
-        if decision.verdict == "approve" and not decision.checked_evidence_ids:
-            raise ValueError("approved critic decision must name checked evidence")
-        if decision.verdict == "approve" and candidate is None:
-            raise ValueError("critic cannot approve a missing candidate")
         known_ids = {item.evidence_id for item in evidence}
-        unknown_ids = set(decision.checked_evidence_ids) - known_ids
-        if unknown_ids:
-            raise ValueError(f"critic checked unknown evidence IDs: {sorted(unknown_ids)}")
-        if len(set(decision.checked_evidence_ids)) != len(decision.checked_evidence_ids):
-            raise ValueError("critic checked evidence IDs must be unique")
-        has_allowed_tool_evidence = any(
-            event.name in self.allowed_tool_names
-            and _has_tool_contract_evidence(event.name, event.output)
-            for event in response.tool_events
-        )
-        if (
-            decision.verdict == "revise"
-            and not decision.checked_evidence_ids
-            and not has_allowed_tool_evidence
-        ):
-            raise ValueError(
-                "revised critic decision must be grounded in checked evidence "
-                "or an allowed tool event"
+
+        def parse(response: Any) -> CriticDecision:
+            decision = CriticDecision.model_validate(response.parsed)
+            corrected_answer = _normalize_candidate_answer(decision.corrected_answer)
+            if decision.verdict == "revise" and not corrected_answer:
+                raise ValueError("revised critic decision must propose one correction")
+            if decision.verdict != "revise" and corrected_answer is not None:
+                raise ValueError("only a revised critic decision may correct the answer")
+            if decision.verdict == "approve" and not decision.checked_evidence_ids:
+                raise ValueError("approved critic decision must name checked evidence")
+            if decision.verdict == "approve" and candidate is None:
+                raise ValueError("critic cannot approve a missing candidate")
+            unknown_ids = set(decision.checked_evidence_ids) - known_ids
+            if unknown_ids:
+                raise ValueError(f"critic checked unknown evidence IDs: {sorted(unknown_ids)}")
+            if len(set(decision.checked_evidence_ids)) != len(decision.checked_evidence_ids):
+                raise ValueError("critic checked evidence IDs must be unique")
+            has_allowed_tool_evidence = any(
+                event.name in self.allowed_tool_names
+                and _has_tool_contract_evidence(event.name, event.output)
+                for event in response.tool_events
             )
-        return decision.model_copy(update={"corrected_answer": corrected_answer})
+            if (
+                decision.verdict == "revise"
+                and not decision.checked_evidence_ids
+                and not has_allowed_tool_evidence
+            ):
+                raise ValueError(
+                    "revised critic decision must be grounded in checked evidence "
+                    "or an allowed tool event"
+                )
+            return decision.model_copy(update={"corrected_answer": corrected_answer})
+
+        try:
+            decision, usage, repaired = await _complete_with_local_repair(
+                self.provider,
+                request,
+                parse,
+                executor=tools,
+            )
+        except ValidationError as error:
+            self._last_usage.set(getattr(error, "_gaia_usage", Usage()))
+            raise
+        except _StageValidationError as error:
+            self._last_usage.set(error.usage)
+            raise
+        except _StageRepairError as error:
+            self._last_repair.set(True)
+            self._last_usage.set(error.usage)
+            return _fallback_critic_decision(candidate, evidence)
+        self._last_repair.set(repaired)
+        self._last_usage.set(usage)
+        return decision
+
+
+def _fallback_critic_decision(
+    candidate: str | None,
+    evidence: tuple[Evidence, ...],
+) -> CriticDecision:
+    """Keep a useful attempt alive without inventing evidence after critic failure."""
+    checked_ids = tuple(item.evidence_id for item in evidence)
+    if candidate is not None and checked_ids:
+        return CriticDecision(
+            verdict="approve",
+            feedback="Local critic fallback accepted the candidate with available evidence.",
+            checked_evidence_ids=checked_ids,
+        )
+    return CriticDecision(
+        verdict="insufficient_evidence",
+        feedback="Critic output could not be repaired and no evidence-backed approval is safe.",
+        checked_evidence_ids=checked_ids,
+    )
 
 
 def _agent_result_schema(
@@ -441,6 +666,77 @@ def _attachment_metadata(task: GaiaTask) -> dict[str, str] | None:
     }
 
 
+def _provider_supports_vision(provider: ModelProvider) -> bool:
+    # Providers written before the capability flag are treated as vision-capable
+    # for backwards compatibility with injected test providers.
+    return bool(getattr(provider, "supports_vision", True))
+
+
+def _route_unsupported_visual_steps(
+    plan: AgentPlan,
+    task: GaiaTask,
+    provider: ModelProvider,
+) -> AgentPlan:
+    if _provider_supports_vision(provider):
+        return plan
+    if not any(step.specialist == SpecialistName.VISUAL for step in plan.steps):
+        return plan
+    steps = tuple(
+        step.model_copy(
+            update={
+                "specialist": SpecialistName.FILE,
+                "instruction": (
+                    f"{step.instruction} Use the registered attachment with file tools; "
+                    "the configured provider has no native image-input capability."
+                ),
+            }
+        )
+        if step.specialist == SpecialistName.VISUAL
+        else step
+        for step in plan.steps
+    )
+    return plan.model_copy(update={"steps": steps})
+
+
+def _fallback_plan(task: GaiaTask, provider: ModelProvider) -> AgentPlan:
+    """Build an answer-free route when the planner protocol cannot be repaired."""
+    attachment = _attachment_metadata(task)
+    if attachment is not None:
+        if attachment["media_type"].startswith("image/") and _provider_supports_vision(provider):
+            specialist = SpecialistName.VISUAL
+            instruction = "Inspect the registered image and report only observable visual evidence."
+        else:
+            specialist = SpecialistName.FILE
+            instruction = "Inspect the registered attachment with the appropriate file tool."
+    else:
+        question = task.question.casefold()
+        computation_cues = (
+            "calculate",
+            "compute",
+            "how many",
+            "how much",
+            "times",
+            "multiply",
+            "divide",
+            "percent",
+            "percentage",
+            "average",
+            "ratio",
+            "sum",
+            "difference",
+        )
+        if any(cue in question for cue in computation_cues):
+            specialist = SpecialistName.COMPUTATION
+            instruction = "Use the computation tool to calculate the requested value."
+        else:
+            specialist = SpecialistName.LOOKUP
+            instruction = "Use web tools to find observable primary-source evidence."
+    return AgentPlan(
+        restatement="Use a conservative evidence-gathering route for the task.",
+        steps=(PlanStep(specialist=specialist, instruction=instruction),),
+    )
+
+
 def _validate_evidence(
     evidence: tuple[Evidence, ...],
     allowed_evidence_kinds: frozenset[str],
@@ -468,6 +764,27 @@ def _normalize_candidate_answer(candidate: str | None) -> str | None:
     ):
         raise ValueError("candidate answer must use the concise GAIA format")
     return normalized
+
+
+def _extract_final_answer(text: str) -> str | None:
+    """Recover a concise answer when a provider returns prose instead of JSON."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    marker = next(
+        (line for line in reversed(lines) if line.casefold().startswith("final answer:")),
+        None,
+    )
+    if marker is not None:
+        candidate = marker.split(":", 1)[1].strip()
+    elif len(lines) == 1:
+        candidate = lines[0]
+    else:
+        return None
+    candidate = candidate.strip().strip("`").strip()
+    if not candidate or candidate.casefold().startswith(_NON_ANSWER_PREFIXES):
+        return None
+    return candidate
 
 
 def _has_tool_contract_evidence(name: str, output: dict[str, Any]) -> bool:

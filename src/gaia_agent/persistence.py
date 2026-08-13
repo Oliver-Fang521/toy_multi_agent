@@ -172,6 +172,7 @@ class RunManifest(FrozenModel):
     provider_name: str = "openai"
     evaluation_mode: Literal["production", "test"] = "production"
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"]
+    quality_policy: Literal["benchmark", "strict"] = "benchmark"
     dataset_name: str = "gaia-benchmark"
     dataset_revision: str
     dataset_configuration: str = "2023_all"

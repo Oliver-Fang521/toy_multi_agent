@@ -4,6 +4,7 @@ from typing import Any
 from openai import APITimeoutError, InternalServerError, RateLimitError
 
 from gaia_agent.models import Usage
+from gaia_agent.observability import Observability
 from gaia_agent.providers.base import (
     Citation,
     ModelRequest,
@@ -15,12 +16,107 @@ from gaia_agent.providers.base import (
 )
 
 
+def _append_tool_turn(
+    history: list[dict[str, Any]],
+    response: Any,
+    calls: list[Any],
+    outputs: list[dict[str, str]],
+) -> None:
+    """Append a stateless tool-call turn: reasoning, then calls, then outputs."""
+    for item in response.output:
+        if item.type != "reasoning":
+            continue
+        reasoning_parts = [
+            {"type": "reasoning_text", "text": part.text}
+            for part in item.content
+            if part.type == "reasoning_text"
+        ]
+        if reasoning_parts:
+            history.append({"type": "reasoning", "content": reasoning_parts})
+    history.extend(
+        {
+            "type": "function_call",
+            "call_id": call.call_id,
+            "name": call.name,
+            "arguments": call.arguments,
+        }
+        for call in calls
+    )
+    history.extend(outputs)
+
+
+def _extract_json_object(text: str) -> Any:
+    """Parse the first complete JSON object in model text, tolerating prose and fences."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
 class OpenAIProvider:
-    def __init__(self, client: Any, model: str = "gpt-5.6-sol") -> None:
+    supports_vision = True
+
+    def __init__(
+        self,
+        client: Any,
+        model: str = "gpt-5.6-sol",
+        *,
+        use_previous_response_id: bool = True,
+        observability: Observability | None = None,
+    ) -> None:
         self._client = client.with_options(max_retries=0)
         self._model = model
+        self._use_previous_response_id = use_previous_response_id
+        self._observability = observability
 
     async def complete(
+        self, request: ModelRequest, executor: ToolExecutor | None = None
+    ) -> ModelResponse:
+        trace = self._observability.current_trace() if self._observability else None
+        generation = (
+            trace.generation(
+                "provider-generation",
+                {"model": self._model, "reasoning_effort": request.reasoning_effort},
+            )
+            if trace is not None
+            else None
+        )
+        try:
+            response = await self._complete(request, executor)
+        except Exception as error:
+            if generation is not None:
+                generation.end(
+                    status="error",
+                    metadata={"error_type": type(error).__name__},
+                )
+            raise
+        if generation is not None:
+            generation.end(
+                status="ok",
+                metadata={
+                    "parsed": response.parsed is not None,
+                    "refused": bool(response.output_text and response.parsed is None),
+                    "tool_call_count": len(response.tool_events),
+                },
+                summary={
+                    "decision": "parsed" if response.parsed is not None else "unparsed",
+                    "parsed": response.parsed is not None,
+                    "refused": bool(response.output_text and response.parsed is None),
+                    "tool_call_count": len(response.tool_events),
+                },
+                usage=response.usage,
+            )
+        return response
+
+    async def _complete(
         self, request: ModelRequest, executor: ToolExecutor | None = None
     ) -> ModelResponse:
         common = {
@@ -40,6 +136,7 @@ class OpenAIProvider:
         }
         if request.max_tool_calls > 0:
             common["max_tool_calls"] = request.max_tool_calls
+        history: list[dict[str, Any]] = [dict(item) for item in request.input_items]
         response = await self._create_with_retry(input=request.input_items, **common)
         responses = [response]
         tool_events: list[ToolEvent] = []
@@ -50,17 +147,20 @@ class OpenAIProvider:
 
         while calls := [item for item in response.output if item.type == "function_call"]:
             if tool_call_count + len(calls) > request.max_tool_calls:
-                response = await self._create_with_retry(
-                    previous_response_id=response.id,
-                    input=[
-                        {
-                            "type": "function_call_output",
-                            "call_id": call.call_id,
-                            "output": '{"error":"tool_budget_exhausted"}',
-                        }
-                        for call in calls
-                    ],
-                    **tool_free_common,
+                outputs = [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call.call_id,
+                        "output": '{"error":"tool_budget_exhausted"}',
+                    }
+                    for call in calls
+                ]
+                if not self._use_previous_response_id:
+                    _append_tool_turn(history, response, calls, outputs)
+                response = await self._continue(
+                    previous_response=response,
+                    input_items=outputs if self._use_previous_response_id else list(history),
+                    common=tool_free_common,
                 )
                 responses.append(response)
                 break
@@ -80,13 +180,12 @@ class OpenAIProvider:
                     result = await executor.call(call.name, arguments)
                 except ToolCallError:
                     result = {"error": "tool_failed"}
-                outputs.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call.call_id,
-                        "output": serialize_tool_output(result),
-                    }
-                )
+                output = {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": serialize_tool_output(result),
+                }
+                outputs.append(output)
                 tool_events.append(
                     ToolEvent(
                         call_id=call.call_id,
@@ -96,21 +195,23 @@ class OpenAIProvider:
                     )
                 )
             tool_call_count += len(calls)
+            if not self._use_previous_response_id:
+                _append_tool_turn(history, response, calls, outputs)
             next_common = (
                 tool_free_common
                 if tool_call_count == request.max_tool_calls
                 else common
             )
-            response = await self._create_with_retry(
-                previous_response_id=response.id,
-                input=outputs,
-                **next_common,
+            response = await self._continue(
+                previous_response=response,
+                input_items=outputs if self._use_previous_response_id else list(history),
+                common=next_common,
             )
             responses.append(response)
 
         output_text, refused = _extract_output_text(response)
         citations, remote_file_ids = _extract_sources(responses)
-        parsed = None if refused or not output_text else json.loads(output_text)
+        parsed = None if refused or not output_text else _extract_json_object(output_text)
         if parsed is not None and not isinstance(parsed, dict):
             raise ValueError("structured response must decode to an object")
         return ModelResponse(
@@ -121,6 +222,21 @@ class OpenAIProvider:
             tool_events=tuple(tool_events),
             remote_file_ids=tuple(remote_file_ids),
         )
+
+    async def _continue(
+        self,
+        *,
+        previous_response: Any,
+        input_items: list[dict[str, Any]],
+        common: dict[str, Any],
+    ) -> Any:
+        if self._use_previous_response_id:
+            return await self._create_with_retry(
+                previous_response_id=previous_response.id,
+                input=input_items,
+                **common,
+            )
+        return await self._create_with_retry(input=input_items, **common)
 
     async def _create_with_retry(self, **kwargs: Any) -> Any:
         for attempt in range(2):

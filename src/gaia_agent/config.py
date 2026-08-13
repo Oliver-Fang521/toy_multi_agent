@@ -8,8 +8,9 @@ from pydantic import BaseModel, SecretStr, model_validator
 class RunConfig(BaseModel):
     openai_api_key: SecretStr
     hf_token: SecretStr
-    model: str = "gpt-5.6-sol"
+    model: str = "deepseek-v4-flash"
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
+    quality_policy: Literal["benchmark", "strict"] = "benchmark"
     sample_size: int = 15
     seed: int = 42
     max_steps: int = 8
@@ -32,8 +33,9 @@ class RunConfig(BaseModel):
         values: dict[str, object] = {
             "openai_api_key": os.environ.get("OPENAI_API_KEY"),
             "hf_token": os.environ.get("HF_TOKEN"),
-            "model": os.environ.get("GAIA_MODEL", "gpt-5.6-sol"),
+            "model": os.environ.get("GAIA_MODEL", "deepseek-v4-flash"),
             "reasoning_effort": os.environ.get("GAIA_REASONING_EFFORT", "medium"),
+            "quality_policy": os.environ.get("GAIA_QUALITY_POLICY", "benchmark"),
             "sample_size": os.environ.get("GAIA_SAMPLE_SIZE", "15"),
             "seed": os.environ.get("GAIA_SEED", "42"),
             "max_steps": os.environ.get("GAIA_MAX_STEPS", "8"),
