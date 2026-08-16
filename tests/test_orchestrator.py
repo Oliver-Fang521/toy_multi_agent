@@ -524,13 +524,14 @@ async def test_initial_oversized_visual_stage_routes_to_critic_without_dispatch(
     tmp_path: Path,
 ) -> None:
     attachment = tmp_path / "large.png"
-    attachment.write_bytes(b"x" * 20_000)
+    attachment.write_bytes(b"x" * 2_000_000)
     calls: list[str] = []
     visual = FakeSpecialist(
         SpecialistName.VISUAL,
         calls,
         [_result(SpecialistName.VISUAL, (), None)],
     )
+    visual.max_context_bytes = 1_048_576
     critic = FakeCritic(
         calls,
         [
@@ -543,7 +544,11 @@ async def test_initial_oversized_visual_stage_routes_to_critic_without_dispatch(
         specialists={SpecialistName.VISUAL: visual},
         critic=critic,
         tool_client_factory=FakeToolFactory(FakeTools(calls)),
-        config=_config(max_steps=1, quality_policy="benchmark"),
+        config=_config(
+            max_steps=1,
+            quality_policy="benchmark",
+            stage_context_max_bytes=1_048_576,
+        ),
     )
 
     prediction = await orchestrator.run(_task(attachment_path=attachment))
@@ -551,7 +556,9 @@ async def test_initial_oversized_visual_stage_routes_to_critic_without_dispatch(
     assert prediction.error_category == TerminalErrorCategory.CRITIC_REJECTION
     assert "visual" not in calls
     pressure = [event for event in orchestrator.audit_events if event.event_type == "context_budget_pressure"]
-    assert pressure
+    assert [event.payload for event in pressure] == [
+        {"bytes": 1_048_576, "item_count": 0, "max_bytes": 1_048_576}
+    ] * 2
 
 
 @pytest.mark.asyncio

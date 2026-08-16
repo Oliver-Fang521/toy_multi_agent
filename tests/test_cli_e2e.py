@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from collections import defaultdict, deque
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from gaia_agent import runner as runner_module
 from gaia_agent.agents import ComputationAgent, CriticAgent, LookupAgent, PlannerAgent
 from gaia_agent.cli import app
 from gaia_agent.config import RunConfig
-from gaia_agent.models import GaiaTask, TaskPrediction, TerminalErrorCategory, Usage
+from gaia_agent.models import AuditEvent, GaiaTask, TaskPrediction, TerminalErrorCategory, Usage
 from gaia_agent.providers import ModelRequest, ModelResponse
 from gaia_agent.reporting import summarize
 from gaia_agent.runner import (
@@ -299,6 +300,58 @@ async def test_offline_evaluation_runner_persists_reliability_audit_events(
     ]
     assert expected_event in audit_events
     assert verify_run_directory(tmp_path / mode).total == 3
+
+
+@pytest.mark.asyncio
+async def test_evaluation_runner_persists_context_pressure_at_configured_one_mebibyte_boundary(
+    tmp_path: Path,
+) -> None:
+    """A valid maximum context budget must not abort public artifact persistence."""
+
+    class _BoundaryOrchestrator:
+        def __init__(self, task: GaiaTask) -> None:
+            self._task = task
+            self.audit_events = (
+                AuditEvent(
+                    sequence=1,
+                    event_type="context_budget_pressure",
+                    timestamp=datetime(2026, 8, 17, tzinfo=UTC),
+                    payload={
+                        "bytes": 1_048_576,
+                        "item_count": 1,
+                        "max_bytes": 1_048_576,
+                    },
+                ),
+            )
+
+        async def run(self, task: GaiaTask) -> TaskPrediction:
+            assert task.task_id == self._task.task_id
+            return TaskPrediction(
+                task_id=task.task_id,
+                level=task.level,
+                answer=task.final_answer,
+                critic_verdict="approve",
+            )
+
+    tasks, revision = _fixture_tasks()
+    output_dir = tmp_path / "one-mebibyte-context"
+    runner = EvaluationRunner(
+        config=_config(output_dir, stage_context_max_bytes=1_048_576),
+        dataset_loader=lambda _config: (tasks, revision),
+        orchestrator_factory=_BoundaryOrchestrator,
+    )
+
+    await runner.run()
+
+    assert verify_run_directory(output_dir).total == 3
+    persisted_payloads = [
+        json.loads(line)["payload"]
+        for audit_path in (output_dir / "tasks").rglob("audit.jsonl")
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert persisted_payloads == [
+        {"bytes": 1_048_576, "item_count": 1, "max_bytes": 1_048_576}
+    ] * 3
 
 
 def test_build_runner_rejects_dataset_only_injection_before_default_provider(

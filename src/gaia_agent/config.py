@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+MAX_STAGE_CONTEXT_BYTES = 1_048_576
+
 
 class RunConfig(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
@@ -25,7 +27,7 @@ class RunConfig(BaseModel):
     provider_max_attempts: int = Field(default=4, ge=1, le=10)
     provider_backoff_base: float = Field(default=0.5, gt=0, le=30, allow_inf_nan=False)
     private_notebook_max_bytes: int = Field(default=65_536, ge=1, le=1_048_576)
-    stage_context_max_bytes: int = Field(default=24_576, ge=1, le=1_048_576)
+    stage_context_max_bytes: int = Field(default=24_576, ge=1, le=MAX_STAGE_CONTEXT_BYTES)
     search_circuit_cooldown: float = Field(default=30.0, ge=0, le=3_600, allow_inf_nan=False)
     langfuse_input_cost_per_million: Decimal | None = Field(
         default=None, ge=0, le=Decimal(1_000_000), allow_inf_nan=False

@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
+from gaia_agent.config import MAX_STAGE_CONTEXT_BYTES
 from gaia_agent.models import (
     AgentPlan,
     AuditEvent,
@@ -578,13 +579,18 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
         elif key == "tool":
             if value not in _PUBLIC_TOOL_NAMES:
                 raise ValueError("audit tool is not allowlisted")
+        elif key in {"bytes", "max_bytes"}:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= MAX_STAGE_CONTEXT_BYTES
+            ):
+                raise ValueError("audit context counter must be a bounded integer")
         elif key in {
             "call_number",
             "step_count",
             "step_number",
-            "bytes",
             "item_count",
-            "max_bytes",
             "completed_steps",
             "remaining_steps",
         }:

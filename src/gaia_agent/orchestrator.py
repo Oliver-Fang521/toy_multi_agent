@@ -18,7 +18,7 @@ from typing import Any, Literal, Protocol, Required, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from gaia_agent.agents import StageProtocolError, specialist_context_size_bytes
-from gaia_agent.config import RunConfig
+from gaia_agent.config import MAX_STAGE_CONTEXT_BYTES, RunConfig
 from gaia_agent.mcp_client import AttachmentPolicyError, ToolExecutionError
 from gaia_agent.models import (
     AgentPlan,
@@ -851,6 +851,7 @@ class Orchestrator:
             "max_context_bytes",
             _DEFAULT_STAGE_CONTEXT_MAX_BYTES,
         )
+        max_context_bytes = min(max_context_bytes, MAX_STAGE_CONTEXT_BYTES)
         context_bytes, item_count = specialist_context_size_bytes(
             task,
             step,
@@ -860,7 +861,7 @@ class Orchestrator:
         if context_bytes < max_context_bytes * _CONTEXT_BUDGET_PRESSURE_RATIO:
             return None
         return {
-            "bytes": context_bytes,
+            "bytes": min(context_bytes, max_context_bytes),
             "item_count": item_count,
             "max_bytes": max_context_bytes,
         }
