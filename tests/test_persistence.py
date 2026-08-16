@@ -508,6 +508,37 @@ def test_bounded_task_four_results_are_allowed_only_as_the_shared_shape(tmp_path
         )
 
 
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        ("context_budget_pressure", {"bytes": 24_576, "item_count": 3, "max_bytes": 24_576}),
+        ("plan_early_stop", {"completed_steps": 1, "remaining_steps": 2}),
+        ("soft_step_failure", {"step_number": 2, "code": "candidate_format"}),
+    ],
+)
+def test_persistence_accepts_bounded_orchestrator_reliability_audit_events(
+    tmp_path,
+    prediction,
+    event_type,
+    payload,
+) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+
+    store.append_audit(
+        prediction.task_id,
+        AuditEvent(
+            sequence=1,
+            event_type=event_type,
+            timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+            payload=payload,
+        ),
+    )
+
+    store.verify_integrity()
+    audit = (store.task_directory(prediction.task_id) / "audit.jsonl").read_text()
+    assert f'"event_type":"{event_type}"' in audit
+
+
 def test_not_run_requires_an_incorrect_terminal_failure_and_audit_context(tmp_path, prediction) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
     invalid_predictions = (

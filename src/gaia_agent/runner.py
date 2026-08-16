@@ -373,6 +373,10 @@ def build_runner(
         raise ValueError("dataset_loader and provider_factory must be injected together")
 
     validate_config(config)
+    if not injected_dataset and (
+        config.model != "gpt-5.6-luna" or config.reasoning_effort != "max"
+    ):
+        raise ValueError("production evaluation requires model=gpt-5.6-luna and reasoning_effort=max")
     observability_config = ObservabilityConfig.from_env()
     observability = Observability(
         replace(

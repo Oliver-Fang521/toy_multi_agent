@@ -54,8 +54,8 @@ environment variable, which overrides the built-in default.
 
 | CLI option | Environment variable | Default |
 | --- | --- | --- |
-| `--model` | `GAIA_MODEL` | `deepseek-v4-flash` |
-| `--reasoning-effort` | `GAIA_REASONING_EFFORT` | `medium` |
+| `--model` | `GAIA_MODEL` | `gpt-5.6-luna` |
+| `--reasoning-effort` | `GAIA_REASONING_EFFORT` | `max` |
 | *(quality policy)* | `GAIA_QUALITY_POLICY` | `benchmark` |
 | `--sample-size` | `GAIA_SAMPLE_SIZE` | `15` |
 | `--seed` | `GAIA_SEED` | `42` |
@@ -125,14 +125,14 @@ A bounded three-task smoke run selects one task per level and limits each attemp
 step:
 
 ```console
-GAIA_MAX_STEPS=1 uv run gaia-agent evaluate --sample-size 3 --seed 42 --model deepseek-v4-flash --output-dir results/smoke-3
+GAIA_MAX_STEPS=1 uv run gaia-agent evaluate --sample-size 3 --seed 42 --output-dir results/smoke-3
 uv run gaia-agent verify-results results/smoke-3
 ```
 
 Run the deterministic 15-task evaluation and independently verify its public artifacts:
 
 ```console
-uv run gaia-agent evaluate --sample-size 15 --seed 42 --model deepseek-v4-flash --output-dir results/gaia-15-seed42
+uv run gaia-agent evaluate --sample-size 15 --seed 42 --output-dir results/gaia-15-seed42
 uv run gaia-agent verify-results results/gaia-15-seed42
 ```
 

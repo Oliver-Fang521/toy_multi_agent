@@ -1046,8 +1046,8 @@ def _settings_from_env() -> MCPServerSettings:
         client = AsyncOpenAI(api_key=api_key, max_retries=0)
         backend = HostedOpenAIBackend(
             client=client,
-            model=os.environ.get("GAIA_MODEL", "gpt-5.6-sol"),
-            reasoning_effort=os.environ.get("GAIA_REASONING_EFFORT", "medium"),
+            model=os.environ.get("GAIA_MODEL", "gpt-5.6-luna"),
+            reasoning_effort=os.environ.get("GAIA_REASONING_EFFORT", "max"),
             attachment_reader=attachment_reader,
             timeout_seconds=timeout_seconds,
         )

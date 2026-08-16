@@ -10,6 +10,21 @@ def test_run_config_requires_balanced_sample_size() -> None:
         RunConfig(openai_api_key="sk-test", hf_token="hf_test", sample_size=10)
 
 
+def test_run_config_defaults_to_luna_max_in_direct_and_environment_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-environment")
+    monkeypatch.setenv("HF_TOKEN", "hf-environment")
+    monkeypatch.delenv("GAIA_MODEL", raising=False)
+    monkeypatch.delenv("GAIA_REASONING_EFFORT", raising=False)
+
+    direct = RunConfig(openai_api_key="sk-test", hf_token="hf-test")
+    from_env = RunConfig.from_env()
+
+    assert (direct.model, direct.reasoning_effort) == ("gpt-5.6-luna", "max")
+    assert (from_env.model, from_env.reasoning_effort) == ("gpt-5.6-luna", "max")
+
+
 def test_run_config_redacts_secrets() -> None:
     config = RunConfig(openai_api_key="sk-secret", hf_token="hf_secret")
     assert "sk-secret" not in repr(config)

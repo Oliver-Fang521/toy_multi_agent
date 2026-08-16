@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from gaia_agent import cli as cli_module
 from gaia_agent import runner as runner_module
-from gaia_agent.agents import CriticAgent, LookupAgent, PlannerAgent
+from gaia_agent.agents import ComputationAgent, CriticAgent, LookupAgent, PlannerAgent
 from gaia_agent.cli import app
 from gaia_agent.config import RunConfig
 from gaia_agent.models import GaiaTask, TaskPrediction, TerminalErrorCategory, Usage
@@ -139,6 +139,86 @@ class _OfflineProvider:
         raise AssertionError("unexpected agent request")
 
 
+class _ReliabilityAuditProvider:
+    supports_vision = True
+
+    def __init__(self, mode: str) -> None:
+        self._mode = mode
+
+    async def complete(
+        self,
+        request: ModelRequest,
+        executor: Any | None = None,
+    ) -> ModelResponse:
+        context = _request_context(request)
+        if request.instructions == PlannerAgent.instructions:
+            steps = {
+                "context": [{"specialist": "lookup", "instruction": "Gather a source"}],
+                "early": [
+                    {"specialist": "lookup", "instruction": "Gather a source"},
+                    {"specialist": "computation", "instruction": "Calculate"},
+                ],
+                "soft": [
+                    {"specialist": "computation", "instruction": "Calculate"},
+                    {"specialist": "lookup", "instruction": "Gather corroboration"},
+                ],
+            }[self._mode]
+            return ModelResponse(parsed={"restatement": "Offline reliability route", "steps": steps})
+        if request.instructions == ComputationAgent.instructions:
+            return ModelResponse(
+                parsed={
+                    "specialist": "computation",
+                    "evidence": [
+                        {
+                            "evidence_id": f"computation-{context['task_id']}",
+                            "kind": "computation",
+                            "summary": "Deterministic computation",
+                        }
+                    ],
+                    "candidate_answer": "42",
+                }
+            )
+        if request.instructions.startswith(LookupAgent.instructions):
+            if self._mode == "soft":
+                return ModelResponse(
+                    parsed={"specialist": "computation", "evidence": [], "candidate_answer": "42"}
+                )
+            return ModelResponse(
+                parsed={
+                    "specialist": "lookup",
+                    "evidence": [
+                        {
+                            "evidence_id": f"source-{context['task_id']}",
+                            "kind": "source",
+                            "summary": "Deterministic source",
+                            "source_url": "https://offline.example/source",
+                        }
+                    ],
+                    "candidate_answer": "offline answer",
+                }
+            )
+        if request.instructions == CriticAgent.instructions:
+            evidence = context["evidence"]
+            if self._mode == "context":
+                return ModelResponse(
+                    parsed={
+                        "verdict": "insufficient_evidence",
+                        "feedback": "No bounded context remains",
+                        "checked_evidence_ids": [],
+                        "corrected_answer": None,
+                    }
+                )
+            return ModelResponse(
+                parsed={
+                    "verdict": "approve",
+                    "feedback": "Offline evidence is sufficient",
+                    "checked_evidence_ids": [item["evidence_id"] for item in evidence],
+                    "corrected_answer": None,
+                }
+            )
+        raise AssertionError("unexpected reliability audit request")
+
+
 def _request_context(request: ModelRequest) -> dict[str, Any]:
     content = request.input_items[0]["content"]
     text = next(item["text"] for item in content if item["type"] == "input_text")
@@ -176,6 +256,49 @@ def _inject_capturing_runner(
         return _CapturingRunner()
 
     monkeypatch.setattr(cli_module, "build_runner", capture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected_event"),
+    [
+        ("context", "context_budget_pressure"),
+        ("early", "plan_early_stop"),
+        ("soft", "soft_step_failure"),
+    ],
+)
+async def test_offline_evaluation_runner_persists_reliability_audit_events(
+    tmp_path: Path,
+    mode: str,
+    expected_event: str,
+) -> None:
+    tasks, revision = _fixture_tasks()
+    if mode == "context":
+        tasks = [task.model_copy(update={"question": "x" * 4_096}) for task in tasks]
+    runner = build_runner(
+        _config(
+            tmp_path / mode,
+            max_steps=2,
+            stage_context_max_bytes=5_000 if mode == "context" else 24_576,
+        ),
+        dataset_loader=lambda _config: (tasks, revision),
+        provider_factory=lambda _config: ProviderRuntime(
+            provider=_ReliabilityAuditProvider(mode),
+            provider_name="offline-reliability",
+            evaluation_mode="test",
+            fake_mcp_backend=True,
+        ),
+    )
+
+    await runner.run()
+
+    audit_events = [
+        json.loads(line)["event_type"]
+        for audit_path in (tmp_path / mode / "tasks").rglob("audit.jsonl")
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert expected_event in audit_events
+    assert verify_run_directory(tmp_path / mode).total == 3
 
 
 def test_build_runner_rejects_dataset_only_injection_before_default_provider(
@@ -280,6 +403,59 @@ def test_build_runner_applies_configured_retry_policy_to_openai(
     policy = captured[0]
     assert policy.max_attempts == 6
     assert policy.base_delay_seconds == 1.25
+
+
+def test_build_runner_rejects_non_luna_max_production_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "AsyncOpenAI",
+        lambda **_: pytest.fail("production client must not be constructed for rejected config"),
+    )
+
+    with pytest.raises(ValueError, match="requires model=gpt-5.6-luna"):
+        build_runner(_config(tmp_path, model="other-model", reasoning_effort="high"))
+
+
+def test_build_runner_composes_luna_max_for_every_production_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_models: list[str] = []
+
+    class _Client:
+        def with_options(self, *, max_retries: int) -> _Client:
+            assert max_retries == 0
+            return self
+
+    class _OpenAIProvider:
+        supports_vision = True
+
+        def __init__(self, _: object, model: str, **__: object) -> None:
+            captured_models.append(model)
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("LANGFUSE_ENABLED", "false")
+    monkeypatch.setattr(runner_module, "AsyncOpenAI", lambda **_: _Client())
+    monkeypatch.setattr(runner_module, "OpenAIProvider", _OpenAIProvider)
+    config = RunConfig(
+        openai_api_key="sk-fake-credential",
+        hf_token="hf-fake-credential",
+        sample_size=3,
+        output_dir=tmp_path,
+    )
+
+    runner = build_runner(config)
+    orchestrator = runner._orchestrator_factory(
+        GaiaTask(task_id="offline-l1", question="Synthetic", level=1, final_answer="unused")
+    )
+
+    assert captured_models == ["gpt-5.6-luna"]
+    assert orchestrator._planner.reasoning_effort == "max"
+    assert {agent.reasoning_effort for agent in orchestrator._specialists.values()} == {"max"}
+    assert orchestrator._critic.reasoning_effort == "max"
 
 
 @pytest.mark.parametrize(

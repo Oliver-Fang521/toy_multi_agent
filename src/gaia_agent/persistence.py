@@ -96,6 +96,9 @@ _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
         "correction_completed",
         "submit_started",
         "submit_completed",
+        "context_budget_pressure",
+        "plan_early_stop",
+        "soft_step_failure",
     }
 )
 _PUBLIC_AUDIT_EVENT_KEYS = {
@@ -124,6 +127,9 @@ _PUBLIC_AUDIT_EVENT_KEYS = {
     "correction_completed": frozenset({"evidence_ids", "has_candidate"}),
     "submit_started": frozenset({"evidence_ids"}),
     "submit_completed": frozenset({"evidence_ids"}),
+    "context_budget_pressure": frozenset({"bytes", "item_count", "max_bytes"}),
+    "plan_early_stop": frozenset({"completed_steps", "remaining_steps"}),
+    "soft_step_failure": frozenset({"step_number", "code"}),
 }
 _PUBLIC_CRITIC_VERDICTS = frozenset({"approve", "revise", "insufficient_evidence", "not_run"})
 _NORMAL_CRITIC_VERDICTS = _PUBLIC_CRITIC_VERDICTS - {"not_run"}
@@ -572,9 +578,28 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
         elif key == "tool":
             if value not in _PUBLIC_TOOL_NAMES:
                 raise ValueError("audit tool is not allowlisted")
-        elif key in {"call_number", "step_count", "step_number"}:
+        elif key in {
+            "call_number",
+            "step_count",
+            "step_number",
+            "bytes",
+            "item_count",
+            "max_bytes",
+            "completed_steps",
+            "remaining_steps",
+        }:
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000_000:
                 raise ValueError("audit counter must be a bounded integer")
+        elif key == "code":
+            if value not in {
+                "role_mismatch",
+                "evidence_shape",
+                "source_url_missing",
+                "candidate_format",
+                "checked_evidence",
+                "schema",
+            }:
+                raise ValueError("audit code is not allowlisted")
         elif key == "specialist":
             if value not in {item.value for item in SpecialistName}:
                 raise ValueError("audit specialist is not allowlisted")

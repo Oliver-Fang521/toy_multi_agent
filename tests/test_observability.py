@@ -442,8 +442,8 @@ async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
     assert root.kwargs["metadata"] == {
         "task_id": "trace-task-1",
         "level": 1,
-        "model": "deepseek-v4-flash",
-        "reasoning_effort": "medium",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
         "run_id": "gaia-seed42-n3",
         "attempt_number": 1,
         "evaluation_mode": "test",
