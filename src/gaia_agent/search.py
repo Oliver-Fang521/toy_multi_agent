@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -9,7 +10,7 @@ from typing import Any, Protocol
 import httpx
 
 from gaia_agent.providers.base import ToolCallError
-from gaia_agent.reliability import RetryPolicy
+from gaia_agent.reliability import RetryPolicy, is_transient_provider_error, retry_delay
 
 
 class SearchProvider(Protocol):
@@ -160,6 +161,33 @@ class SerpAPISearchProvider:
         )
 
 
+class OpenAISearchProvider:
+    """Classify hosted OpenAI search failures before chain retry decisions."""
+
+    provider = "openai"
+
+    def __init__(self, backend: SearchProvider) -> None:
+        self._backend = backend
+
+    async def search(self, query: str) -> dict[str, Any]:
+        try:
+            return await self._backend.search(query)
+        except SearchProviderError:
+            raise
+        except Exception as error:  # noqa: BLE001 - normalize opaque SDK failures at this boundary.
+            status = getattr(error, "status_code", None)
+            if isinstance(status, int):
+                raise _http_error(self.provider, status) from None
+            if is_transient_provider_error(error):
+                category = "timeout" if "Timeout" in type(error).__name__ else "transport"
+                raise SearchProviderError(
+                    provider=self.provider, category=category, retryable=True
+                ) from None
+            raise SearchProviderError(
+                provider=self.provider, category="provider_error", retryable=False
+            ) from None
+
+
 @dataclass
 class _Circuit:
     failures: int = 0
@@ -196,14 +224,11 @@ class SearchProviderChain:
                 try:
                     result = await provider.search(query)
                 except SearchProviderError as error:
-                    if error.retryable and attempt < self._retry_policy.max_attempts:
+                    if not error.retryable:
+                        raise
+                    if attempt < self._retry_policy.max_attempts:
+                        await asyncio.sleep(retry_delay(self._retry_policy, attempt, lambda: 0.0))
                         continue
-                    if error.retryable:
-                        circuit.failures += 1
-                        if circuit.failures >= self._threshold:
-                            circuit.open_until = self._clock() + self._cooldown
-                    break
-                except Exception:  # noqa: BLE001 - providers must not leak into the MCP process.
                     circuit.failures += 1
                     if circuit.failures >= self._threshold:
                         circuit.open_until = self._clock() + self._cooldown

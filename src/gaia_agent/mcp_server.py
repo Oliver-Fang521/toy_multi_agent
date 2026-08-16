@@ -15,7 +15,7 @@ import zipfile
 import zlib
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -36,8 +36,9 @@ from gaia_agent.providers.base import (
     serialize_tool_output,
     tool_output_size_bytes,
 )
-from gaia_agent.reliability import RetryPolicy
+from gaia_agent.reliability import RetryPolicy, retry_delay
 from gaia_agent.search import (
+    OpenAISearchProvider,
     SearchProvider,
     SearchProviderChain,
     SerpAPISearchProvider,
@@ -192,6 +193,23 @@ class HostedBackend(Protocol):
     async def transcribe_audio(self, path: str) -> dict[str, Any]: ...
 
 
+class WebpageError(ToolCallError):
+    def __init__(
+        self,
+        category: str,
+        *,
+        retryable: bool,
+        http_status: int | None = None,
+        attempt_count: int = 1,
+    ) -> None:
+        super().__init__(category)
+        self.category = category
+        self.retryable = retryable
+        self.provider = None
+        self.http_status = http_status
+        self.attempt_count = attempt_count
+
+
 class HTTPWebReader:
     def __init__(
         self,
@@ -206,6 +224,24 @@ class HTTPWebReader:
         self._max_bytes = max_bytes
 
     async def read(self, url: str) -> dict[str, Any]:
+        try:
+            result = await self._read_once(url)
+        except TimeoutError:
+            raise WebpageError("timeout", retryable=True) from None
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            raise WebpageError(
+                "http_status",
+                retryable=status == 408 or status == 429 or status >= 500,
+                http_status=status,
+            ) from None
+        except httpx.TransportError:
+            raise WebpageError("transport", retryable=True) from None
+        if not result.get("text", "").strip():
+            raise WebpageError("empty_content", retryable=False)
+        return result
+
+    async def _read_once(self, url: str) -> dict[str, Any]:
         async with asyncio.timeout(self._timeout_seconds):
             current_url = httpx.URL(url)
             for _ in range(MAX_REDIRECTS + 1):
@@ -801,10 +837,21 @@ class MCPServerSettings:
     serper_api_key: str = ""
     serpapi_api_key: str = ""
     search_provider: SearchProvider | None = None
+    search_client: httpx.AsyncClient | None = None
+    webpage_retry_policy: RetryPolicy = field(
+        default_factory=lambda: RetryPolicy(max_attempts=3, base_delay_seconds=0.25, max_delay_seconds=1)
+    )
 
     @property
     def secrets(self) -> tuple[str, ...]:
         return (self.api_key, self.hf_token, self.serper_api_key, self.serpapi_api_key)
+
+    async def aclose(self) -> None:
+        close_web_reader = getattr(self.web_reader, "aclose", None)
+        if close_web_reader is not None:
+            await close_web_reader()
+        if self.search_client is not None:
+            await self.search_client.aclose()
 
     @classmethod
     def for_fake_backend(
@@ -871,6 +918,37 @@ async def _safe_tool_call(
         raise RuntimeError(message) from None
 
 
+async def _read_webpage_with_fallback(settings: MCPServerSettings, url: str) -> dict[str, Any]:
+    for attempt in range(1, settings.webpage_retry_policy.max_attempts + 1):
+        try:
+            result = await settings.web_reader.read(url)
+        except ValueError:
+            raise WebpageError("policy_rejection", retryable=False, attempt_count=attempt) from None
+        except ToolCallError as error:
+            error.attempt_count = attempt
+            if not bool(getattr(error, "retryable", False)):
+                raise
+            if attempt < settings.webpage_retry_policy.max_attempts:
+                await asyncio.sleep(retry_delay(settings.webpage_retry_policy, attempt, lambda: 0.0))
+                continue
+            try:
+                provider = settings.search_provider or settings.backend
+                search = provider.search if hasattr(provider, "search") else provider.web_search
+                snippets = await search(url)
+            except ToolCallError:
+                raise error from None
+            return {
+                "url": url,
+                "text": str(snippets.get("answer") or ""),
+                "sources": snippets.get("sources") if isinstance(snippets.get("sources"), list) else [],
+                "fallback": "search",
+            }
+        if not str(result.get("text") or "").strip():
+            raise WebpageError("empty_content", retryable=False, attempt_count=attempt)
+        return result
+    raise AssertionError("bounded webpage retry did not return or raise")
+
+
 def build_server(settings: MCPServerSettings) -> MCPServer:
     server = MCPServer("gaia-tools")
 
@@ -890,7 +968,7 @@ def build_server(settings: MCPServerSettings) -> MCPServer:
     @server.tool()
     async def read_webpage(url: str) -> dict[str, Any]:
         """Read public HTTP(S) page text with redirects, timeout, and size limits."""
-        return await _safe_tool_call(settings, settings.web_reader.read(url))
+        return await _safe_tool_call(settings, _read_webpage_with_fallback(settings, url))
 
     @server.tool()
     async def execute_python(instruction: str, paths: list[str] | None = None) -> dict[str, Any]:
@@ -945,8 +1023,9 @@ def _settings_from_env() -> MCPServerSettings:
             timeout_seconds=timeout_seconds,
         )
     search_provider: SearchProvider | None = None
+    search_client: httpx.AsyncClient | None = None
     if not fake_backend:
-        search_providers: list[SearchProvider] = [backend]
+        search_providers: list[SearchProvider] = [OpenAISearchProvider(backend)]
         search_client = httpx.AsyncClient()
         if serper_api_key:
             search_providers.append(
@@ -973,8 +1052,13 @@ def _settings_from_env() -> MCPServerSettings:
         serper_api_key=serper_api_key,
         serpapi_api_key=serpapi_api_key,
         search_provider=search_provider,
+        search_client=search_client,
     )
 
 
 if __name__ == "__main__":
-    build_server(_settings_from_env()).run()
+    _settings = _settings_from_env()
+    try:
+        build_server(_settings).run()
+    finally:
+        asyncio.run(_settings.aclose())

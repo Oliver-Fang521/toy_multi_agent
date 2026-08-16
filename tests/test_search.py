@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any
@@ -163,3 +164,53 @@ async def test_search_chain_opens_circuit_skips_provider_then_closes_after_probe
     now[0] = 31.0
     assert await chain.search("probe") == {"answer": "recovered", "sources": []}
     assert openai.queries == ["first", "second", "probe"]
+
+
+@pytest.mark.asyncio
+async def test_search_chain_waits_with_bounded_backoff_before_retrying_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    openai = _ScriptedProvider("openai", [_transient("openai"), _transient("openai")])
+    serper = _ScriptedProvider("serper", [{"answer": "fallback", "sources": []}])
+    chain = SearchProviderChain(
+        [openai, serper],
+        RetryPolicy(max_attempts=2, base_delay_seconds=0.5, max_delay_seconds=1),
+        clock=lambda: 0.0,
+    )
+
+    assert await chain.search("question") == {"answer": "fallback", "sources": []}
+    assert delays == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_search_chain_stops_on_nonretryable_provider_failure() -> None:
+    openai = _ScriptedProvider(
+        "openai", [SearchProviderError(provider="openai", category="parse_failure", retryable=False)]
+    )
+    serper = _ScriptedProvider("serper", [{"answer": "must not run", "sources": []}])
+    chain = SearchProviderChain([openai, serper], RetryPolicy(max_attempts=2), clock=lambda: 0.0)
+
+    with pytest.raises(SearchProviderError, match="parse_failure"):
+        await chain.search("question")
+
+    assert openai.queries == ["question"]
+    assert serper.queries == []
+
+
+@pytest.mark.asyncio
+async def test_search_chain_propagates_unclassified_provider_errors_without_opening_circuit() -> None:
+    openai = _ScriptedProvider("openai", [RuntimeError("implementation failure")])
+    serper = _ScriptedProvider("serper", [{"answer": "must not run", "sources": []}])
+    chain = SearchProviderChain([openai, serper], RetryPolicy(max_attempts=2), clock=lambda: 0.0)
+
+    with pytest.raises(RuntimeError, match="implementation failure"):
+        await chain.search("question")
+
+    assert serper.queries == []
+    assert chain._circuits["openai"].failures == 0

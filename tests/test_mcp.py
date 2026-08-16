@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 import pytest
 from mcp import Client
+from openai import APITimeoutError
 from openpyxl import Workbook
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, NameObject
@@ -24,6 +25,7 @@ from gaia_agent.mcp_server import (
     HostedOpenAIBackend,
     HTTPWebReader,
     MCPServerSettings,
+    WebpageError,
     build_server,
 )
 from gaia_agent.models import Usage
@@ -48,6 +50,63 @@ def test_mcp_server_env_propagates_openai_base_url(
     client = MCPToolClient(task_root=tmp_path, config=run_config)
 
     assert client._minimal_server_env()["OPENAI_BASE_URL"] == "https://api.deepseek.com"
+
+
+@pytest.mark.asyncio
+async def test_settings_chain_classifies_transient_openai_failure_and_uses_serper_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailingOpenAIBackend:
+        provider = "openai"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            raise APITimeoutError(request=httpx.Request("POST", "https://api.openai.test"))
+
+    class SerperFallback:
+        provider = "serper"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            return {"answer": "fallback", "sources": []}
+
+    monkeypatch.setenv("GAIA_TASK_ROOT", str(tmp_path))
+    monkeypatch.setenv("GAIA_ATTACHMENTS", "[]")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("HF_TOKEN", "")
+    monkeypatch.setenv("SERPER_API_KEY", "serper-key")
+    monkeypatch.delenv("GAIA_MCP_FAKE_BACKEND", raising=False)
+    monkeypatch.setattr(mcp_server, "AsyncOpenAI", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(mcp_server, "HostedOpenAIBackend", lambda **kwargs: FailingOpenAIBackend())
+    monkeypatch.setattr(
+        mcp_server, "SerperSearchProvider", lambda *args, **kwargs: SerperFallback()
+    )
+
+    settings = mcp_server._settings_from_env()
+    try:
+        assert settings.search_provider is not None
+        assert await settings.search_provider.search("question") == {
+            "answer": "fallback",
+            "sources": [],
+        }
+    finally:
+        await settings.aclose()
+
+
+@pytest.mark.asyncio
+async def test_settings_close_owned_search_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GAIA_TASK_ROOT", str(tmp_path))
+    monkeypatch.setenv("GAIA_ATTACHMENTS", "[]")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("HF_TOKEN", "")
+    monkeypatch.delenv("GAIA_MCP_FAKE_BACKEND", raising=False)
+    monkeypatch.setattr(mcp_server, "AsyncOpenAI", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(mcp_server, "HostedOpenAIBackend", lambda **kwargs: SimpleNamespace())
+
+    settings = mcp_server._settings_from_env()
+    assert settings.search_client is not None
+
+    await settings.aclose()
+
+    assert settings.search_client.is_closed is True
 
 
 def test_mcp_server_env_propagates_only_optional_search_provider_keys(
@@ -95,6 +154,159 @@ async def test_mcp_client_categorizes_webpage_http_errors_without_retaining_raw_
     assert "private.example" not in str(caught.value)
     assert "secret" not in str(caught.value)
     assert "classified" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_read_webpage_retries_only_transient_failures_before_returning_content(
+    tmp_path: Path,
+) -> None:
+    class FlakyReader:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def read(self, url: str) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls == 1:
+                error = ToolExecutionError("timeout with https://private.example and body=secret")
+                error.category = "timeout"
+                error.retryable = True
+                raise error
+            return {
+                "url": url,
+                "status_code": 200,
+                "content_type": "text/plain",
+                "text": "recovered page",
+                "truncated": False,
+            }
+
+    reader = FlakyReader()
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=reader,
+        backend=SimpleNamespace(),
+        api_key="",
+        hf_token="",
+    )
+    async with Client(build_server(settings)) as client:
+        result = await client.call_tool("read_webpage", {"url": "https://example.test/article"})
+
+    assert result.is_error is False
+    assert result.structured_content == {
+        "url": "https://example.test/article",
+        "status_code": 200,
+        "content_type": "text/plain",
+        "text": "recovered page",
+        "truncated": False,
+    }
+    assert reader.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_read_webpage_returns_bounded_search_snippets_after_transient_failure(
+    tmp_path: Path,
+) -> None:
+    class UnavailableReader:
+        async def read(self, url: str) -> dict[str, Any]:
+            error = ToolExecutionError("timeout with key=secret and body=private")
+            error.category = "timeout"
+            error.retryable = True
+            raise error
+
+    class SearchFallback:
+        provider = "serper"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            assert query == "https://example.test/article"
+            return {
+                "answer": "A public search summary.",
+                "sources": [{"url": "https://source.test", "title": "Source"}],
+            }
+
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=UnavailableReader(),
+        backend=SimpleNamespace(),
+        api_key="secret",
+        hf_token="",
+        search_provider=SearchFallback(),
+    )
+    async with Client(build_server(settings)) as client:
+        result = await client.call_tool("read_webpage", {"url": "https://example.test/article"})
+
+    assert result.is_error is False
+    assert result.structured_content == {
+        "url": "https://example.test/article",
+        "text": "A public search summary.",
+        "sources": [{"url": "https://source.test", "title": "Source"}],
+        "fallback": "search",
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_webpage_reports_empty_content_as_safe_nonretryable_category(
+    tmp_path: Path,
+) -> None:
+    class EmptyReader:
+        async def read(self, url: str) -> dict[str, Any]:
+            return {
+                "url": url,
+                "status_code": 200,
+                "content_type": "text/plain",
+                "text": "",
+                "truncated": False,
+            }
+
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=EmptyReader(),
+        backend=SimpleNamespace(),
+        api_key="",
+        hf_token="",
+    )
+    async with Client(build_server(settings)) as client:
+        result = await client.call_tool("read_webpage", {"url": "https://example.test/article"})
+
+    assert result.is_error is True
+    assert '"category":"empty_content"' in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_read_webpage_reports_policy_rejection_without_retry_or_search_fallback(
+    tmp_path: Path,
+) -> None:
+    class PolicyReader:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def read(self, url: str) -> dict[str, Any]:
+            self.calls += 1
+            raise ValueError("URL must refer to a public host")
+
+    class ForbiddenFallback:
+        provider = "serper"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            raise AssertionError("policy errors must not invoke search fallback")
+
+    reader = PolicyReader()
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=reader,
+        backend=SimpleNamespace(),
+        api_key="",
+        hf_token="",
+        search_provider=ForbiddenFallback(),
+    )
+    async with Client(build_server(settings)) as client:
+        result = await client.call_tool("read_webpage", {"url": "https://private.test"})
+
+    assert result.is_error is True
+    assert '"category":"policy_rejection"' in result.content[0].text
+    assert reader.calls == 1
 
 
 @pytest.fixture
@@ -832,10 +1044,13 @@ async def test_http_reader_raises_for_http_status(public_dns: None) -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         reader = HTTPWebReader(client=client, timeout_seconds=1)
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(WebpageError) as caught:
             await reader.read("https://example.test/down")
 
     assert attempts == ["93.184.216.34"]
+    assert caught.value.category == "http_status"
+    assert caught.value.retryable is True
+    assert caught.value.http_status == 503
 
 
 @pytest.mark.asyncio
