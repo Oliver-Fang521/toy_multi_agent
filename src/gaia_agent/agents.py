@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import mimetypes
 from base64 import b64encode
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
@@ -22,6 +23,7 @@ from gaia_agent.models import (
     Usage,
 )
 from gaia_agent.providers import ModelProvider, ModelRequest
+from gaia_agent.research_notebook import NotebookEntry, select_evidence_cards
 
 if TYPE_CHECKING:
     from gaia_agent.mcp_client import MCPToolClient
@@ -44,6 +46,10 @@ _PYTHON_RESULT_FIELDS = (
 )
 _DEFAULT_MAX_OUTPUT_TOKENS = 2_000
 _MAX_REASONING_OUTPUT_TOKENS = 8_000
+_DEFAULT_MAX_CONTEXT_BYTES = 24_576
+_MAX_CONTEXT_QUESTION_CHARS = 4_096
+_MAX_CONTEXT_INSTRUCTION_CHARS = 2_048
+_EVIDENCE_CARD_TIMESTAMP = datetime(1970, 1, 1, tzinfo=UTC)
 _REPAIR_INSTRUCTIONS = (
     "Your previous response did not match the required JSON schema. "
     "Return only the JSON object exactly matching the schema, with no prose, "
@@ -377,10 +383,14 @@ class SpecialistAgent:
         *,
         reasoning_effort: ReasoningEffort = "medium",
         max_tool_calls: int = 8,
+        max_context_bytes: int = _DEFAULT_MAX_CONTEXT_BYTES,
     ) -> None:
+        if max_context_bytes < 1:
+            raise ValueError("max_context_bytes must be positive")
         self.provider = provider
         self.reasoning_effort = reasoning_effort
         self.max_tool_calls = max_tool_calls
+        self.max_context_bytes = max_context_bytes
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"specialist_usage_{id(self)}", default=None
         )
@@ -424,6 +434,7 @@ class SpecialistAgent:
                 evidence,
                 visual=self.name == "visual",
                 tools=tools,
+                max_json_bytes=self.max_context_bytes,
             ),
             output_schema=output_schema,
             allowed_tools=allowed_tools,
@@ -757,16 +768,12 @@ async def _specialist_input(
     *,
     visual: bool,
     tools: MCPToolClient,
+    max_json_bytes: int = _DEFAULT_MAX_CONTEXT_BYTES,
 ) -> tuple[dict[str, Any], ...]:
+    if max_json_bytes < 1:
+        raise ValueError("max_json_bytes must be positive")
     attachment = _attachment_metadata(task)
-    context = {
-        "task_id": task.task_id,
-        "question": task.question,
-        "level": task.level,
-        "instruction": step.instruction,
-        "attachment": attachment,
-        "evidence": [item.model_dump(mode="json") for item in evidence],
-    }
+    context = _bounded_specialist_context(task, step, evidence, max_json_bytes)
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
@@ -790,6 +797,98 @@ async def _specialist_input(
             }
         )
     return ({"role": "user", "content": content},)
+
+
+def context_size_bytes(input_items: Sequence[Mapping[str, Any]]) -> int:
+    """Return the exact UTF-8 JSON size of model input items."""
+    return len(
+        json.dumps(
+            list(input_items),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+
+
+def specialist_context_size_bytes(
+    task: GaiaTask,
+    step: PlanStep,
+    evidence: Sequence[Evidence],
+    *,
+    max_json_bytes: int = _DEFAULT_MAX_CONTEXT_BYTES,
+) -> tuple[int, int]:
+    """Return the bounded text-context size and selected evidence-card count."""
+    context = _bounded_specialist_context(task, step, evidence, max_json_bytes)
+    return context_size_bytes(_text_input_items(context)), len(context["evidence"])
+
+
+def _bounded_specialist_context(
+    task: GaiaTask,
+    step: PlanStep,
+    evidence: Sequence[Evidence],
+    max_json_bytes: int,
+) -> dict[str, Any]:
+    attachment = _attachment_metadata(task)
+    context: dict[str, Any] = {
+        "task_id": task.task_id,
+        "question": _bounded_context_text(task.question, _MAX_CONTEXT_QUESTION_CHARS),
+        "level": task.level,
+        "instruction": _bounded_context_text(step.instruction, _MAX_CONTEXT_INSTRUCTION_CHARS),
+        "attachment": attachment,
+        "evidence": [],
+    }
+    available_card_bytes = max(
+        0,
+        max_json_bytes - context_size_bytes(_text_input_items(context)),
+    )
+    context["evidence"] = list(
+        select_evidence_cards(
+            _notebook_entries_for_evidence(evidence),
+            max_json_bytes=available_card_bytes,
+        )
+    )
+    return context
+
+
+def _text_input_items(context: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    return (
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": json.dumps(
+                        context,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+        },
+    )
+
+
+def _notebook_entries_for_evidence(evidence: Sequence[Evidence]) -> tuple[NotebookEntry, ...]:
+    return tuple(
+        NotebookEntry(
+            signature=item.evidence_id,
+            tool=item.kind,
+            result={
+                "evidence_id": item.evidence_id,
+                "source_url": item.source_url,
+                "summary": item.summary,
+            },
+            created_at=_EVIDENCE_CARD_TIMESTAMP,
+        )
+        for item in evidence
+    )
+
+
+def _bounded_context_text(value: str, limit: int) -> str:
+    return " ".join(value.split())[:limit]
 
 
 def _attachment_metadata(task: GaiaTask) -> dict[str, str] | None:

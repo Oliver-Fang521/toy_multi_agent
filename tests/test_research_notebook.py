@@ -5,11 +5,16 @@ import os
 import stat
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from gaia_agent.research_notebook import ResearchNotebook
+from gaia_agent.research_notebook import (
+    NotebookEntry,
+    ResearchNotebook,
+    select_evidence_cards,
+)
 
 
 def test_notebook_persists_private_bounded_result(tmp_path: Path) -> None:
@@ -128,3 +133,64 @@ def test_notebook_treats_a_nonregular_entry_as_a_cache_miss(tmp_path: Path) -> N
     finally:
         writer.join()
         os.close(reader)
+
+
+def _notebook_entry(tool: str, result: dict[str, object], signature: str) -> NotebookEntry:
+    return NotebookEntry(
+        signature=signature,
+        tool=tool,
+        result=result,
+        created_at=datetime(2026, 8, 16, tzinfo=UTC),
+    )
+
+
+def test_evidence_cards_deduplicate_sources_prioritize_them_and_keep_ties_stable() -> None:
+    entries = (
+        _notebook_entry(
+            "read_webpage",
+            {"url": "https://example.test/fact", "title": "Primary fact", "text": "A" * 500},
+            "first-source",
+        ),
+        _notebook_entry(
+            "web_search",
+            {"sources": [{"url": "https://example.test/fact", "title": "Duplicate", "snippet": "A" * 500}]},
+            "duplicate-url",
+        ),
+        _notebook_entry("execute_python", {"error": "tool failed"}, "error"),
+        _notebook_entry("execute_python", {"text": "same score one"}, "tie-one"),
+        _notebook_entry("execute_python", {"text": "same score two"}, "tie-two"),
+    )
+
+    cards = select_evidence_cards(entries, max_items=5)
+
+    assert len(cards) == 4
+    assert cards[0]["domain"] == "example.test"
+    assert cards[0]["tool_kind"] == "read_webpage"
+    assert [card["excerpt"] for card in cards[1:3]] == [
+        "same score one",
+        "same score two",
+    ]
+    assert cards[-1]["tool_kind"] != "read_webpage"
+
+
+def test_evidence_cards_never_exceed_json_budget_or_include_full_webpage_bodies() -> None:
+    cards = select_evidence_cards(
+        tuple(
+            _notebook_entry(
+                "read_webpage",
+                {
+                    "url": f"https://source-{index}.example.test/page",
+                    "title": "Title " + "x" * 1_000,
+                    "text": "private full webpage body " + "y" * 10_000,
+                },
+                f"entry-{index}",
+            )
+            for index in range(20)
+        ),
+        max_json_bytes=2_000,
+    )
+
+    encoded = json.dumps(cards, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= 2_000
+    assert all(len(str(card.get("excerpt", ""))) < 10_000 for card in cards)
+    assert all("y" * 10_000 not in json.dumps(card) for card in cards)

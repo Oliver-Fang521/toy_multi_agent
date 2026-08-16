@@ -8,11 +8,16 @@ import json
 import os
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+_MAX_CARD_TITLE_CHARS = 256
+_MAX_CARD_DOMAIN_CHARS = 255
+_MAX_CARD_EXCERPT_CHARS = 1_536
 
 
 @dataclass(frozen=True)
@@ -21,6 +26,139 @@ class NotebookEntry:
     tool: str
     result: dict[str, Any]
     created_at: datetime
+
+
+def select_evidence_cards(
+    entries: Sequence[NotebookEntry],
+    *,
+    max_items: int = 12,
+    max_json_bytes: int = 24_576,
+) -> tuple[dict[str, Any], ...]:
+    """Select a small, deterministic model-safe view of private tool results.
+
+    Cards intentionally retain only source metadata and a short excerpt.  The
+    notebook's raw results may contain full pages or tool output and must never
+    be copied directly into a model request.
+    """
+    if max_items < 0:
+        raise ValueError("max_items must be non-negative")
+    if max_json_bytes < 0:
+        raise ValueError("max_json_bytes must be non-negative")
+
+    candidates = [_evidence_card(entry, index) for index, entry in enumerate(entries)]
+    unique: list[tuple[int, int, dict[str, Any]]] = []
+    seen: set[tuple[str, str]] = set()
+    for score, index, card, duplicate_key in sorted(
+        candidates,
+        key=lambda item: (-item[0], item[1]),
+    ):
+        if duplicate_key in seen:
+            continue
+        seen.add(duplicate_key)
+        unique.append((score, index, card))
+
+    selected: list[dict[str, Any]] = []
+    for _, _, card in unique:
+        if len(selected) >= max_items:
+            break
+        candidate = [*selected, card]
+        if _json_size_bytes(candidate) > max_json_bytes:
+            continue
+        selected.append(card)
+    return tuple(selected)
+
+
+def _evidence_card(entry: NotebookEntry, index: int) -> tuple[int, int, dict[str, Any], tuple[str, str]]:
+    url, title, excerpt = _card_fields(entry.result)
+    domain = urlparse(url).hostname if url else None
+    card = {
+        "entry_hash": hashlib.sha256(entry.signature.encode("utf-8")).hexdigest(),
+        "tool_kind": _bound_text(entry.tool, _MAX_CARD_TITLE_CHARS),
+        "title": _bound_text(title, _MAX_CARD_TITLE_CHARS),
+        "domain": _bound_text(domain, _MAX_CARD_DOMAIN_CHARS),
+        "excerpt": _bound_text(excerpt, _MAX_CARD_EXCERPT_CHARS),
+    }
+    evidence_id = entry.result.get("evidence_id")
+    if isinstance(evidence_id, str) and evidence_id.strip():
+        card["evidence_id"] = _bound_text(evidence_id, _MAX_CARD_TITLE_CHARS)
+    card = {key: value for key, value in card.items() if value}
+    content_hash = hashlib.sha256(
+        _canonical_card_content(title, excerpt).encode("utf-8")
+    ).hexdigest()
+    duplicate_key = ("url", url) if url else ("content", content_hash)
+    has_source = bool(url or title)
+    has_excerpt = bool(excerpt)
+    has_error = _is_error_result(entry.result)
+    score = (1_000 if has_source else 0) + (100 if has_excerpt else 0) - (500 if has_error else 0)
+    return score, index, card, duplicate_key
+
+
+def _card_fields(result: Mapping[str, Any]) -> tuple[str | None, str | None, str | None]:
+    source: Mapping[str, Any] = result
+    sources = result.get("sources")
+    if isinstance(sources, list):
+        for item in sources:
+            if isinstance(item, Mapping):
+                source = {**result, **item}
+                break
+    url = _first_text(source, "url", "source_url")
+    title = _first_text(source, "title", "name")
+    excerpt = _first_text(
+        source,
+        "snippet",
+        "answer",
+        "summary",
+        "text",
+        "content",
+        "logs",
+        "output",
+        "result",
+        "value",
+        "data",
+    )
+    return url, title, excerpt
+
+
+def _first_text(value: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return None
+
+
+def _bound_text(value: str | None, limit: int) -> str | None:
+    if not value:
+        return None
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    return normalized[:limit]
+
+
+def _canonical_card_content(title: str | None, excerpt: str | None) -> str:
+    return "\n".join(
+        value.casefold().strip() for value in (title, excerpt) if value and value.strip()
+    )
+
+
+def _is_error_result(result: Mapping[str, Any]) -> bool:
+    return bool(result.get("error")) and not any(
+        _first_text(result, key)
+        for key in ("url", "source_url", "title", "snippet", "answer", "text", "content")
+    )
+
+
+def _json_size_bytes(value: object) -> int:
+    return len(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
 
 
 class ResearchNotebook:

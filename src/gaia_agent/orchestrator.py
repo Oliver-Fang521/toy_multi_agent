@@ -17,7 +17,7 @@ from typing import Any, Literal, Protocol, Required, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from gaia_agent.agents import StageProtocolError
+from gaia_agent.agents import StageProtocolError, specialist_context_size_bytes
 from gaia_agent.config import RunConfig
 from gaia_agent.mcp_client import AttachmentPolicyError, ToolExecutionError
 from gaia_agent.models import (
@@ -37,6 +37,9 @@ from gaia_agent.observability import Observability, TaskTrace
 from gaia_agent.providers import ToolCallError, ToolSpec
 from gaia_agent.research_notebook import ResearchNotebook
 from gaia_agent.scoring import parse_number_with_status
+
+_DEFAULT_STAGE_CONTEXT_MAX_BYTES = 24_576
+_CONTEXT_BUDGET_PRESSURE_RATIO = 0.7
 
 
 class Planner(Protocol):
@@ -500,6 +503,28 @@ class Orchestrator:
             raise ValueError("graph act router requires a plan")
         step_index = graph_state.get("next_step_index", 0)
         if step_index < len(state.plan.steps):
+            next_step = state.plan.steps[step_index]
+            max_context_bytes = getattr(
+                self._specialists.get(next_step.specialist),
+                "max_context_bytes",
+                _DEFAULT_STAGE_CONTEXT_MAX_BYTES,
+            )
+            context_bytes, item_count = specialist_context_size_bytes(
+                graph_state["task"],
+                next_step,
+                state.evidence,
+                max_json_bytes=max_context_bytes,
+            )
+            if context_bytes >= max_context_bytes * _CONTEXT_BUDGET_PRESSURE_RATIO:
+                self._audit(
+                    "context_budget_pressure",
+                    {
+                        "bytes": context_bytes,
+                        "item_count": item_count,
+                        "max_bytes": max_context_bytes,
+                    },
+                )
+                return "verify"
             if _ready_for_critic(state):
                 self._audit(
                     "plan_early_stop",

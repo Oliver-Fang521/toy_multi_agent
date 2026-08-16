@@ -15,6 +15,8 @@ from gaia_agent.agents import (
     StageValidationCode,
     VisualAgent,
     _complete_with_local_repair,
+    _specialist_input,
+    context_size_bytes,
     normalize_plan,
 )
 from gaia_agent.mcp_client import AttachmentPolicyError
@@ -763,6 +765,42 @@ async def test_specialist_context_serializes_prior_evidence_in_order(
     context = json.loads(fake_provider.requests[0].input_items[0]["content"][0]["text"])
 
     assert [item["evidence_id"] for item in context["evidence"]] == ["source-2", "source-1"]
+
+
+@pytest.mark.asyncio
+async def test_specialist_context_selects_bounded_unique_high_value_evidence(
+    fake_tools, task
+) -> None:
+    evidence = tuple(
+        Evidence(
+            evidence_id=f"source-{index}",
+            kind="source",
+            summary=("important evidence " if index == 0 else "duplicate body ") + "x" * 12_000,
+            source_url=(
+                "https://primary.example/fact"
+                if index < 2
+                else f"https://source-{index}.example/fact"
+            ),
+        )
+        for index in range(20)
+    )
+
+    input_items = await _specialist_input(
+        task,
+        PlanStep(specialist="lookup", instruction="Synthesize the evidence"),
+        evidence,
+        visual=False,
+        tools=fake_tools,
+    )
+    context = json.loads(input_items[0]["content"][0]["text"])
+
+    assert context["question"] == task.question
+    assert context["evidence"][0]["evidence_id"] == "source-0"
+    assert len({item.get("domain") for item in context["evidence"]}) == len(
+        context["evidence"]
+    )
+    assert context_size_bytes(input_items) <= 24_576
+    assert "x" * 12_000 not in repr(input_items)
 
 
 @pytest.mark.asyncio

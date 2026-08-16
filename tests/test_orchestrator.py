@@ -443,6 +443,46 @@ async def test_budgeted_tool_client_restores_private_notebook_result_across_scop
     ]
 
 
+@pytest.mark.asyncio
+async def test_context_budget_pressure_forces_synthesis_before_enrichment() -> None:
+    calls: list[str] = []
+    evidence = tuple(
+        _evidence(f"calculation-{index}", "computation", summary=f"result {index} " + "x" * 8_000)
+        for index in range(12)
+    )
+    planner = FakePlanner(
+        calls,
+        _plan(SpecialistName.COMPUTATION, SpecialistName.LOOKUP),
+    )
+    computation = FakeSpecialist(
+        SpecialistName.COMPUTATION,
+        calls,
+        [_result(SpecialistName.COMPUTATION, evidence, "42")],
+    )
+    lookup = FakeSpecialist(SpecialistName.LOOKUP, calls, [])
+    critic = FakeCritic(calls, [_decision("approve", tuple(f"evidence-{i:04d}" for i in range(1, 13)))])
+    tools = FakeTools(calls)
+    orchestrator = Orchestrator(
+        planner=planner,
+        specialists={
+            SpecialistName.COMPUTATION: computation,
+            SpecialistName.LOOKUP: lookup,
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(tools),
+        config=_config(quality_policy="benchmark"),
+    )
+
+    prediction = await orchestrator.run(_task(question="Compute the answer"))
+
+    assert prediction.answer == "42"
+    assert calls == ["planner", "computation", "critic", "submit_answer"]
+    pressure = [event for event in orchestrator.audit_events if event.event_type == "context_budget_pressure"]
+    assert len(pressure) == 1
+    assert pressure[0].payload["bytes"] >= int(24_576 * 0.7)
+    assert pressure[0].payload["item_count"] == 12
+
+
 def _config(**overrides: Any) -> RunConfig:
     values: dict[str, Any] = {
         "openai_api_key": "sk-test",
