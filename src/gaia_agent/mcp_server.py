@@ -81,6 +81,10 @@ class _TrustedHostedResult(dict[str, Any]):
     pass
 
 
+class _SearchFallbackResult(dict[str, Any]):
+    pass
+
+
 def _is_relative_to(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -235,6 +239,8 @@ class HTTPWebReader:
                 retryable=status == 408 or status == 429 or status >= 500,
                 http_status=status,
             ) from None
+        except httpx.DecodingError:
+            raise WebpageError("parse_failure", retryable=False) from None
         except httpx.TransportError:
             raise WebpageError("transport", retryable=True) from None
         if not result.get("text", "").strip():
@@ -299,10 +305,13 @@ class HTTPWebReader:
         media_type = response.headers.get("content-type", "")
         text = bytes(content).decode(response.encoding or "utf-8", errors="replace")
         if "html" in media_type.lower():
-            soup = BeautifulSoup(text, "html.parser")
-            for element in soup(["script", "style", "noscript"]):
-                element.decompose()
-            text = " ".join(soup.get_text(" ", strip=True).split())
+            try:
+                soup = BeautifulSoup(text, "html.parser")
+                for element in soup(["script", "style", "noscript"]):
+                    element.decompose()
+                text = " ".join(soup.get_text(" ", strip=True).split())
+            except (AttributeError, TypeError, ValueError):
+                raise WebpageError("parse_failure", retryable=False) from None
         return {
             "url": str(original_url),
             "status_code": response.status_code,
@@ -886,6 +895,7 @@ async def _safe_tool_call(
 ) -> dict[str, Any]:
     try:
         result = await operation if hasattr(operation, "__await__") else operation()
+        is_search_result = isinstance(result, _SearchFallbackResult)
         payload = dict(result)
         raw_usage = payload.pop(HOSTED_USAGE_METADATA_KEY, None)
         usage = (
@@ -895,7 +905,7 @@ async def _safe_tool_call(
         )
         redacted = _redact(payload, settings.secrets)
         metadata = {HOSTED_USAGE_METADATA_KEY: usage} if usage is not None else None
-        if web_result:
+        if web_result or is_search_result:
             return _bounded_web_search_result(redacted, metadata=metadata)
         return _bounded_result(redacted, metadata=metadata)
     except ToolCallError as error:
@@ -922,8 +932,9 @@ async def _read_webpage_with_fallback(settings: MCPServerSettings, url: str) -> 
     for attempt in range(1, settings.webpage_retry_policy.max_attempts + 1):
         try:
             result = await settings.web_reader.read(url)
-        except ValueError:
-            raise WebpageError("policy_rejection", retryable=False, attempt_count=attempt) from None
+        except ValueError as error:
+            category = "policy_rejection" if _is_webpage_policy_error(error) else "parse_failure"
+            raise WebpageError(category, retryable=False, attempt_count=attempt) from None
         except ToolCallError as error:
             error.attempt_count = attempt
             if not bool(getattr(error, "retryable", False)):
@@ -937,16 +948,29 @@ async def _read_webpage_with_fallback(settings: MCPServerSettings, url: str) -> 
                 snippets = await search(url)
             except ToolCallError:
                 raise error from None
-            return {
+            return _SearchFallbackResult(
+                {
                 "url": url,
-                "text": str(snippets.get("answer") or ""),
+                "answer": str(snippets.get("answer") or ""),
                 "sources": snippets.get("sources") if isinstance(snippets.get("sources"), list) else [],
                 "fallback": "search",
-            }
+                }
+            )
         if not str(result.get("text") or "").strip():
             raise WebpageError("empty_content", retryable=False, attempt_count=attempt)
         return result
     raise AssertionError("bounded webpage retry did not return or raise")
+
+
+def _is_webpage_policy_error(error: ValueError) -> bool:
+    return str(error).startswith(
+        (
+            "URL must use HTTP(S)",
+            "URL credentials are not allowed",
+            "URL must refer to a public host",
+            "URL hostname did not resolve",
+        )
+    )
 
 
 def build_server(settings: MCPServerSettings) -> MCPServer:

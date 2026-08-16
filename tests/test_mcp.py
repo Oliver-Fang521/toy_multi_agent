@@ -238,10 +238,104 @@ async def test_read_webpage_returns_bounded_search_snippets_after_transient_fail
     assert result.is_error is False
     assert result.structured_content == {
         "url": "https://example.test/article",
-        "text": "A public search summary.",
+        "answer": "A public search summary.",
         "sources": [{"url": "https://source.test", "title": "Source"}],
         "fallback": "search",
     }
+
+
+@pytest.mark.asyncio
+async def test_read_webpage_bounds_and_redacts_oversized_search_fallback(
+    tmp_path: Path,
+) -> None:
+    secret = "search-provider-secret"
+
+    class UnavailableReader:
+        async def read(self, url: str) -> dict[str, Any]:
+            error = ToolExecutionError("timeout")
+            error.category = "timeout"
+            error.retryable = True
+            raise error
+
+    class SearchFallback:
+        provider = "serper"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            return {
+                "answer": secret + "漢字🚀" * 4_000,
+                "sources": [
+                    {
+                        "url": f"https://source-{index}.test/article",
+                        "title": secret + "title" * 200,
+                    }
+                    for index in range(20)
+                ],
+            }
+
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=UnavailableReader(),
+        backend=SimpleNamespace(),
+        api_key=secret,
+        hf_token="",
+        search_provider=SearchFallback(),
+    )
+    async with Client(build_server(settings)) as client:
+        tool_result = await client.call_tool("read_webpage", {"url": "https://example.test/article"})
+
+    assert tool_result.is_error is False
+    assert isinstance(tool_result.structured_content, dict)
+    result = dict(tool_result.structured_content)
+    assert result["fallback"] == "search"
+    assert "answer" in result
+    assert len(result["sources"]) <= mcp_server.MAX_WEB_SEARCH_SOURCES
+    assert len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= (
+        mcp_server.MAX_WEB_SEARCH_OUTPUT_BYTES
+    )
+    assert secret not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_read_webpage_reports_parser_value_errors_as_parse_failure(
+    tmp_path: Path,
+) -> None:
+    class ParserFailureReader:
+        async def read(self, url: str) -> dict[str, Any]:
+            raise ValueError("HTML parser rejected malformed content")
+
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=ParserFailureReader(),
+        backend=SimpleNamespace(),
+        api_key="",
+        hf_token="",
+    )
+    async with Client(build_server(settings)) as client:
+        result = await client.call_tool("read_webpage", {"url": "https://example.test/article"})
+
+    assert result.is_error is True
+    assert '"category":"parse_failure"' in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_http_reader_classifies_content_decode_errors_as_parse_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with httpx.AsyncClient() as client:
+        reader = HTTPWebReader(client=client)
+
+        async def fail_to_decode(url: str) -> dict[str, Any]:
+            raise httpx.DecodingError("raw body must not escape")
+
+        monkeypatch.setattr(reader, "_read_once", fail_to_decode)
+        with pytest.raises(WebpageError) as caught:
+            await reader.read("https://example.test/article")
+
+    assert caught.value.category == "parse_failure"
+    assert caught.value.retryable is False
+    assert "raw body" not in str(caught.value)
 
 
 @pytest.mark.asyncio
