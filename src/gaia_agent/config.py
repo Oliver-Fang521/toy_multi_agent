@@ -3,10 +3,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 class RunConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     openai_api_key: SecretStr
     hf_token: SecretStr
     model: str = "deepseek-v4-flash"
@@ -20,8 +22,17 @@ class RunConfig(BaseModel):
     votes: int = 1
     output_dir: Path = Path("results/gaia-15-seed42")
     resume: bool = False
-    langfuse_input_cost_per_million: Decimal | None = None
-    langfuse_output_cost_per_million: Decimal | None = None
+    provider_max_attempts: int = Field(default=4, ge=1, le=10)
+    provider_backoff_base: float = Field(default=0.5, gt=0, le=30, allow_inf_nan=False)
+    private_notebook_max_bytes: int = Field(default=65_536, ge=1, le=1_048_576)
+    stage_context_max_bytes: int = Field(default=24_576, ge=1, le=1_048_576)
+    search_circuit_cooldown: float = Field(default=30.0, ge=0, le=3_600, allow_inf_nan=False)
+    langfuse_input_cost_per_million: Decimal | None = Field(
+        default=None, ge=0, le=Decimal(1_000_000), allow_inf_nan=False
+    )
+    langfuse_output_cost_per_million: Decimal | None = Field(
+        default=None, ge=0, le=Decimal(1_000_000), allow_inf_nan=False
+    )
 
     @field_validator("langfuse_input_cost_per_million", "langfuse_output_cost_per_million")
     @classmethod
@@ -56,6 +67,13 @@ class RunConfig(BaseModel):
             "votes": os.environ.get("GAIA_VOTES", "1"),
             "output_dir": os.environ.get("GAIA_OUTPUT_DIR", "results/gaia-15-seed42"),
             "resume": os.environ.get("GAIA_RESUME", "false"),
+            "provider_max_attempts": os.environ.get("GAIA_PROVIDER_MAX_ATTEMPTS", "4"),
+            "provider_backoff_base": os.environ.get("GAIA_PROVIDER_BACKOFF_BASE", "0.5"),
+            "private_notebook_max_bytes": os.environ.get(
+                "GAIA_PRIVATE_NOTEBOOK_MAX_BYTES", "65536"
+            ),
+            "stage_context_max_bytes": os.environ.get("GAIA_STAGE_CONTEXT_MAX_BYTES", "24576"),
+            "search_circuit_cooldown": os.environ.get("GAIA_SEARCH_CIRCUIT_COOLDOWN", "30"),
             "langfuse_input_cost_per_million": os.environ.get(
                 "LANGFUSE_INPUT_COST_PER_MILLION"
             ),

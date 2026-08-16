@@ -5,10 +5,11 @@ from typing import Any
 
 import httpx
 import pytest
-from openai import BadRequestError, RateLimitError
+from openai import APIConnectionError, BadRequestError, RateLimitError
 
 from gaia_agent.models import Usage
 from gaia_agent.providers import DeepSeekProvider, ModelRequest, ToolSpec
+from gaia_agent.reliability import RetryPolicy
 
 
 def test_deepseek_provider_declares_no_native_vision_support() -> None:
@@ -248,6 +249,37 @@ async def test_deepseek_provider_retries_transient_error_once(
 
     assert response.parsed == {"answer": "42"}
     assert len(fake_chat_client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_applies_configured_retry_attempts_and_backoff(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.extend(
+        [
+            APIConnectionError(
+                request=httpx.Request("POST", "https://api.deepseek.com/chat/completions")
+            ),
+            _status_error(RateLimitError, 429),
+            _chat_response(_chat_message(content='{"answer":"42"}')),
+        ]
+    )
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    response = await DeepSeekProvider(
+        fake_chat_client,
+        "deepseek-v4-flash",
+        retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=1.25),
+        sleep=sleep,
+        jitter=lambda: 0.0,
+    ).complete(model_request())
+
+    assert response.parsed == {"answer": "42"}
+    assert len(fake_chat_client.requests) == 3
+    assert delays == [1.25, 2.5]
 
 
 @pytest.mark.asyncio

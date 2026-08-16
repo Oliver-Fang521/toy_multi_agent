@@ -1034,6 +1034,11 @@ def _settings_from_env() -> MCPServerSettings:
     serper_api_key = os.environ.get("SERPER_API_KEY", "")
     serpapi_api_key = os.environ.get("SERPAPI_API_KEY", "")
     timeout_seconds = float(os.environ.get("GAIA_TIMEOUT_SECONDS", "300"))
+    provider_retry_policy = RetryPolicy(
+        max_attempts=int(os.environ.get("GAIA_PROVIDER_MAX_ATTEMPTS", "4")),
+        base_delay_seconds=float(os.environ.get("GAIA_PROVIDER_BACKOFF_BASE", "0.5")),
+    )
+    search_circuit_cooldown = float(os.environ.get("GAIA_SEARCH_CIRCUIT_COOLDOWN", "30"))
     fake_backend = os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1"
     if fake_backend:
         backend: HostedBackend = FakeHostedBackend(api_key, hf_token, attachment_reader)
@@ -1063,7 +1068,12 @@ def _settings_from_env() -> MCPServerSettings:
                     serpapi_api_key, search_client, timeout_seconds=min(timeout_seconds, 20.0)
                 )
             )
-        search_provider = SearchProviderChain(search_providers, RetryPolicy(), time.monotonic)
+        search_provider = SearchProviderChain(
+            search_providers,
+            provider_retry_policy,
+            time.monotonic,
+            circuit_cooldown_seconds=search_circuit_cooldown,
+        )
     return MCPServerSettings(
         task_root=task_root,
         attachment_reader=attachment_reader,

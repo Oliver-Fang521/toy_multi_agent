@@ -66,6 +66,28 @@ environment variable, which overrides the built-in default.
 | `--output-dir` | `GAIA_OUTPUT_DIR` | `results/gaia-15-seed42` |
 | `--resume` / `--no-resume` | `GAIA_RESUME` | `false` |
 
+The following reliability settings are environment-only so every stage of a run uses the same
+bounded behavior. They are included in the public manifest (except that unset optional cost rates
+are omitted), so `--resume` rejects a run whose behavior-defining configuration has changed.
+
+| Environment variable | Default | Bound and purpose |
+| --- | --- | --- |
+| `GAIA_PROVIDER_MAX_ATTEMPTS` | `4` | 1–10 attempts for recoverable provider and search-provider calls |
+| `GAIA_PROVIDER_BACKOFF_BASE` | `0.5` | Positive finite base delay, at most 30 seconds |
+| `GAIA_PRIVATE_NOTEBOOK_MAX_BYTES` | `65536` | Per-entry private checkpoint cap, at most 1 MiB |
+| `GAIA_STAGE_CONTEXT_MAX_BYTES` | `24576` | Per-specialist and Critic context cap, at most 1 MiB |
+| `GAIA_SEARCH_CIRCUIT_COOLDOWN` | `30` | Finite search-provider circuit-open cooldown, 0–3600 seconds |
+| `LANGFUSE_INPUT_COST_PER_MILLION` | unset | Optional non-negative finite input-token rate, capped at 1,000,000 |
+| `LANGFUSE_OUTPUT_COST_PER_MILLION` | unset | Optional non-negative finite output-token rate, capped at 1,000,000 |
+
+The primary provider is the OpenAI Responses adapter. Hosted web search is attempted first, then
+the configured Serper and SerpAPI fallbacks; each provider is retried within the configured budget
+and opens a short circuit after repeated failures. The model adapter retries recoverable connection,
+timeout, rate-limit, and internal-server errors in place; structured stage responses get one local
+schema/semantic repair; attachment-ineligible visual routes normalize before dispatch; and the
+Critic receives the surviving normalized route. These recovery steps are bounded and never expose
+tool content or credentials in public artifacts.
+
 The sample size must be at least three and divisible by three so the run contains equal counts from
 GAIA levels 1, 2, and 3. Votes must be a positive odd number. Run `uv run gaia-agent evaluate
 --help` for the current CLI surface.
@@ -92,6 +114,11 @@ answers, candidate text, attachments, prompts, model output, tool arguments/resu
 are swallowed and cannot change scoring or retries. Call `flush` at run completion is handled by
 the runner; no Langfuse data is written into the public result artifacts.
 
+Each root trace closes with the scorer-facing outcome fields `answer_present`, `evidence_count`,
+`critic_verdict`, `error_category`, `correct`, provider retry count, tool success/failure counts,
+latencies, and checkpoint-restoration state. The optional cost rates configure Langfuse generation
+cost accounting only; they are not credentials.
+
 ## Run and verify
 
 A bounded three-task smoke run selects one task per level and limits each attempt to one planned
@@ -116,11 +143,22 @@ and safe tool-shape metadata. They exclude GAIA question text, reference answers
 content and paths, credentials, prompts, and hidden reasoning. `results/` is gitignored as an
 additional safeguard.
 
+Private research-notebook checkpoints are kept in a sibling hidden directory derived from the public
+output directory: `results/gaia-luna-max` uses `results/.gaia-luna-max.private`. They are replay aids
+only and are not part of the report, manifest, predictions, or audit artifacts.
+
 To continue an interrupted run, repeat the same command and output directory with `--resume` (or
 set `GAIA_RESUME=true`). The persisted selection and all run-defining configuration must match;
 complete valid checkpoints are skipped and incomplete checkpoints are repaired. Re-run
 `verify-results` after completion to check schemas, privacy allowlists, selection balance, audit
 sequence integrity, prediction completeness, and recomputed summary/report metrics.
+
+For a production Luna/max evaluation, configure credentials externally and run:
+
+```console
+GAIA_MODEL=gpt-5.6-luna GAIA_REASONING_EFFORT=max \
+uv run gaia-agent evaluate --sample-size 15 --seed 42 --output-dir results/gaia-luna-max
+```
 
 ## Interpretation
 

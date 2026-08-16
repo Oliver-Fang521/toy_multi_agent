@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import random
+from collections.abc import Awaitable, Callable
 from typing import Any
-
-from openai import APITimeoutError, InternalServerError, RateLimitError
 
 from gaia_agent.models import Usage
 from gaia_agent.observability import Observability
@@ -18,6 +19,7 @@ from gaia_agent.providers.base import (
     serialize_tool_output,
 )
 from gaia_agent.providers.openai import _extract_json_object
+from gaia_agent.reliability import RetryPolicy, is_transient_provider_error, retry_delay
 
 
 def _content_to_text(content: Any) -> str:
@@ -159,10 +161,16 @@ class DeepSeekProvider:
         model: str = "deepseek-v4-flash",
         *,
         observability: Observability | None = None,
+        retry_policy: RetryPolicy | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        jitter: Callable[[], float] = random.random,
     ) -> None:
         self._client = client.with_options(max_retries=0)
         self._model = model
         self._observability = observability
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._sleep = sleep
+        self._jitter = jitter
 
     async def complete(
         self, request: ModelRequest, executor: ToolExecutor | None = None
@@ -316,10 +324,14 @@ class DeepSeekProvider:
         )
 
     async def _create_with_retry(self, **kwargs: Any) -> Any:
-        for attempt in range(2):
+        for attempt in range(1, self._retry_policy.max_attempts + 1):
             try:
                 return await self._client.chat.completions.create(**kwargs)
-            except (RateLimitError, APITimeoutError, InternalServerError):
-                if attempt == 1:
+            except Exception as error:
+                if (
+                    not is_transient_provider_error(error)
+                    or attempt == self._retry_policy.max_attempts
+                ):
                     raise
-        raise AssertionError("retry loop did not return or raise")
+                await self._sleep(retry_delay(self._retry_policy, attempt, self._jitter))
+        raise AssertionError("bounded provider retry did not return or raise")

@@ -8,6 +8,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
@@ -181,7 +182,7 @@ class RunManifest(FrozenModel):
     dataset_revision: str
     dataset_configuration: str = "2023_all"
     dataset_split: str = "validation"
-    limits: dict[str, int | float] = Field(default_factory=dict)
+    limits: dict[str, int | float | Decimal] = Field(default_factory=dict)
     package_versions: dict[str, str] = Field(default_factory=dict)
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -207,9 +208,24 @@ class RunManifest(FrozenModel):
             ("dataset_split", self.dataset_split),
         ):
             _validate_public_identifier(value_name, value)
-        if set(self.limits) - {"max_steps", "max_tool_calls", "timeout_seconds", "votes"}:
+        if set(self.limits) - {
+            "max_steps",
+            "max_tool_calls",
+            "timeout_seconds",
+            "votes",
+            "provider_max_attempts",
+            "provider_backoff_base",
+            "private_notebook_max_bytes",
+            "stage_context_max_bytes",
+            "search_circuit_cooldown",
+            "langfuse_input_cost_per_million",
+            "langfuse_output_cost_per_million",
+        }:
             raise ValueError("limits contains an unsupported public key")
-        if any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in self.limits.values()):
+        if any(
+            not isinstance(value, (int, float, Decimal)) or isinstance(value, bool)
+            for value in self.limits.values()
+        ):
             raise ValueError("limits values must be numeric")
         if any(
             not _PUBLIC_PACKAGE_NAME_PATTERN.fullmatch(name)

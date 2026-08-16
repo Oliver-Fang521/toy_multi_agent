@@ -43,6 +43,7 @@ from gaia_agent.observability import Observability, ObservabilityConfig, TaskTra
 from gaia_agent.orchestrator import Orchestrator, choose_majority
 from gaia_agent.persistence import RunManifest, RunStore
 from gaia_agent.providers import DeepSeekProvider, ModelProvider, OpenAIProvider
+from gaia_agent.reliability import RetryPolicy
 from gaia_agent.reporting import (
     EvaluationSummary,
     LevelMetrics,
@@ -402,6 +403,10 @@ def build_runner(
                 client,
                 model=config.model,
                 observability=observability,
+                retry_policy=RetryPolicy(
+                    max_attempts=config.provider_max_attempts,
+                    base_delay_seconds=config.provider_backoff_base,
+                ),
             )
             provider_name = "deepseek"
         else:
@@ -410,6 +415,10 @@ def build_runner(
                 model=config.model,
                 use_previous_response_id=base_url is None,
                 observability=observability,
+                retry_policy=RetryPolicy(
+                    max_attempts=config.provider_max_attempts,
+                    base_delay_seconds=config.provider_backoff_base,
+                ),
             )
             provider_name = "openai"
         runtime = ProviderRuntime(
@@ -439,27 +448,32 @@ def build_runner(
             provider,
             reasoning_effort=config.reasoning_effort,
             max_tool_calls=agent_tool_calls,
+            max_context_bytes=config.stage_context_max_bytes,
         ),
         SpecialistName.COMPUTATION: ComputationAgent(
             provider,
             reasoning_effort=config.reasoning_effort,
             max_tool_calls=agent_tool_calls,
+            max_context_bytes=config.stage_context_max_bytes,
         ),
         SpecialistName.FILE: FileAnalysisAgent(
             provider,
             reasoning_effort=config.reasoning_effort,
             max_tool_calls=agent_tool_calls,
+            max_context_bytes=config.stage_context_max_bytes,
         ),
         SpecialistName.VISUAL: VisualAgent(
             provider,
             reasoning_effort=config.reasoning_effort,
             max_tool_calls=agent_tool_calls,
+            max_context_bytes=config.stage_context_max_bytes,
         ),
     }
     critic = CriticAgent(
         provider,
         reasoning_effort=config.reasoning_effort,
         max_tool_calls=agent_tool_calls,
+        max_context_bytes=config.stage_context_max_bytes,
     )
 
     def orchestrator_factory(task: GaiaTask) -> Orchestrator:
@@ -475,7 +489,11 @@ def build_runner(
             ),
             config=config,
             observability=observability,
-            notebook=ResearchNotebook(_private_run_root(config.output_dir), task.task_id),
+            notebook=ResearchNotebook(
+                _private_run_root(config.output_dir),
+                task.task_id,
+                max_entry_bytes=config.private_notebook_max_bytes,
+            ),
         )
 
     return EvaluationRunner(
@@ -594,6 +612,21 @@ def _manifest_for(
             "max_tool_calls": config.max_tool_calls,
             "timeout_seconds": config.timeout_seconds,
             "votes": config.votes,
+            "provider_max_attempts": config.provider_max_attempts,
+            "provider_backoff_base": config.provider_backoff_base,
+            "private_notebook_max_bytes": config.private_notebook_max_bytes,
+            "stage_context_max_bytes": config.stage_context_max_bytes,
+            "search_circuit_cooldown": config.search_circuit_cooldown,
+            **(
+                {"langfuse_input_cost_per_million": config.langfuse_input_cost_per_million}
+                if config.langfuse_input_cost_per_million is not None
+                else {}
+            ),
+            **(
+                {"langfuse_output_cost_per_million": config.langfuse_output_cost_per_million}
+                if config.langfuse_output_cost_per_million is not None
+                else {}
+            ),
         },
         package_versions=_package_versions(),
         started_at=started_at or datetime.now(UTC),

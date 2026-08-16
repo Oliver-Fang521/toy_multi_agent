@@ -224,6 +224,64 @@ def test_build_runner_rejects_provider_only_injection_before_factory_or_store(
     assert not (tmp_path / "manifest.json").exists()
 
 
+def test_build_runner_applies_configured_retry_policy_to_deepseek(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[object] = []
+
+    class _Client:
+        def with_options(self, *, max_retries: int) -> _Client:
+            assert max_retries == 0
+            return self
+
+    class _DeepSeekProvider:
+        supports_vision = False
+
+        def __init__(self, *_: object, retry_policy: object, **__: object) -> None:
+            captured.append(retry_policy)
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.example/v1")
+    monkeypatch.setattr(runner_module, "AsyncOpenAI", lambda **_: _Client())
+    monkeypatch.setattr(runner_module, "DeepSeekProvider", _DeepSeekProvider)
+
+    build_runner(_config(tmp_path, provider_max_attempts=6, provider_backoff_base=1.25))
+
+    assert len(captured) == 1
+    policy = captured[0]
+    assert policy.max_attempts == 6
+    assert policy.base_delay_seconds == 1.25
+
+
+def test_build_runner_applies_configured_retry_policy_to_openai(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[object] = []
+
+    class _Client:
+        def with_options(self, *, max_retries: int) -> _Client:
+            assert max_retries == 0
+            return self
+
+    class _OpenAIProvider:
+        supports_vision = True
+
+        def __init__(self, *_: object, retry_policy: object, **__: object) -> None:
+            captured.append(retry_policy)
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setattr(runner_module, "AsyncOpenAI", lambda **_: _Client())
+    monkeypatch.setattr(runner_module, "OpenAIProvider", _OpenAIProvider)
+
+    build_runner(_config(tmp_path, provider_max_attempts=6, provider_backoff_base=1.25))
+
+    assert len(captured) == 1
+    policy = captured[0]
+    assert policy.max_attempts == 6
+    assert policy.base_delay_seconds == 1.25
+
+
 @pytest.mark.parametrize(
     ("provider_name", "evaluation_mode"),
     [
@@ -309,6 +367,47 @@ def test_private_notebook_is_a_sibling_and_never_enters_public_artifacts(tmp_pat
         path.read_text(encoding="utf-8") for path in private_root.rglob("*.json")
     )
     assert verify_run_directory(output_dir).total == 3
+
+
+def test_manifest_persists_reliability_limits_for_safe_resume(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    tasks, revision = _fixture_tasks()
+    runner = build_runner(
+        _config(
+            output_dir,
+            provider_max_attempts=6,
+            provider_backoff_base=1.25,
+            private_notebook_max_bytes=80_000,
+            stage_context_max_bytes=32_768,
+            search_circuit_cooldown=90.0,
+            langfuse_input_cost_per_million="0.25",
+            langfuse_output_cost_per_million="1.50",
+        ),
+        dataset_loader=lambda _config: (tasks, revision),
+        provider_factory=lambda _config: ProviderRuntime(
+            provider=_OfflineProvider(),
+            provider_name="offline-fixture",
+            evaluation_mode="test",
+            fake_mcp_backend=True,
+        ),
+    )
+
+    asyncio.run(runner.run())
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["limits"] == {
+        "max_steps": 8,
+        "max_tool_calls": 24,
+        "timeout_seconds": 300.0,
+        "votes": 1,
+        "provider_max_attempts": 6,
+        "provider_backoff_base": 1.25,
+        "private_notebook_max_bytes": 80_000,
+        "stage_context_max_bytes": 32_768,
+        "search_circuit_cooldown": 90.0,
+        "langfuse_input_cost_per_million": "0.25",
+        "langfuse_output_cost_per_million": "1.50",
+    }
 
 
 def test_evaluate_cli_runs_four_planes_over_real_stdio_and_writes_reports(
