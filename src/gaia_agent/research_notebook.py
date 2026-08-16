@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -43,9 +44,10 @@ class ResearchNotebook:
         try:
             self._assert_private_directory(self.root)
             self._assert_private_directory(self._task_root)
-            if entry_path.is_symlink() or entry_path.stat().st_size > self.max_entry_bytes:
+            payload = _read_bounded_entry(entry_path, self.max_entry_bytes)
+            if payload is None:
                 return None
-            raw_entry = json.loads(entry_path.read_text(encoding="utf-8"))
+            raw_entry = json.loads(payload)
             entry = _parse_entry(raw_entry)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -122,6 +124,26 @@ def _reject_symlink_components(path: Path) -> None:
         current /= component
         if current.is_symlink():
             raise ValueError("notebook storage must not traverse symlinks")
+
+
+def _read_bounded_entry(path: Path, max_entry_bytes: int) -> bytes | None:
+    try:
+        initial_state = os.lstat(path)
+        if not stat.S_ISREG(initial_state.st_mode) or initial_state.st_size > max_entry_bytes:
+            return None
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        opened_state = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_state.st_mode) or opened_state.st_size > max_entry_bytes:
+            return None
+        payload = os.read(descriptor, max_entry_bytes + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    return payload if len(payload) <= max_entry_bytes else None
 
 
 def _signature(tool: str, arguments: Mapping[str, Any]) -> str:

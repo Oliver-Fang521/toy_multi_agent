@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -101,3 +104,27 @@ def test_notebook_treats_existing_oversized_entry_as_a_cache_miss(tmp_path: Path
 
     assert entry.stat().st_size > notebook.max_entry_bytes
     assert notebook.lookup("web_search", arguments) is None
+
+
+def test_notebook_treats_a_nonregular_entry_as_a_cache_miss(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    arguments = {"query": "q"}
+    notebook.record("web_search", arguments, {"answer": "a"})
+    entry = next((tmp_path / "private").rglob("*.json"))
+    entry_payload = entry.read_bytes()
+    entry.unlink()
+    os.mkfifo(entry)
+    reader = os.open(entry, os.O_RDONLY | os.O_NONBLOCK)
+    def write_payload() -> None:
+        with entry.open("wb") as writer:
+            writer.write(entry_payload)
+            writer.flush()
+            time.sleep(0.05)
+
+    writer = threading.Thread(target=write_payload)
+    writer.start()
+    try:
+        assert notebook.lookup("web_search", arguments) is None
+    finally:
+        writer.join()
+        os.close(reader)
