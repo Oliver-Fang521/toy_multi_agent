@@ -54,6 +54,9 @@ _SAFE_METADATA_KEYS = frozenset(
         "result_key_count",
         "argument_key_count",
         "tool_call_count",
+        "provider_attempt_count",
+        "provider_retry_count",
+        "retry_category",
     }
 )
 _SAFE_LIST_KEYS = frozenset()
@@ -85,6 +88,9 @@ _SAFE_SUMMARY_KEYS = frozenset(
         "parsed",
         "refused",
         "tool_call_count",
+        "provider_attempt_count",
+        "provider_retry_count",
+        "retry_category",
     }
 )
 _CURRENT_TRACE: ContextVar[TaskTrace | None] = ContextVar("gaia_langfuse_trace", default=None)

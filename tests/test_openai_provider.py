@@ -7,6 +7,7 @@ import httpx
 import pytest
 from mcp import Client
 from openai import (
+    APIConnectionError,
     APITimeoutError,
     AuthenticationError,
     BadRequestError,
@@ -23,6 +24,7 @@ from gaia_agent.models import Usage
 from gaia_agent.observability import Observability, ObservabilityConfig
 from gaia_agent.orchestrator import _RepeatedToolCall, _ToolBudgetExhausted
 from gaia_agent.providers import ModelRequest, OpenAIProvider, ToolSpec
+from gaia_agent.reliability import RetryPolicy
 
 
 def test_openai_provider_declares_native_vision_support() -> None:
@@ -315,6 +317,8 @@ async def test_openai_provider_records_safe_generation_metadata(
         "parsed": True,
         "refused": False,
         "tool_call_count": 0,
+        "provider_attempt_count": 1,
+        "provider_retry_count": 0,
         "status": "ok",
     }
     assert generation.updates[-1]["output"]["reasoning_summary"] == {
@@ -322,12 +326,70 @@ async def test_openai_provider_records_safe_generation_metadata(
         "parsed": True,
         "refused": False,
         "tool_call_count": 0,
+        "provider_attempt_count": 1,
+        "provider_retry_count": 0,
     }
     assert generation.updates[-1]["usage_details"] == {
         "input_tokens": 3,
         "output_tokens": 4,
         "reasoning_tokens": 1,
         "total_tokens": 7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_records_safe_generation_retry_metadata() -> None:
+    client = FakeResponsesClient()
+    client.queued.extend(
+        [
+            APIConnectionError(request=httpx.Request("POST", "https://api.openai.com/v1/responses")),
+            _response("resp-retry-metadata", []),
+        ]
+    )
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "task-1",
+        level=1,
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        run_index=0,
+        evaluation_mode="test",
+    )
+
+    async def sleep(_delay: float) -> None:
+        return None
+
+    await OpenAIProvider(
+        client,
+        model="gpt-5.6-sol",
+        observability=observability,
+        sleep=sleep,
+        jitter=lambda: 0.0,
+    ).complete(model_request())
+    trace.close()
+
+    generation = trace_client.observations[-1]
+    assert generation.updates[-1]["metadata"] == {
+        "parsed": False,
+        "refused": False,
+        "tool_call_count": 0,
+        "provider_attempt_count": 2,
+        "provider_retry_count": 1,
+        "retry_category": "APIConnectionError",
+        "status": "ok",
+    }
+    assert generation.updates[-1]["output"]["reasoning_summary"] == {
+        "decision": "unparsed",
+        "parsed": False,
+        "refused": False,
+        "tool_call_count": 0,
+        "provider_attempt_count": 2,
+        "provider_retry_count": 1,
+        "retry_category": "APIConnectionError",
     }
 @pytest.mark.asyncio
 async def test_openai_provider_stateless_loop_resends_full_history_without_previous_id(
@@ -850,6 +912,60 @@ async def test_openai_provider_retries_transient_failures_once(transient_error: 
     await OpenAIProvider(client, "gpt-5.6-sol").complete(model_request())
 
     assert len(client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_retries_initial_connection_error_in_place() -> None:
+    client = FakeResponsesClient()
+    client.queued.extend(
+        [
+            APIConnectionError(request=httpx.Request("POST", "https://api.openai.com/v1/responses")),
+            _response("resp-retry", []),
+        ]
+    )
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    await OpenAIProvider(
+        client,
+        "gpt-5.6-sol",
+        retry_policy=RetryPolicy(max_attempts=4),
+        sleep=sleep,
+        jitter=lambda: 0.0,
+    ).complete(model_request())
+
+    assert len(client.requests) == 2
+    assert delays == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_retries_failed_continuation_without_reexecuting_tool() -> None:
+    client = FakeResponsesClient()
+    client.queue_function_call("execute_python", '{"code":"print(6*7)"}', "call-1")
+    client.queued.append(
+        APIConnectionError(request=httpx.Request("POST", "https://api.openai.com/v1/responses"))
+    )
+    client.queue_text('{"answer":"42"}')
+    executor = RecordingExecutor({"stdout": "42"})
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    response = await OpenAIProvider(
+        client,
+        "gpt-5.6-sol",
+        retry_policy=RetryPolicy(max_attempts=4),
+        sleep=sleep,
+        jitter=lambda: 0.0,
+    ).complete(model_request(), executor)
+
+    assert len(client.requests) == 3
+    assert executor.calls == [("execute_python", {"code": "print(6*7)"})]
+    assert response.parsed == {"answer": "42"}
+    assert delays == [0.5]
 
 
 @pytest.mark.asyncio

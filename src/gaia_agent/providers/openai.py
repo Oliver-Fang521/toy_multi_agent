@@ -1,7 +1,10 @@
+import asyncio
 import json
+import random
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from typing import Any
-
-from openai import APITimeoutError, InternalServerError, RateLimitError
 
 from gaia_agent.models import Usage
 from gaia_agent.observability import Observability
@@ -13,6 +16,32 @@ from gaia_agent.providers.base import (
     ToolEvent,
     ToolExecutor,
     serialize_tool_output,
+)
+from gaia_agent.reliability import (
+    RetryPolicy,
+    is_transient_provider_error,
+    retry_delay,
+)
+
+
+@dataclass
+class _ProviderRetryMetadata:
+    attempt_count: int = 0
+    retry_count: int = 0
+    retry_category: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "provider_attempt_count": self.attempt_count,
+            "provider_retry_count": self.retry_count,
+        }
+        if self.retry_category is not None:
+            metadata["retry_category"] = self.retry_category
+        return metadata
+
+
+_CURRENT_RETRY_METADATA: ContextVar[_ProviderRetryMetadata | None] = ContextVar(
+    "gaia_provider_retry_metadata", default=None
 )
 
 
@@ -71,15 +100,25 @@ class OpenAIProvider:
         *,
         use_previous_response_id: bool = True,
         observability: Observability | None = None,
+        retry_policy: RetryPolicy | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        jitter: Callable[[], float] = random.random,
     ) -> None:
         self._client = client.with_options(max_retries=0)
         self._model = model
         self._use_previous_response_id = use_previous_response_id
         self._observability = observability
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._sleep = sleep
+        self._jitter = jitter
 
     async def complete(
         self, request: ModelRequest, executor: ToolExecutor | None = None
     ) -> ModelResponse:
+        retry_metadata = _ProviderRetryMetadata()
+        retry_token: Token[_ProviderRetryMetadata | None] = _CURRENT_RETRY_METADATA.set(
+            retry_metadata
+        )
         trace = self._observability.current_trace() if self._observability else None
         generation = (
             trace.generation(
@@ -90,31 +129,40 @@ class OpenAIProvider:
             else None
         )
         try:
-            response = await self._complete(request, executor)
-        except Exception as error:
+            try:
+                response = await self._complete(request, executor)
+            except Exception as error:
+                if generation is not None:
+                    generation.end(
+                        status="error",
+                        metadata={
+                            "error_type": type(error).__name__,
+                            **retry_metadata.as_dict(),
+                        },
+                        summary=retry_metadata.as_dict(),
+                    )
+                raise
             if generation is not None:
                 generation.end(
-                    status="error",
-                    metadata={"error_type": type(error).__name__},
+                    status="ok",
+                    metadata={
+                        "parsed": response.parsed is not None,
+                        "refused": bool(response.output_text and response.parsed is None),
+                        "tool_call_count": len(response.tool_events),
+                        **retry_metadata.as_dict(),
+                    },
+                    summary={
+                        "decision": "parsed" if response.parsed is not None else "unparsed",
+                        "parsed": response.parsed is not None,
+                        "refused": bool(response.output_text and response.parsed is None),
+                        "tool_call_count": len(response.tool_events),
+                        **retry_metadata.as_dict(),
+                    },
+                    usage=response.usage,
                 )
-            raise
-        if generation is not None:
-            generation.end(
-                status="ok",
-                metadata={
-                    "parsed": response.parsed is not None,
-                    "refused": bool(response.output_text and response.parsed is None),
-                    "tool_call_count": len(response.tool_events),
-                },
-                summary={
-                    "decision": "parsed" if response.parsed is not None else "unparsed",
-                    "parsed": response.parsed is not None,
-                    "refused": bool(response.output_text and response.parsed is None),
-                    "tool_call_count": len(response.tool_events),
-                },
-                usage=response.usage,
-            )
-        return response
+            return response
+        finally:
+            _CURRENT_RETRY_METADATA.reset(retry_token)
 
     async def _complete(
         self, request: ModelRequest, executor: ToolExecutor | None = None
@@ -239,13 +287,28 @@ class OpenAIProvider:
         return await self._create_with_retry(input=input_items, **common)
 
     async def _create_with_retry(self, **kwargs: Any) -> Any:
-        for attempt in range(2):
+        for attempt in range(1, self._retry_policy.max_attempts + 1):
             try:
+                retry_metadata = _CURRENT_RETRY_METADATA.get()
+                if retry_metadata is not None:
+                    retry_metadata.attempt_count += 1
                 return await self._client.responses.create(**kwargs)
-            except (RateLimitError, APITimeoutError, InternalServerError):
-                if attempt == 1:
+            except Exception as error:
+                if (
+                    not is_transient_provider_error(error)
+                    or attempt == self._retry_policy.max_attempts
+                ):
                     raise
-        raise AssertionError("retry loop did not return or raise")
+                self._record_retry(error, attempt)
+                await self._sleep(retry_delay(self._retry_policy, attempt, self._jitter))
+        raise AssertionError("bounded provider retry did not return or raise")
+
+    @staticmethod
+    def _record_retry(error: BaseException, _failed_attempt: int) -> None:
+        retry_metadata = _CURRENT_RETRY_METADATA.get()
+        if retry_metadata is not None:
+            retry_metadata.retry_count += 1
+            retry_metadata.retry_category = type(error).__name__
 
 
 def _aggregate_usage(responses: list[Any]) -> Usage:
