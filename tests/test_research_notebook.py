@@ -21,7 +21,16 @@ from gaia_agent.research_notebook import (
 def _rewrite_with_test_digest(path: Path, **updates: object) -> None:
     entry = json.loads(path.read_text(encoding="utf-8"))
     entry.update(updates)
-    unsigned = {key: value for key, value in entry.items() if key != "integrity_sha256"}
+    integrity_field = (
+        "integrity_hmac_sha256"
+        if "integrity_hmac_sha256" in entry
+        else "integrity_sha256"
+    )
+    unsigned = {
+        key: value
+        for key, value in entry.items()
+        if key not in {"integrity_sha256", "integrity_hmac_sha256"}
+    }
     canonical = json.dumps(
         unsigned,
         sort_keys=True,
@@ -29,7 +38,7 @@ def _rewrite_with_test_digest(path: Path, **updates: object) -> None:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-    entry["integrity_sha256"] = hashlib.sha256(canonical).hexdigest()
+    entry[integrity_field] = hashlib.sha256(canonical).hexdigest()
     path.write_text(json.dumps(entry), encoding="utf-8")
 
 
@@ -87,6 +96,16 @@ def test_notebook_treats_parseable_result_tampering_as_a_cache_miss(tmp_path: Pa
     assert notebook.lookup("web_search", arguments) is None
 
 
+def test_notebook_rejects_result_forged_with_a_recomputed_public_digest(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    arguments = {"query": "q"}
+    notebook.record("web_search", arguments, {"answer": "trusted"})
+    entry = next((tmp_path / "private").rglob("*.json"))
+    _rewrite_with_test_digest(entry, result={"answer": "forged"})
+
+    assert notebook.lookup("web_search", arguments) is None
+
+
 @pytest.mark.parametrize(
     ("field", "stale_value"),
     [
@@ -122,6 +141,7 @@ def test_notebook_does_not_trust_legacy_unsigned_entries(tmp_path: Path) -> None
         "notebook_scope",
         "task_id",
         "integrity_sha256",
+        "integrity_hmac_sha256",
     ):
         raw.pop(key, None)
     entry.write_text(json.dumps(raw), encoding="utf-8")
@@ -139,6 +159,70 @@ def test_notebook_does_not_replay_entry_copied_from_another_run_root(tmp_path: P
     destination.write_bytes(source.read_bytes())
 
     assert second.lookup("web_search", arguments) is None
+
+
+def test_notebook_rejects_cross_run_scope_forged_with_public_digest(tmp_path: Path) -> None:
+    arguments = {"query": "q"}
+    first = ResearchNotebook(tmp_path / "run-one.private", "task-1")
+    first.record("web_search", arguments, {"answer": "first run"})
+    source = next(first.root.rglob("*.json"))
+    second = ResearchNotebook(tmp_path / "run-two.private", "task-1")
+    destination = second.root / "task-1" / source.name
+    destination.write_bytes(source.read_bytes())
+    destination_scope = hashlib.sha256(
+        str(second.root.absolute()).encode("utf-8")
+    ).hexdigest()
+    _rewrite_with_test_digest(
+        destination,
+        notebook_scope=destination_scope,
+        result={"answer": "forged cross-run"},
+    )
+
+    assert second.lookup("web_search", arguments) is None
+
+
+def test_notebook_creates_private_per_run_trust_anchor(tmp_path: Path) -> None:
+    root = tmp_path / "private"
+    ResearchNotebook(root, "task-1")
+    anchor = root / ".trust-anchor"
+
+    assert anchor.is_file()
+    assert stat.S_IMODE(anchor.stat().st_mode) == 0o600
+
+
+def test_notebook_rejects_symlinked_trust_anchor(tmp_path: Path) -> None:
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    target.write_text("do not overwrite", encoding="utf-8")
+    (root / ".trust-anchor").symlink_to(target)
+
+    with pytest.raises(ValueError, match="anchor.*symlink"):
+        ResearchNotebook(root, "task-1")
+
+    assert target.read_text(encoding="utf-8") == "do not overwrite"
+
+
+def test_notebook_rejects_overpermissive_trust_anchor(tmp_path: Path) -> None:
+    root = tmp_path / "private"
+    ResearchNotebook(root, "task-1")
+    anchor = root / ".trust-anchor"
+    assert anchor.is_file()
+    anchor.chmod(0o644)
+
+    with pytest.raises(ValueError, match="anchor.*permissions"):
+        ResearchNotebook(root, "task-2")
+
+
+def test_notebook_rejects_oversized_trust_anchor(tmp_path: Path) -> None:
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    anchor = root / ".trust-anchor"
+    anchor.write_bytes(b"x" * 10_000)
+    anchor.chmod(0o600)
+
+    with pytest.raises(ValueError, match="anchor"):
+        ResearchNotebook(root, "task-1")
 
 
 def test_notebook_rejects_task_ids_that_escape_its_root(tmp_path: Path) -> None:

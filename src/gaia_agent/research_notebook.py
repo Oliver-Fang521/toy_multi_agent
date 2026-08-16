@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import stat
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -21,6 +22,11 @@ _MAX_CARD_DOMAIN_CHARS = 255
 _MAX_CARD_EXCERPT_CHARS = 1_536
 _ENTRY_SCHEMA_VERSION = 1
 _ENTRY_CONTRACT = "gaia.research-notebook.entry"
+_TRUST_ANCHOR_SCHEMA_VERSION = 1
+_TRUST_ANCHOR_CONTRACT = "gaia.research-notebook.trust-anchor"
+_TRUST_ANCHOR_FILENAME = ".trust-anchor"
+_MAX_TRUST_ANCHOR_BYTES = 4_096
+_HMAC_KEY_BYTES = 32
 _ENTRY_BODY_KEYS = frozenset(
     {
         "schema_version",
@@ -33,7 +39,7 @@ _ENTRY_BODY_KEYS = frozenset(
         "created_at",
     }
 )
-_ENTRY_KEYS = _ENTRY_BODY_KEYS | {"integrity_sha256"}
+_ENTRY_KEYS = _ENTRY_BODY_KEYS | {"integrity_hmac_sha256"}
 
 
 @dataclass(frozen=True)
@@ -182,15 +188,25 @@ def _json_size_bytes(value: object) -> int:
 class ResearchNotebook:
     """Store task-scoped tool results outside the public evaluation run."""
 
-    def __init__(self, root: Path, task_id: str, max_entry_bytes: int = 65_536) -> None:
+    def __init__(
+        self,
+        root: Path,
+        task_id: str,
+        max_entry_bytes: int = 65_536,
+        *,
+        run_generation: str = "standalone",
+    ) -> None:
         if max_entry_bytes < 1:
             raise ValueError("max_entry_bytes must be positive")
         if not _is_contained_task_id(task_id):
             raise ValueError("task_id must be a single path component")
+        if not run_generation or len(run_generation.encode("utf-8")) > 512:
+            raise ValueError("run_generation must be non-empty and bounded")
         self.root = Path(root)
         self.task_id = task_id
         self.max_entry_bytes = max_entry_bytes
         self._create_private_directory(self.root)
+        self._integrity_key = self._load_or_rotate_trust_anchor(run_generation)
         self._task_root = self.root / task_id
         self._create_private_directory(self._task_root)
 
@@ -206,6 +222,7 @@ class ResearchNotebook:
             raw_entry = json.loads(payload)
             entry = _parse_entry(
                 raw_entry,
+                integrity_key=self._integrity_key,
                 expected_notebook_scope=_notebook_scope(self.root),
                 expected_task_id=self.task_id,
             )
@@ -230,6 +247,7 @@ class ResearchNotebook:
         )
         payload = _encode_entry(
             entry,
+            integrity_key=self._integrity_key,
             notebook_scope=_notebook_scope(self.root),
             task_id=self.task_id,
         )
@@ -254,6 +272,31 @@ class ResearchNotebook:
 
     def _entry_path(self, signature: str) -> Path:
         return self._task_root / f"{signature}.json"
+
+    def _load_or_rotate_trust_anchor(self, run_generation: str) -> bytes:
+        path = self.root / _TRUST_ANCHOR_FILENAME
+        if path.is_symlink():
+            raise ValueError("notebook trust anchor must not be a symlink")
+        if path.exists():
+            state = os.lstat(path)
+            if stat.S_IMODE(state.st_mode) != 0o600:
+                raise ValueError("notebook trust anchor permissions must be 0600")
+            payload = _read_bounded_entry(
+                path,
+                _MAX_TRUST_ANCHOR_BYTES,
+                required_mode=0o600,
+            )
+            if payload is None:
+                raise ValueError("notebook trust anchor is invalid or oversized")
+            persisted_generation, integrity_key = _parse_trust_anchor(payload)
+            if persisted_generation == run_generation:
+                return integrity_key
+        integrity_key = secrets.token_bytes(_HMAC_KEY_BYTES)
+        payload = _encode_trust_anchor(run_generation, integrity_key)
+        if len(payload) > _MAX_TRUST_ANCHOR_BYTES:
+            raise ValueError("notebook trust anchor is oversized")
+        self._atomic_write(path, payload)
+        return integrity_key
 
     @staticmethod
     def _atomic_write(path: Path, payload: bytes) -> None:
@@ -290,7 +333,12 @@ def _reject_symlink_components(path: Path) -> None:
             raise ValueError("notebook storage must not traverse symlinks")
 
 
-def _read_bounded_entry(path: Path, max_entry_bytes: int) -> bytes | None:
+def _read_bounded_entry(
+    path: Path,
+    max_entry_bytes: int,
+    *,
+    required_mode: int | None = None,
+) -> bytes | None:
     try:
         initial_state = os.lstat(path)
         if not stat.S_ISREG(initial_state.st_mode) or initial_state.st_size > max_entry_bytes:
@@ -301,6 +349,8 @@ def _read_bounded_entry(path: Path, max_entry_bytes: int) -> bytes | None:
     try:
         opened_state = os.fstat(descriptor)
         if not stat.S_ISREG(opened_state.st_mode) or opened_state.st_size > max_entry_bytes:
+            return None
+        if required_mode is not None and stat.S_IMODE(opened_state.st_mode) != required_mode:
             return None
         payload = os.read(descriptor, max_entry_bytes + 1)
     except OSError:
@@ -343,7 +393,7 @@ def _entry_body(
     }
 
 
-def _integrity_digest(body: Mapping[str, Any]) -> str:
+def _integrity_digest(body: Mapping[str, Any], integrity_key: bytes) -> str:
     canonical = json.dumps(
         dict(body),
         sort_keys=True,
@@ -351,15 +401,21 @@ def _integrity_digest(body: Mapping[str, Any]) -> str:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+    return hmac.new(integrity_key, canonical, hashlib.sha256).hexdigest()
 
 
-def _encode_entry(entry: NotebookEntry, *, notebook_scope: str, task_id: str) -> bytes:
+def _encode_entry(
+    entry: NotebookEntry,
+    *,
+    integrity_key: bytes,
+    notebook_scope: str,
+    task_id: str,
+) -> bytes:
     body = _entry_body(entry, notebook_scope=notebook_scope, task_id=task_id)
     return json.dumps(
         {
             **body,
-            "integrity_sha256": _integrity_digest(body),
+            "integrity_hmac_sha256": _integrity_digest(body, integrity_key),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -371,6 +427,7 @@ def _encode_entry(entry: NotebookEntry, *, notebook_scope: str, task_id: str) ->
 def _parse_entry(
     value: object,
     *,
+    integrity_key: bytes,
     expected_notebook_scope: str,
     expected_task_id: str,
 ) -> NotebookEntry:
@@ -384,7 +441,7 @@ def _parse_entry(
     tool = value.get("tool")
     result = value.get("result")
     created_at = value.get("created_at")
-    integrity_sha256 = value.get("integrity_sha256")
+    integrity_hmac_sha256 = value.get("integrity_hmac_sha256")
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
@@ -399,10 +456,13 @@ def _parse_entry(
         raise ValueError("notebook entry task scope does not match")
     if not isinstance(signature, str) or not isinstance(tool, str) or not isinstance(result, dict):
         raise TypeError("notebook entry has invalid fields")
-    if not isinstance(created_at, str) or not isinstance(integrity_sha256, str):
+    if not isinstance(created_at, str) or not isinstance(integrity_hmac_sha256, str):
         raise TypeError("notebook entry has invalid timestamp")
     body = {key: value[key] for key in _ENTRY_BODY_KEYS}
-    if not hmac.compare_digest(integrity_sha256, _integrity_digest(body)):
+    if not hmac.compare_digest(
+        integrity_hmac_sha256,
+        _integrity_digest(body, integrity_key),
+    ):
         raise ValueError("notebook entry failed integrity validation")
     return NotebookEntry(
         signature=signature,
@@ -410,3 +470,46 @@ def _parse_entry(
         result=result,
         created_at=datetime.fromisoformat(created_at),
     )
+
+
+def _encode_trust_anchor(run_generation: str, integrity_key: bytes) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": _TRUST_ANCHOR_SCHEMA_VERSION,
+            "contract": _TRUST_ANCHOR_CONTRACT,
+            "run_generation": run_generation,
+            "hmac_key_hex": integrity_key.hex(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _parse_trust_anchor(payload: bytes) -> tuple[str, bytes]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("notebook trust anchor is malformed") from error
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "contract",
+        "run_generation",
+        "hmac_key_hex",
+    }:
+        raise ValueError("notebook trust anchor contract is invalid")
+    if value.get("schema_version") != _TRUST_ANCHOR_SCHEMA_VERSION:
+        raise ValueError("notebook trust anchor schema is unsupported")
+    if value.get("contract") != _TRUST_ANCHOR_CONTRACT:
+        raise ValueError("notebook trust anchor contract is unsupported")
+    run_generation = value.get("run_generation")
+    key_hex = value.get("hmac_key_hex")
+    if not isinstance(run_generation, str) or not isinstance(key_hex, str):
+        raise TypeError("notebook trust anchor fields are invalid")
+    try:
+        integrity_key = bytes.fromhex(key_hex)
+    except ValueError as error:
+        raise ValueError("notebook trust anchor key is invalid") from error
+    if len(integrity_key) != _HMAC_KEY_BYTES:
+        raise ValueError("notebook trust anchor key is invalid")
+    return run_generation, integrity_key

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from collections import defaultdict, deque
 from datetime import UTC, datetime
 from pathlib import Path
@@ -578,12 +579,13 @@ def test_private_notebook_is_a_sibling_and_never_enters_public_artifacts(tmp_pat
             fake_mcp_backend=True,
         ),
     )
-    notebook = runner._orchestrator_factory(tasks[0])._notebook
-    assert notebook is not None
     sentinel = "https://private.example/sentinel-research"
-    notebook.record("unused_private_tool", {"query": sentinel}, {"private_text": sentinel})
 
     asyncio.run(runner.run())
+
+    notebook = runner._orchestrator_factory(tasks[0])._notebook
+    assert notebook is not None
+    notebook.record("unused_private_tool", {"query": sentinel}, {"private_text": sentinel})
 
     private_root = _private_run_root(output_dir)
     assert private_root == tmp_path / ".run.private"
@@ -596,6 +598,38 @@ def test_private_notebook_is_a_sibling_and_never_enters_public_artifacts(tmp_pat
         path.read_text(encoding="utf-8") for path in private_root.rglob("*.json")
     )
     assert verify_run_directory(output_dir).total == 3
+
+
+def test_new_run_at_same_path_rotates_private_notebook_generation(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    tasks, revision = _fixture_tasks()
+
+    def make_runner() -> EvaluationRunner:
+        return build_runner(
+            _config(output_dir),
+            dataset_loader=lambda _config: (tasks, revision),
+            provider_factory=lambda _config: ProviderRuntime(
+                provider=_OfflineProvider(),
+                provider_name="offline-fixture",
+                evaluation_mode="test",
+                fake_mcp_backend=True,
+            ),
+        )
+
+    asyncio.run(make_runner().run())
+    first_manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    private_root = _private_run_root(output_dir)
+    assert list(private_root.rglob("*.json"))
+    shutil.rmtree(output_dir)
+
+    asyncio.run(make_runner().run())
+
+    second_manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert second_manifest["started_at"] != first_manifest["started_at"]
+    second_audit = "".join(
+        path.read_text(encoding="utf-8") for path in output_dir.rglob("audit.jsonl")
+    )
+    assert '"event_type":"tool_call_restored"' not in second_audit
 
 
 def test_manifest_persists_reliability_limits_for_safe_resume(tmp_path: Path) -> None:
@@ -1055,6 +1089,11 @@ def test_resume_skips_complete_records_and_plain_append_repairs_incomplete_recor
     ]
     assert len(audit_sequences) > original_audit_count
     assert audit_sequences == list(range(1, len(audit_sequences) + 1))
+    resumed_events = [
+        json.loads(line)["event_type"]
+        for line in audit_path.read_text(encoding="utf-8").splitlines()[original_audit_count:]
+    ]
+    assert "tool_call_restored" in resumed_events
 
 
 def test_outputs_stay_contained_and_exclude_secret_and_gated_fields(

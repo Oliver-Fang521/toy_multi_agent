@@ -108,6 +108,7 @@ DatasetLoader = Callable[[RunConfig], tuple[list[GaiaTask], str]]
 OrchestratorFactory = Callable[[GaiaTask], TaskOrchestrator]
 Sleep = Callable[[float], Awaitable[None]]
 ProviderFactory = Callable[[RunConfig], "ProviderRuntime"]
+RunOpened = Callable[[RunManifest], None]
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,7 @@ class EvaluationRunner:
         provider_name: str = "injected",
         evaluation_mode: Literal["production", "test"] = "test",
         observability: Observability | None = None,
+        run_opened: RunOpened | None = None,
     ) -> None:
         self._config = config
         self._dataset_loader = dataset_loader
@@ -148,6 +150,7 @@ class EvaluationRunner:
         self._provider_name = provider_name
         self._evaluation_mode = evaluation_mode
         self._observability = observability or Observability()
+        self._run_opened = run_opened
         self._last_flush_ok: bool | None = None
 
     @property
@@ -175,6 +178,8 @@ class EvaluationRunner:
             provider_name=self._provider_name,
             evaluation_mode=self._evaluation_mode,
         )
+        if self._run_opened is not None:
+            self._run_opened(store.manifest)
 
         completed_predictions = {prediction.task_id: prediction for prediction in store.load_predictions()}
         for task in selected:
@@ -479,8 +484,23 @@ def build_runner(
         max_tool_calls=agent_tool_calls,
         max_context_bytes=config.stage_context_max_bytes,
     )
+    notebook_generation: str | None = None
+
+    def bind_notebook_generation(manifest: RunManifest) -> None:
+        nonlocal notebook_generation
+        notebook_generation = manifest.started_at.astimezone(UTC).isoformat()
 
     def orchestrator_factory(task: GaiaTask) -> Orchestrator:
+        notebook = (
+            ResearchNotebook(
+                _private_run_root(config.output_dir),
+                task.task_id,
+                max_entry_bytes=config.private_notebook_max_bytes,
+                run_generation=notebook_generation,
+            )
+            if notebook_generation is not None
+            else None
+        )
         return Orchestrator(
             planner=planner,
             specialists=specialists,
@@ -493,11 +513,7 @@ def build_runner(
             ),
             config=config,
             observability=observability,
-            notebook=ResearchNotebook(
-                _private_run_root(config.output_dir),
-                task.task_id,
-                max_entry_bytes=config.private_notebook_max_bytes,
-            ),
+            notebook=notebook,
         )
 
     return EvaluationRunner(
@@ -507,6 +523,7 @@ def build_runner(
         provider_name=runtime.provider_name,
         evaluation_mode=runtime.evaluation_mode,
         observability=observability,
+        run_opened=bind_notebook_generation,
     )
 
 
