@@ -10,6 +10,32 @@ class ToolCallError(RuntimeError):
     """A recoverable tool failure safe for a provider to report opaquely to the model."""
 
 
+class SafeToolFailure(FrozenModel):
+    """The non-sensitive portion of a recoverable tool failure."""
+
+    tool: str
+    category: str = "tool_error"
+    retryable: bool = False
+    provider: str | None = None
+    attempt_count: int = 1
+    http_status: int | None = None
+
+    @classmethod
+    def from_exception(cls, tool: str, error: ToolCallError) -> "SafeToolFailure":
+        category = getattr(error, "category", "tool_error")
+        provider = getattr(error, "provider", None)
+        attempt_count = getattr(error, "attempt_count", 1)
+        http_status = getattr(error, "http_status", None)
+        return cls(
+            tool=tool,
+            category=category if isinstance(category, str) else "tool_error",
+            retryable=bool(getattr(error, "retryable", False)),
+            provider=provider if isinstance(provider, str) else None,
+            attempt_count=attempt_count if isinstance(attempt_count, int) and attempt_count > 0 else 1,
+            http_status=http_status if isinstance(http_status, int) else None,
+        )
+
+
 def serialize_tool_output(value: Any) -> str:
     """Serialize a tool output deterministically without expanding Unicode."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

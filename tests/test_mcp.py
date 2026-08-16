@@ -50,6 +50,53 @@ def test_mcp_server_env_propagates_openai_base_url(
     assert client._minimal_server_env()["OPENAI_BASE_URL"] == "https://api.deepseek.com"
 
 
+def test_mcp_server_env_propagates_only_optional_search_provider_keys(
+    tmp_path: Path, run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SERPER_API_KEY", "serper-test-secret")
+    monkeypatch.setenv("SERPAPI_API_KEY", "serpapi-test-secret")
+    client = MCPToolClient(task_root=tmp_path, config=run_config)
+
+    env = client._minimal_server_env()
+
+    assert env["SERPER_API_KEY"] == "serper-test-secret"
+    assert env["SERPAPI_API_KEY"] == "serpapi-test-secret"
+    assert "PATH" not in env
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_categorizes_webpage_http_errors_without_retaining_raw_message(
+    tmp_path: Path, run_config: RunConfig
+) -> None:
+    class FailingWebClient:
+        async def call_tool(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                is_error=True,
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=(
+                            "Error executing tool read_webpage: HTTP 503 for "
+                            "https://private.example?api_key=secret with body=classified"
+                        ),
+                    )
+                ],
+            )
+
+    client = MCPToolClient(task_root=tmp_path, config=run_config, allowed={"read_webpage"})
+    client._client = FailingWebClient()
+
+    with pytest.raises(ToolExecutionError) as caught:
+        await client.call("read_webpage", {"url": "https://private.example"})
+
+    assert caught.value.category == "http_status"
+    assert caught.value.retryable is True
+    assert caught.value.http_status == 503
+    assert "private.example" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+    assert "classified" not in str(caught.value)
+
+
 @pytest.fixture
 def fake_backend_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GAIA_MCP_FAKE_BACKEND", "1")

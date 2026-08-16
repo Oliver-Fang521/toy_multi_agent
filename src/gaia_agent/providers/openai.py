@@ -12,6 +12,7 @@ from gaia_agent.providers.base import (
     Citation,
     ModelRequest,
     ModelResponse,
+    SafeToolFailure,
     ToolCallError,
     ToolEvent,
     ToolExecutor,
@@ -226,8 +227,15 @@ class OpenAIProvider:
                     raise TypeError("function-call arguments must decode to an object")
                 try:
                     result = await executor.call(call.name, arguments)
-                except ToolCallError:
-                    result = {"error": "tool_failed"}
+                except ToolCallError as error:
+                    failure = SafeToolFailure.from_exception(call.name, error)
+                    details = failure.model_dump(exclude={"tool", "http_status"})
+                    if failure.http_status is not None:
+                        details["http_status"] = failure.http_status
+                    result = {
+                        "error": "tool_failed",
+                        **details,
+                    }
                 output = {
                     "type": "function_call_output",
                     "call_id": call.call_id,

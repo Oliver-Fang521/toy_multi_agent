@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import stat
 import sys
 from collections.abc import Iterable
@@ -168,7 +169,9 @@ class MCPToolClient:
                 read_timeout_seconds=self._config.timeout_seconds,
             )
         except TimeoutError:
-            raise ToolExecutionError(f"tool call timed out: {name}") from None
+            raise _tool_execution_error(
+                name, category="timeout", retryable=True, provider=None, attempt_count=1
+            ) from None
         # This is the process boundary: every SDK/transport failure must become a
         # redacted ToolExecutor error instead of leaking implementation exceptions.
         except Exception as error:  # noqa: BLE001
@@ -177,6 +180,11 @@ class MCPToolClient:
             message = "\n".join(
                 content.text for content in result.content if getattr(content, "type", None) == "text"
             )
+            safe = _safe_failure_payload(message)
+            if safe is not None:
+                raise _tool_execution_error(name, **safe)
+            if name == "read_webpage" and (classified := _webpage_failure_payload(message)):
+                raise _tool_execution_error(name, **classified)
             raise ToolExecutionError(self._redact(message or f"tool failed: {name}"))
         output = result.structured_content
         if not isinstance(output, dict):
@@ -294,12 +302,17 @@ class MCPToolClient:
             env["GAIA_MCP_FAKE_BACKEND"] = "1"
         if os.environ.get("OPENAI_BASE_URL"):
             env["OPENAI_BASE_URL"] = os.environ["OPENAI_BASE_URL"]
+        for name in ("SERPER_API_KEY", "SERPAPI_API_KEY"):
+            if value := os.environ.get(name):
+                env[name] = value
         return env
 
     def _redact(self, message: str) -> str:
         for secret in (
             self._config.openai_api_key.get_secret_value(),
             self._config.hf_token.get_secret_value(),
+            os.environ.get("SERPER_API_KEY", ""),
+            os.environ.get("SERPAPI_API_KEY", ""),
         ):
             if secret:
                 message = message.replace(secret, "[REDACTED]")
@@ -334,6 +347,101 @@ def _strict_function_schema(schema: dict[str, Any]) -> dict[str, Any]:
         strict["additionalProperties"] = False
         strict["required"] = list(properties)
     return strict
+
+
+def _safe_failure_payload(message: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(message[message.find("{") :])
+    except (TypeError, ValueError):
+        return None
+    required = {"error", "category", "retryable", "provider", "attempt_count"}
+    if not isinstance(value, dict) or not required.issubset(value) or value.get("error") != "tool_failed":
+        return None
+    category = value["category"]
+    provider = value["provider"]
+    attempt_count = value["attempt_count"]
+    http_status = value.get("http_status")
+    if (
+        not isinstance(category, str)
+        or not isinstance(value["retryable"], bool)
+        or provider is not None and not isinstance(provider, str)
+        or not isinstance(attempt_count, int)
+        or attempt_count < 1
+        or http_status is not None and not isinstance(http_status, int)
+    ):
+        return None
+    return {
+        "category": category,
+        "retryable": value["retryable"],
+        "provider": provider,
+        "attempt_count": attempt_count,
+        "http_status": http_status,
+    }
+
+
+def _tool_execution_error(
+    name: str,
+    *,
+    category: str,
+    retryable: bool,
+    provider: str | None,
+    attempt_count: int,
+    http_status: int | None = None,
+) -> ToolExecutionError:
+    error = ToolExecutionError(f"tool failed: {name}")
+    error.category = category
+    error.retryable = retryable
+    error.provider = provider
+    error.attempt_count = attempt_count
+    error.http_status = http_status
+    return error
+
+
+def _webpage_failure_payload(message: str) -> dict[str, Any] | None:
+    status = re.search(r"\bHTTP\s+(\d{3})\b", message, flags=re.IGNORECASE)
+    if status is not None:
+        http_status = int(status.group(1))
+        return {
+            "category": "http_status",
+            "retryable": http_status == 408 or http_status == 429 or http_status >= 500,
+            "provider": None,
+            "attempt_count": 1,
+            "http_status": http_status,
+        }
+    normalized = message.lower()
+    if "timed out" in normalized or "timeout" in normalized:
+        return {
+            "category": "timeout",
+            "retryable": True,
+            "provider": None,
+            "attempt_count": 1,
+            "http_status": None,
+        }
+    if any(term in normalized for term in ("public host", "credentials", "http(s)")):
+        return {
+            "category": "policy_rejection",
+            "retryable": False,
+            "provider": None,
+            "attempt_count": 1,
+            "http_status": None,
+        }
+    if "empty" in normalized:
+        return {
+            "category": "empty_content",
+            "retryable": False,
+            "provider": None,
+            "attempt_count": 1,
+            "http_status": None,
+        }
+    if any(term in normalized for term in ("decode", "parse", "content type")):
+        return {
+            "category": "parse_failure",
+            "retryable": False,
+            "provider": None,
+            "attempt_count": 1,
+            "http_status": None,
+        }
+    return None
 
 
 def _validated_usage(value: Any) -> Usage:

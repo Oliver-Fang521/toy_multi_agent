@@ -10,6 +10,7 @@ import os
 import socket
 import stat
 import threading
+import time
 import zipfile
 import zlib
 from collections.abc import Awaitable, Callable, Iterator
@@ -29,7 +30,19 @@ from pypdf import filters as pypdf_filters
 from pypdf.errors import LimitReachedError
 
 from gaia_agent.models import HOSTED_USAGE_METADATA_KEY, Usage
-from gaia_agent.providers.base import serialize_tool_output, tool_output_size_bytes
+from gaia_agent.providers.base import (
+    SafeToolFailure,
+    ToolCallError,
+    serialize_tool_output,
+    tool_output_size_bytes,
+)
+from gaia_agent.reliability import RetryPolicy
+from gaia_agent.search import (
+    SearchProvider,
+    SearchProviderChain,
+    SerpAPISearchProvider,
+    SerperSearchProvider,
+)
 
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
 MAX_WEB_SEARCH_OUTPUT_BYTES = 16 * 1024
@@ -583,6 +596,7 @@ def _bounded_zlib_decompress(data: bytes) -> bytes:
 
 
 class HostedOpenAIBackend:
+    provider = "openai"
     def __init__(
         self,
         *,
@@ -625,6 +639,9 @@ class HostedOpenAIBackend:
                     sources.append({"url": url, "title": _field(source, "title")})
         result = {"answer": response.output_text, "sources": sources}
         return _with_response_usage(result, response)
+
+    async def search(self, query: str) -> dict[str, Any]:
+        return await self.web_search(query)
 
     async def execute_python(self, instruction: str, paths: list[str]) -> dict[str, Any]:
         file_ids = [await self._upload_registered(path) for path in paths]
@@ -727,6 +744,7 @@ def _jsonable(value: Any) -> Any:
 
 
 class FakeHostedBackend:
+    provider = "openai"
     def __init__(
         self,
         api_key: str,
@@ -756,6 +774,9 @@ class FakeHostedBackend:
             "sources": [{"url": "https://example.test/source", "title": "Example"}],
         }
 
+    async def search(self, query: str) -> dict[str, Any]:
+        return await self.web_search(query)
+
     async def execute_python(self, instruction: str, paths: list[str]) -> dict[str, Any]:
         if instruction == "__GAIA_LARGE_OUTPUT__":
             return {"output_text": "x" * (MAX_TOOL_OUTPUT_BYTES + 10_000), "outputs": []}
@@ -777,10 +798,13 @@ class MCPServerSettings:
     backend: HostedBackend
     api_key: str
     hf_token: str
+    serper_api_key: str = ""
+    serpapi_api_key: str = ""
+    search_provider: SearchProvider | None = None
 
     @property
     def secrets(self) -> tuple[str, ...]:
-        return (self.api_key, self.hf_token)
+        return (self.api_key, self.hf_token, self.serper_api_key, self.serpapi_api_key)
 
     @classmethod
     def for_fake_backend(
@@ -827,6 +851,19 @@ async def _safe_tool_call(
         if web_result:
             return _bounded_web_search_result(redacted, metadata=metadata)
         return _bounded_result(redacted, metadata=metadata)
+    except ToolCallError as error:
+        failure = SafeToolFailure.from_exception("tool", error)
+        details = failure.model_dump(exclude={"tool", "http_status"})
+        if failure.http_status is not None:
+            details["http_status"] = failure.http_status
+        raise RuntimeError(
+            serialize_tool_output(
+                {
+                    "error": "tool_failed",
+                    **details,
+                }
+            )
+        ) from None
     # This is the server boundary: redact arbitrary backend/parser failures before
     # MCP serializes them into consumer-visible tool errors.
     except Exception as error:  # noqa: BLE001
@@ -842,7 +879,11 @@ def build_server(settings: MCPServerSettings) -> MCPServer:
         """Search the public and return a concise answer with source URLs."""
         return await _safe_tool_call(
             settings,
-            settings.backend.web_search(query),
+            (
+                (settings.search_provider or settings.backend).search(query)
+                if hasattr(settings.search_provider or settings.backend, "search")
+                else settings.backend.web_search(query)
+            ),
             web_result=True,
         )
 
@@ -888,8 +929,11 @@ def _settings_from_env() -> MCPServerSettings:
     attachment_reader = AttachmentReader(task_root, {Path(path) for path in raw_attachments})
     api_key = os.environ.get("OPENAI_API_KEY", "")
     hf_token = os.environ.get("HF_TOKEN", "")
+    serper_api_key = os.environ.get("SERPER_API_KEY", "")
+    serpapi_api_key = os.environ.get("SERPAPI_API_KEY", "")
     timeout_seconds = float(os.environ.get("GAIA_TIMEOUT_SECONDS", "300"))
-    if os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1":
+    fake_backend = os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1"
+    if fake_backend:
         backend: HostedBackend = FakeHostedBackend(api_key, hf_token, attachment_reader)
     else:
         client = AsyncOpenAI(api_key=api_key, max_retries=0)
@@ -900,6 +944,23 @@ def _settings_from_env() -> MCPServerSettings:
             attachment_reader=attachment_reader,
             timeout_seconds=timeout_seconds,
         )
+    search_provider: SearchProvider | None = None
+    if not fake_backend:
+        search_providers: list[SearchProvider] = [backend]
+        search_client = httpx.AsyncClient()
+        if serper_api_key:
+            search_providers.append(
+                SerperSearchProvider(
+                    serper_api_key, search_client, timeout_seconds=min(timeout_seconds, 20.0)
+                )
+            )
+        if serpapi_api_key:
+            search_providers.append(
+                SerpAPISearchProvider(
+                    serpapi_api_key, search_client, timeout_seconds=min(timeout_seconds, 20.0)
+                )
+            )
+        search_provider = SearchProviderChain(search_providers, RetryPolicy(), time.monotonic)
     return MCPServerSettings(
         task_root=task_root,
         attachment_reader=attachment_reader,
@@ -909,6 +970,9 @@ def _settings_from_env() -> MCPServerSettings:
         backend=backend,
         api_key=api_key,
         hf_token=hf_token,
+        serper_api_key=serper_api_key,
+        serpapi_api_key=serpapi_api_key,
+        search_provider=search_provider,
     )
 
 

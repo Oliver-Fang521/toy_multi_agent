@@ -618,7 +618,13 @@ async def test_openai_provider_recovers_from_tool_failure_without_leaking_messag
         async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             self.calls.append((name, arguments))
             if name == "execute_python":
-                raise ToolExecutionError("sk-super-secret-tool-message")
+                error = ToolExecutionError("sk-super-secret-tool-message")
+                error.category = "timeout"
+                error.retryable = True
+                error.provider = "serper"
+                error.attempt_count = 2
+                error.http_status = 503
+                raise error
             return {"answer": "fallback succeeded", "sources": []}
 
     executor = RecoveringExecutor()
@@ -636,16 +642,34 @@ async def test_openai_provider_recovers_from_tool_failure_without_leaking_messag
         ("execute_python", {"code": "bad"}),
         ("web_search", {"query": "safe fallback"}),
     ]
+    assert json.loads(fake_responses_client.requests[1]["input"][0]["output"]) == {
+        "error": "tool_failed",
+        "category": "timeout",
+        "retryable": True,
+        "provider": "serper",
+        "attempt_count": 2,
+        "http_status": 503,
+    }
     assert fake_responses_client.requests[1]["input"] == [
         {
             "type": "function_call_output",
             "call_id": "call-1",
-            "output": '{"error":"tool_failed"}',
+            "output": (
+                '{"error":"tool_failed","category":"timeout","retryable":true,'
+                '"provider":"serper","attempt_count":2,"http_status":503}'
+            ),
         }
     ]
     assert "sk-super-secret-tool-message" not in repr(fake_responses_client.requests[1])
     assert [event.output for event in response.tool_events] == [
-        {"error": "tool_failed"},
+        {
+            "error": "tool_failed",
+            "category": "timeout",
+            "retryable": True,
+            "provider": "serper",
+            "attempt_count": 2,
+            "http_status": 503,
+        },
         {"answer": "fallback succeeded", "sources": []},
     ]
 
@@ -675,7 +699,8 @@ async def test_openai_provider_finalizes_after_recoverable_failure_reaches_tool_
     assert response.parsed == {"answer": "budget-finalized"}
     assert executor.calls == 1
     assert fake_responses_client.requests[1]["input"][0]["output"] == (
-        '{"error":"tool_failed"}'
+        '{"error":"tool_failed","category":"tool_error","retryable":false,'
+        '"provider":null,"attempt_count":1}'
     )
     assert fake_responses_client.requests[1]["tools"] == []
     assert "max_tool_calls" not in fake_responses_client.requests[1]
