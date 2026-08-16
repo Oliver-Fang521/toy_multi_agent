@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -39,7 +39,7 @@ from gaia_agent.models import (
     TerminalErrorCategory,
     Usage,
 )
-from gaia_agent.observability import Observability
+from gaia_agent.observability import Observability, ObservabilityConfig, TaskTraceOutcome
 from gaia_agent.orchestrator import Orchestrator, choose_majority
 from gaia_agent.persistence import RunManifest, RunStore
 from gaia_agent.providers import DeepSeekProvider, ModelProvider, OpenAIProvider
@@ -147,12 +147,21 @@ class EvaluationRunner:
         self._provider_name = provider_name
         self._evaluation_mode = evaluation_mode
         self._observability = observability or Observability()
+        self._last_flush_ok: bool | None = None
+
+    @property
+    def langfuse_enabled(self) -> bool:
+        return self._observability.enabled
+
+    @property
+    def last_flush_ok(self) -> bool | None:
+        return self._last_flush_ok
 
     async def run(self) -> EvaluationSummary:
         try:
             return await self._run()
         finally:
-            self._observability.flush()
+            self._last_flush_ok = self._observability.flush()
 
     async def _run(self) -> EvaluationSummary:
         validate_config(self._config)
@@ -170,28 +179,64 @@ class EvaluationRunner:
             if task.task_id in store.completed_task_ids():
                 continue
             started = time.monotonic()
-            task_run = await self._run_task(task)
-            prediction = task_run.prediction
-            try:
-                correct = prediction.error_category is None and question_scorer(
-                    prediction.answer, task.final_answer
-                )
-            except Exception:  # noqa: BLE001 - scoring is isolated per selected task
-                prediction = prediction.model_copy(
-                    update={
-                        "correct": False,
-                        "error_category": TerminalErrorCategory.MALFORMED_RESPONSE,
-                    }
-                )
-            else:
-                prediction = prediction.model_copy(update={"correct": correct})
-            prediction = prediction.model_copy(
-                update={"duration_seconds": time.monotonic() - started}
+            trace = self._observability.start_task(
+                task.task_id,
+                level=task.level,
+                model=self._config.model,
+                reasoning_effort=self._config.reasoning_effort,
+                run_id=store.manifest.run_id,
+                attempt_number=1,
+                evaluation_mode=self._evaluation_mode,
             )
-            _persist_task_artifacts(store, task.task_id, task_run)
-            # A plain append deliberately invokes Task 7's repair path for a
-            # parseable incomplete or corrupt record on resume.
-            store.append(prediction)
+            task_run: _TaskRun | None = None
+            prediction: TaskPrediction | None = None
+            try:
+                task_run = await self._run_task(task)
+                prediction = task_run.prediction
+                try:
+                    correct = prediction.error_category is None and question_scorer(
+                        prediction.answer, task.final_answer
+                    )
+                except Exception:  # noqa: BLE001 - scoring is isolated per selected task
+                    prediction = prediction.model_copy(
+                        update={
+                            "correct": False,
+                            "error_category": TerminalErrorCategory.MALFORMED_RESPONSE,
+                        }
+                    )
+                else:
+                    prediction = prediction.model_copy(update={"correct": correct})
+                prediction = prediction.model_copy(
+                    update={"duration_seconds": time.monotonic() - started}
+                )
+                _persist_task_artifacts(store, task.task_id, task_run)
+                # A plain append deliberately invokes Task 7's repair path for a
+                # parseable incomplete or corrupt record on resume.
+                store.append(prediction)
+            finally:
+                terminal = prediction or _failure_prediction(
+                    task, TerminalErrorCategory.RETRY_EXHAUSTED
+                )
+                trace.finish(
+                    TaskTraceOutcome(
+                        answer_present=terminal.answer is not None,
+                        evidence_count=len(terminal.evidence_ids),
+                        critic_verdict=terminal.critic_verdict,
+                        error_category=(
+                            terminal.error_category.value
+                            if terminal.error_category is not None
+                            else None
+                        ),
+                        correct=terminal.correct,
+                        checkpoint_restored=bool(
+                            task_run
+                            and any(
+                                event.event_type == "tool_call_restored"
+                                for event in task_run.audit_events
+                            )
+                        ),
+                    )
+                )
 
         predictions = store.load_predictions()
         expected_ids = tuple(task.task_id for task in selected)
@@ -206,14 +251,8 @@ class EvaluationRunner:
         audit_events: list[AuditEvent] = []
         first_plan: AgentPlan | None = None
         for run_index in range(self._config.votes):
-            trace = self._observability.start_task(
-                task.task_id,
-                level=task.level,
-                model=self._config.model,
-                reasoning_effort=self._config.reasoning_effort,
-                run_index=run_index,
-                evaluation_mode=self._evaluation_mode,
-            )
+            task_trace = self._observability.current_trace()
+            trace = task_trace.span("vote", {"run_index": run_index}) if task_trace else None
             vote: _TaskRun | None = None
             try:
                 vote = await self._run_vote(task)
@@ -224,8 +263,8 @@ class EvaluationRunner:
                     status = "error"
                     if vote is not None and vote.prediction.error_category is not None:
                         close_metadata = {"category": vote.prediction.error_category.value}
-                trace.close(status=status, metadata=close_metadata)
-                self._observability.flush()
+                if trace is not None:
+                    trace.end(status=status, metadata=close_metadata)
             assert vote is not None
             predictions.append(vote.prediction.model_copy(update={"run_index": run_index}))
             audit_events.extend(vote.audit_events)
@@ -331,7 +370,22 @@ def build_runner(
         raise ValueError("dataset_loader and provider_factory must be injected together")
 
     validate_config(config)
-    observability = Observability()
+    observability_config = ObservabilityConfig.from_env()
+    observability = Observability(
+        replace(
+            observability_config,
+            input_cost_per_million=(
+                config.langfuse_input_cost_per_million
+                if config.langfuse_input_cost_per_million is not None
+                else observability_config.input_cost_per_million
+            ),
+            output_cost_per_million=(
+                config.langfuse_output_cost_per_million
+                if config.langfuse_output_cost_per_million is not None
+                else observability_config.output_cost_per_million
+            ),
+        )
+    )
     if not injected_dataset:
         dataset_loader = lambda active: load_gaia_validation(
             active.hf_token.get_secret_value()

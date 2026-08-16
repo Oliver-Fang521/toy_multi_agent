@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from gaia_agent.models import GaiaTask, TaskPrediction, Usage
-from gaia_agent.observability import Observability, ObservabilityConfig
+from gaia_agent.observability import Observability, ObservabilityConfig, TaskTraceOutcome
 from gaia_agent.runner import EvaluationRunner
 
 
@@ -275,14 +275,61 @@ def test_langfuse_span_set_summary_publishes_on_context_exit() -> None:
     }
 
 
-def test_flush_failure_is_swallowed() -> None:
+def test_generation_records_configured_model_cost_details() -> None:
+    client = _FakeClient()
+    config = ObservabilityConfig(
+        enabled=True,
+        public_key="pk",
+        secret_key="sk",
+        input_cost_per_million="1.25",
+        output_cost_per_million="2",
+    )
+    observability = Observability(config, client=client)
+    trace = observability.start_task(
+        "task-cost",
+        level=1,
+        model="test-model",
+        reasoning_effort="max",
+        run_id="gaia-run",
+        attempt_number=1,
+        evaluation_mode="test",
+    )
+
+    generation = trace.generation("provider-generation")
+    generation.end(
+        status="ok",
+        usage=Usage(input_tokens=2_000_000, output_tokens=3_000_000),
+    )
+
+    assert client.observations[-1].updates[-1]["cost_details"] == {
+        "input": 2.5,
+        "output": 6.0,
+    }
+
+
+def test_flush_reports_a_safe_warning_on_sdk_failure(caplog: pytest.LogCaptureFixture) -> None:
     client = _FakeClient(fail_flush=True)
-    config = ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk")
+    config = ObservabilityConfig(
+        enabled=True,
+        public_key="pk-test-credential",
+        secret_key="sk-test-credential",
+    )
     observability = Observability(config, client=client)
 
-    observability.flush()
+    with caplog.at_level("WARNING"):
+        success = observability.flush()
 
     assert client.flush_count == 1
+    assert not success
+    assert [record.message for record in caplog.records] == ["Langfuse flush warning"]
+    assert "credential" not in caplog.text
+
+
+def test_flush_reports_success() -> None:
+    client = _FakeClient()
+    config = ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk")
+
+    assert Observability(config, client=client).flush()
 
 
 class _RecordingTrace:
@@ -305,21 +352,31 @@ class _RecordingObservability:
         self.traces.append(trace)
         return trace
 
-    def flush(self) -> None:
+    def flush(self) -> bool:
         self.flush_count += 1
+        return True
 
 
 @pytest.mark.asyncio
-async def test_runner_owns_task_trace_lifecycle() -> None:
-    task = GaiaTask(task_id="trace-task", question="private", level=1, final_answer="answer")
+async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
+    tmp_path: __import__("pathlib").Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gaia_agent import runner as runner_module
+
+    tasks = [
+        GaiaTask(task_id=f"trace-task-{level}", question="private", level=level, final_answer="answer")
+        for level in (1, 2, 3)
+    ]
     config = __import__("gaia_agent.config", fromlist=["RunConfig"]).RunConfig(
         openai_api_key="sk-test",
         hf_token="hf-test",
         sample_size=3,
+        output_dir=tmp_path / "run",
     )
     prediction = TaskPrediction(
-        task_id=task.task_id,
-        level=task.level,
+        task_id="unused",
+        level=1,
         answer="answer",
         critic_verdict="approve",
     )
@@ -328,26 +385,80 @@ async def test_runner_owns_task_trace_lifecycle() -> None:
         audit_events: tuple[()] = ()
 
         async def run(self, active_task: GaiaTask) -> TaskPrediction:
-            return prediction
+            return prediction.model_copy(update={"task_id": active_task.task_id, "level": active_task.level})
 
-    observability = _RecordingObservability()
+    client = _FakeClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+    )
     runner = EvaluationRunner(
         config=config,
-        dataset_loader=lambda _config: ([task], "revision"),
+        dataset_loader=lambda _config: (tasks, "revision"),
         orchestrator_factory=lambda _task: _Orchestrator(),
-        observability=observability,  # type: ignore[arg-type]
+        observability=observability,
     )
 
-    await runner._run_task(task)
+    monkeypatch.setattr(runner_module, "sample_stratified", lambda *_args: tasks)
 
-    assert observability.started == [
-        {
-            "task_id": "trace-task",
-            "level": 1,
-            "model": "deepseek-v4-flash",
-            "reasoning_effort": "medium",
-            "run_index": 0,
-            "evaluation_mode": "test",
-        }
-    ]
-    assert observability.traces[0].closed == ["ok"]
+    def score(answer: str | None, reference: str) -> bool:
+        assert answer == "answer"
+        assert reference == "answer"
+        roots = [observation for observation in client.observations if observation.name == "gaia-task"]
+        assert not roots[-1].ended
+        return True
+
+    monkeypatch.setattr(runner_module, "question_scorer", score)
+
+    await runner._run()
+
+    root, vote = client.observations[:2]
+    assert root.name == "gaia-task"
+    assert root.kwargs["metadata"] == {
+        "task_id": "trace-task-1",
+        "level": 1,
+        "model": "deepseek-v4-flash",
+        "reasoning_effort": "medium",
+        "run_id": "gaia-seed42-n3",
+        "attempt_number": 1,
+        "evaluation_mode": "test",
+    }
+    assert vote.name == "vote"
+    assert vote.kwargs["metadata"] == {"run_index": 0}
+    assert root.ended
+    assert root.updates[-1]["output"] == {
+        "answer_present": True,
+        "evidence_count": 0,
+        "critic_verdict": "approve",
+        "error_category": None,
+        "correct": True,
+        "provider_retry_count": 0,
+        "tool_success_count": 0,
+        "tool_failure_count": 0,
+        "checkpoint_restored": False,
+    }
+
+
+def test_task_trace_outcome_bounds_counts_and_categories() -> None:
+    outcome = TaskTraceOutcome(
+        answer_present=True,
+        evidence_count=-1,
+        critic_verdict="private verdict",
+        error_category="private category",
+        correct=True,
+        provider_retry_count=-2,
+        tool_success_count=-3,
+        tool_failure_count=-4,
+        checkpoint_restored=False,
+    )
+
+    assert outcome.as_output() == {
+        "answer_present": True,
+        "evidence_count": 0,
+        "critic_verdict": "not_run",
+        "error_category": None,
+        "correct": True,
+        "provider_retry_count": 0,
+        "tool_success_count": 0,
+        "tool_failure_count": 0,
+        "checkpoint_restored": False,
+    }

@@ -333,6 +333,18 @@ def test_evaluate_cli_runs_four_planes_over_real_stdio_and_writes_reports(
     assert '"tool":"submit_answer"' in audit
 
 
+def test_evaluate_cli_reports_only_langfuse_health(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _credentials(monkeypatch)
+    _inject_offline_runner(monkeypatch)
+
+    result = cli_runner.invoke(app, _evaluate_arguments(tmp_path / "run"))
+
+    assert result.exit_code == 0, result.output
+    assert "langfuse=disabled" in result.output
+    assert "langfuse_flush=ok" in result.output
+    assert "LANGFUSE_" not in result.output
+
+
 def test_public_cli_does_not_expose_or_accept_fixture_backend_switches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

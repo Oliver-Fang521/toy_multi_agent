@@ -1,8 +1,9 @@
 import os
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, SecretStr, model_validator
+from pydantic import BaseModel, SecretStr, field_validator, model_validator
 
 
 class RunConfig(BaseModel):
@@ -19,6 +20,17 @@ class RunConfig(BaseModel):
     votes: int = 1
     output_dir: Path = Path("results/gaia-15-seed42")
     resume: bool = False
+    langfuse_input_cost_per_million: Decimal | None = None
+    langfuse_output_cost_per_million: Decimal | None = None
+
+    @field_validator("langfuse_input_cost_per_million", "langfuse_output_cost_per_million")
+    @classmethod
+    def validate_langfuse_cost_rate(cls, value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        if not value.is_finite() or value < 0:
+            raise ValueError("Langfuse cost rates must be non-negative finite decimals")
+        return value
 
     @model_validator(mode="after")
     def validate_run_shape(self) -> "RunConfig":
@@ -44,6 +56,12 @@ class RunConfig(BaseModel):
             "votes": os.environ.get("GAIA_VOTES", "1"),
             "output_dir": os.environ.get("GAIA_OUTPUT_DIR", "results/gaia-15-seed42"),
             "resume": os.environ.get("GAIA_RESUME", "false"),
+            "langfuse_input_cost_per_million": os.environ.get(
+                "LANGFUSE_INPUT_COST_PER_MILLION"
+            ),
+            "langfuse_output_cost_per_million": os.environ.get(
+                "LANGFUSE_OUTPUT_COST_PER_MILLION"
+            ),
         }
         values.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(values)

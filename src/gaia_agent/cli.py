@@ -58,11 +58,15 @@ def evaluate(
 
     try:
         runner = build_runner(config)
+        typer.echo(f"langfuse={'enabled' if getattr(runner, 'langfuse_enabled', False) else 'disabled'}")
         summary = asyncio.run(runner.run())
     except Exception:  # noqa: BLE001 - CLI emits a value-free failure boundary
         typer.echo("evaluation failed; no credential or gated values were printed", err=True)
         raise typer.Exit(code=2) from None
     accuracy = 0.0 if summary.accuracy is None else summary.accuracy
+    typer.echo(
+        f"langfuse_flush={'ok' if getattr(runner, 'last_flush_ok', False) is True else 'warning'}"
+    )
     typer.echo(f"accuracy={accuracy:.2%} ({summary.correct}/{summary.total})")
 
 
