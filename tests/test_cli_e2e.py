@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections import defaultdict, deque
@@ -17,7 +18,13 @@ from gaia_agent.config import RunConfig
 from gaia_agent.models import GaiaTask, TaskPrediction, TerminalErrorCategory, Usage
 from gaia_agent.providers import ModelRequest, ModelResponse
 from gaia_agent.reporting import summarize
-from gaia_agent.runner import EvaluationRunner, ProviderRuntime, build_runner
+from gaia_agent.runner import (
+    EvaluationRunner,
+    ProviderRuntime,
+    _private_run_root,
+    build_runner,
+    verify_run_directory,
+)
 
 cli_runner = CliRunner()
 FIXTURE = Path(__file__).parent / "fixtures" / "gaia_records.json"
@@ -269,6 +276,39 @@ def test_build_runner_caps_each_specialist_and_critic_request(
     }
     assert orchestrator._critic.max_tool_calls == agent_limit
     assert orchestrator._config.max_tool_calls == global_limit
+
+
+def test_private_notebook_is_a_sibling_and_never_enters_public_artifacts(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    tasks, revision = _fixture_tasks()
+    runner = build_runner(
+        _config(output_dir),
+        dataset_loader=lambda _config: (tasks, revision),
+        provider_factory=lambda _config: ProviderRuntime(
+            provider=_OfflineProvider(),
+            provider_name="offline-fixture",
+            evaluation_mode="test",
+            fake_mcp_backend=True,
+        ),
+    )
+    notebook = runner._orchestrator_factory(tasks[0])._notebook
+    assert notebook is not None
+    sentinel = "https://private.example/sentinel-research"
+    notebook.record("unused_private_tool", {"query": sentinel}, {"private_text": sentinel})
+
+    asyncio.run(runner.run())
+
+    private_root = _private_run_root(output_dir)
+    assert private_root == tmp_path / ".run.private"
+    assert private_root.is_dir()
+    public_artifacts = "".join(
+        path.read_text(encoding="utf-8") for path in output_dir.rglob("*") if path.is_file()
+    )
+    assert sentinel not in public_artifacts
+    assert sentinel in "".join(
+        path.read_text(encoding="utf-8") for path in private_root.rglob("*.json")
+    )
+    assert verify_run_directory(output_dir).total == 3
 
 
 def test_evaluate_cli_runs_four_planes_over_real_stdio_and_writes_reports(

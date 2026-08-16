@@ -33,6 +33,7 @@ from gaia_agent.orchestrator import (
     choose_majority,
 )
 from gaia_agent.providers import ToolSpec
+from gaia_agent.research_notebook import ResearchNotebook
 
 
 class FakePlanner:
@@ -392,6 +393,54 @@ async def test_budgeted_tool_client_does_not_cache_failed_result() -> None:
     assert result == {"text": "retry succeeded"}
     assert backend.calls == 2
     assert client.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_budgeted_tool_client_restores_private_notebook_result_across_scopes(
+    tmp_path: Path,
+) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    arguments = {"query": "private query"}
+    notebook.record("web_search", arguments, {"sources": [{"url": "https://private.example"}]})
+
+    class UnusedBackend:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            raise AssertionError("notebook restoration must not call the MCP client")
+
+    backend = UnusedBackend()
+    audit: list[tuple[str, dict[str, Any]]] = []
+    client = _BudgetedToolClient(
+        backend,
+        max_calls=2,
+        audit=lambda event_type, payload: audit.append((event_type, payload)),
+        notebook=notebook,
+    )
+    client.start_scope("verify:1")
+
+    restored = await client.call("web_search", arguments)
+
+    assert restored == {"sources": [{"url": "https://private.example"}]}
+    assert backend.calls == 0
+    assert client.call_count == 1
+    assert client.executed_call_count == 0
+    assert client.restored_call_count == 1
+    assert audit == [
+        (
+            "tool_call_restored",
+            {
+                "tool": "web_search",
+                "call_number": 1,
+                "argument_keys": ["query"],
+                "result_keys": ["sources"],
+            },
+        )
+    ]
 
 
 def _config(**overrides: Any) -> RunConfig:

@@ -35,6 +35,7 @@ from gaia_agent.models import (
 )
 from gaia_agent.observability import Observability, TaskTrace
 from gaia_agent.providers import ToolCallError, ToolSpec
+from gaia_agent.research_notebook import ResearchNotebook
 from gaia_agent.scoring import parse_number_with_status
 
 
@@ -137,14 +138,19 @@ class _BudgetedToolClient:
         *,
         max_calls: int,
         audit: Callable[[str, dict[str, Any]], None],
+        notebook: ResearchNotebook | None = None,
     ) -> None:
         self._client = client
         self._max_calls = max_calls
         self._audit = audit
+        self._notebook = notebook
         self._scope = "unscoped"
         self._scope_tool_names: set[str] = set()
         self._results_by_scope: dict[str, dict[str, _CachedToolResult]] = defaultdict(dict)
         self.call_count = 0
+        self.logical_call_count = 0
+        self.executed_call_count = 0
+        self.restored_call_count = 0
 
     @property
     def tool_specs(self) -> tuple[ToolSpec, ...]:
@@ -177,7 +183,7 @@ class _BudgetedToolClient:
             if cached.reused:
                 raise _RepeatedToolCall(f"repeated tool call: {name}")
             cached.reused = True
-            self.call_count += 1
+            self._record_logical_call()
             self._audit(
                 "tool_call_reused",
                 {
@@ -188,13 +194,26 @@ class _BudgetedToolClient:
                 },
             )
             return copy.deepcopy(cached.result)
-        self.call_count += 1
+        self._record_logical_call()
         safe_payload = {
             "tool": name,
             "call_number": self.call_count,
             "argument_keys": sorted(arguments),
         }
+        if self._notebook is not None:
+            restored = self._notebook.lookup(name, arguments)
+            if restored is not None:
+                self._results_by_scope[self._scope][signature] = _CachedToolResult(
+                    result=copy.deepcopy(restored)
+                )
+                self.restored_call_count += 1
+                self._audit(
+                    "tool_call_restored",
+                    {**safe_payload, "result_keys": sorted(restored)},
+                )
+                return copy.deepcopy(restored)
         self._audit("tool_call_started", safe_payload)
+        self.executed_call_count += 1
         try:
             result = await self._client.call(name, arguments)
         except ToolCallError:
@@ -203,6 +222,11 @@ class _BudgetedToolClient:
                 {**safe_payload, "category": "tool_error"},
             )
             raise
+        if self._notebook is not None:
+            try:
+                self._notebook.record(name, arguments, result)
+            except (OSError, TypeError, ValueError):
+                pass
         self._results_by_scope[self._scope][signature] = _CachedToolResult(
             result=copy.deepcopy(result)
         )
@@ -214,6 +238,10 @@ class _BudgetedToolClient:
             },
         )
         return result
+
+    def _record_logical_call(self) -> None:
+        self.logical_call_count += 1
+        self.call_count = self.logical_call_count
 
 
 class _GraphState(TypedDict, total=False):
@@ -238,6 +266,7 @@ class Orchestrator:
         tool_client_factory: Callable[[GaiaTask], AbstractAsyncContextManager[Any]],
         config: RunConfig,
         observability: Observability | None = None,
+        notebook: ResearchNotebook | None = None,
     ) -> None:
         if config.max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -254,6 +283,7 @@ class Orchestrator:
         self._tool_client_factory = tool_client_factory
         self._config = config
         self._observability = observability or Observability()
+        self._notebook = notebook
         self._trace: TaskTrace | None = None
         self._audit_events: list[AuditEvent] = []
         self.correction_count = 0
@@ -286,6 +316,7 @@ class Orchestrator:
                         active_tools,
                         max_calls=self._config.max_tool_calls,
                         audit=self._audit,
+                        notebook=self._notebook,
                     )
                     prediction = await self._execute(state, execution_task, budgeted_tools)
         except TimeoutError:

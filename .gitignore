@@ -7,3 +7,4 @@ __pycache__/
 .hf/
 data/
 results/
+.*.private/

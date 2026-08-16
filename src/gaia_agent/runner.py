@@ -50,6 +50,7 @@ from gaia_agent.reporting import (
     verify_summary,
     write_reports,
 )
+from gaia_agent.research_notebook import ResearchNotebook
 from gaia_agent.scoring import question_scorer
 
 _PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
@@ -89,6 +90,11 @@ _FORBIDDEN_PUBLIC_KEYS = frozenset(
     }
 )
 _MAX_AGENT_TOOL_CALLS = 6
+
+
+def _private_run_root(output_dir: Path) -> Path:
+    absolute = output_dir.absolute()
+    return absolute.parent / f".{absolute.name}.private"
 
 
 class TaskOrchestrator(Protocol):
@@ -413,6 +419,7 @@ def build_runner(
             ),
             config=config,
             observability=observability,
+            notebook=ResearchNotebook(_private_run_root(config.output_dir), task.task_id),
         )
 
     return EvaluationRunner(

@@ -80,6 +80,7 @@ _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
         "tool_call_completed",
         "tool_call_failed",
         "tool_call_reused",
+        "tool_call_restored",
         "terminal_failure",
         "plan_started",
         "plan_completed",
@@ -101,6 +102,9 @@ _PUBLIC_AUDIT_EVENT_KEYS = {
     "tool_call_completed": frozenset({"tool", "call_number", "argument_keys", "result_keys"}),
     "tool_call_failed": frozenset({"tool", "call_number", "argument_keys", "category"}),
     "tool_call_reused": frozenset(
+        {"tool", "call_number", "argument_keys", "result_keys"}
+    ),
+    "tool_call_restored": frozenset(
         {"tool", "call_number", "argument_keys", "result_keys"}
     ),
     "terminal_failure": frozenset({"category", "critic_verdict"}),
@@ -579,6 +583,7 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
         "tool_call_completed",
         "tool_call_failed",
         "tool_call_reused",
+        "tool_call_restored",
     }:
         tool = public.get("tool")
         if tool not in _PUBLIC_TOOL_NAMES:
@@ -593,7 +598,7 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
             raise ValueError("tool start audit cannot include result keys")
         if event_type == "tool_call_failed" and result_keys is not None:
             raise ValueError("tool failure audit cannot include result keys")
-        if event_type in {"tool_call_completed", "tool_call_reused"}:
+        if event_type in {"tool_call_completed", "tool_call_reused", "tool_call_restored"}:
             result_key_set = frozenset(result_keys) if isinstance(result_keys, list) else None
             if result_key_set not in _PUBLIC_TOOL_NORMAL_RESULT_SHAPES[tool] | {_BOUNDED_RESULT_KEYS}:
                 raise ValueError("tool audit result keys do not match the tool contract")
