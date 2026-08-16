@@ -17,6 +17,7 @@ from typing import Any, Literal, Protocol, Required, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from gaia_agent.agents import StageProtocolError
 from gaia_agent.config import RunConfig
 from gaia_agent.mcp_client import AttachmentPolicyError, ToolExecutionError
 from gaia_agent.models import (
@@ -194,6 +195,7 @@ class _GraphState(TypedDict, total=False):
     runtime: Required[_TaskState]
     tools: Required[_BudgetedToolClient]
     next_step_index: int
+    soft_step_failures: int
     decision: CriticDecision
     prediction: TaskPrediction
 
@@ -324,6 +326,7 @@ class Orchestrator:
                 "runtime": state,
                 "tools": tools,
                 "next_step_index": 0,
+                "soft_step_failures": 0,
             },
             config={"recursion_limit": self._graph_recursion_limit()},
         )
@@ -406,13 +409,31 @@ class Orchestrator:
         step_index = graph_state.get("next_step_index", 0)
         if step_index < 0 or step_index >= len(state.plan.steps):
             raise ValueError("graph act node received an invalid plan index")
-        await self._act(
-            state,
-            task,
-            state.plan.steps[step_index],
-            tools,
-            correction=False,
-        )
+        try:
+            await self._act(
+                state,
+                task,
+                state.plan.steps[step_index],
+                tools,
+                correction=False,
+            )
+        except StageProtocolError as error:
+            if (
+                not error.repairable
+                or graph_state.get("soft_step_failures", 0) >= 1
+                or state.candidate is None
+                or not state.evidence
+            ):
+                raise
+            self._audit(
+                "soft_step_failure",
+                {"step_number": state.step_count, "code": error.code.value},
+            )
+            return {
+                "runtime": state,
+                "next_step_index": len(state.plan.steps),
+                "soft_step_failures": graph_state.get("soft_step_failures", 0) + 1,
+            }
         return {"runtime": state, "next_step_index": step_index + 1}
 
     def _route_after_act(self, graph_state: _GraphState) -> Literal["act", "verify"]:

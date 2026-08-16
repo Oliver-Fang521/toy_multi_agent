@@ -5,10 +5,12 @@ import mimetypes
 from base64 import b64encode
 from collections.abc import Callable
 from contextvars import ContextVar
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from gaia_agent.mcp_client import AttachmentPolicyError
 from gaia_agent.models import (
     AgentPlan,
     AgentResult,
@@ -64,16 +66,28 @@ _NON_ANSWER_PREFIXES = (
 _Parsed = TypeVar("_Parsed")
 
 
-class _StageRepairError(ValueError):
-    def __init__(self, message: str, usage: Usage) -> None:
-        super().__init__(message)
-        self.usage = usage
+class StageValidationCode(StrEnum):
+    ROLE_MISMATCH = "role_mismatch"
+    EVIDENCE_SHAPE = "evidence_shape"
+    SOURCE_URL_MISSING = "source_url_missing"
+    CANDIDATE_FORMAT = "candidate_format"
+    CHECKED_EVIDENCE = "checked_evidence"
+    SCHEMA = "schema"
 
 
-class _StageValidationError(ValueError):
-    def __init__(self, message: str, usage: Usage) -> None:
-        super().__init__(message)
+class StageProtocolError(ValueError):
+    def __init__(
+        self,
+        code: StageValidationCode,
+        usage: Usage,
+        repairable: bool = True,
+        *,
+        message: str | None = None,
+    ) -> None:
+        super().__init__(message or code.value)
+        self.code = code
         self.usage = usage
+        self.repairable = repairable
 
 
 def _max_output_tokens(reasoning_effort: ReasoningEffort) -> int:
@@ -104,6 +118,46 @@ def _repair_request(request: ModelRequest) -> ModelRequest:
     )
 
 
+def _semantic_repair_request(
+    request: ModelRequest,
+    error: StageProtocolError,
+) -> ModelRequest:
+    return request.model_copy(
+        update={
+            "instructions": (
+                f"{request.instructions}\n\nRepair code: {error.code.value}. "
+                "Return one valid object only."
+            ),
+            "allowed_tools": (),
+            "max_tool_calls": 0,
+        }
+    )
+
+
+def _parsed_repair_input(parsed: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Return only provider-parsed JSON, never output text or tool event bodies."""
+    return (
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": json.dumps(parsed, sort_keys=True, separators=(",", ":")),
+                }
+            ],
+        },
+    )
+
+
+def _with_usage(error: StageProtocolError, usage: Usage) -> StageProtocolError:
+    return StageProtocolError(
+        error.code,
+        usage,
+        error.repairable,
+        message=str(error),
+    )
+
+
 async def _complete_with_local_repair(
     provider: ModelProvider,
     request: ModelRequest,
@@ -117,29 +171,47 @@ async def _complete_with_local_repair(
     failure, not evidence that the stage needs a second research trajectory.
     """
     response = await provider.complete(request, executor)
-    # A non-null parsed payload is already a provider-level JSON object. Keep
-    # semantic/domain validation strict; repair is for the protocol failure that
-    # caused the historical `parsed=None` terminal results.
-    if response.parsed is not None:
-        try:
-            return parser(response), response.usage, False
-        except ValidationError as error:
-            error._gaia_usage = response.usage  # type: ignore[attr-defined]
-            raise
-        except (ValueError, TypeError, KeyError) as error:
-            raise _StageValidationError(str(error), response.usage) from error
     try:
         return parser(response), response.usage, False
-    except (ValidationError, ValueError, TypeError, KeyError):
-        repaired = await provider.complete(_repair_request(request))
-        try:
-            parsed = parser(repaired)
-        except (ValidationError, ValueError, TypeError, KeyError) as repair_error:
-            raise _StageRepairError(
-                "stage response remained invalid after one local repair",
-                _add_usage(response.usage, repaired.usage),
-            ) from repair_error
-        return parsed, _add_usage(response.usage, repaired.usage), True
+    except AttachmentPolicyError:
+        raise
+    except StageProtocolError as error:
+        protocol_error = _with_usage(error, response.usage)
+    except (ValidationError, ValueError, TypeError, KeyError) as error:
+        protocol_error = StageProtocolError(StageValidationCode.SCHEMA, response.usage)
+        protocol_error.__cause__ = error
+
+    if not protocol_error.repairable:
+        raise protocol_error
+
+    repair_request = (
+        _semantic_repair_request(request, protocol_error).model_copy(
+            update={"input_items": _parsed_repair_input(response.parsed)}
+        )
+        if response.parsed is not None
+        else _repair_request(request)
+    )
+    repaired = await provider.complete(repair_request)
+    aggregate_usage = _add_usage(response.usage, repaired.usage)
+    try:
+        parsed = parser(repaired)
+    except AttachmentPolicyError:
+        raise
+    except StageProtocolError as repair_error:
+        if not repair_error.repairable:
+            raise _with_usage(repair_error, aggregate_usage)
+        raise StageProtocolError(
+            protocol_error.code,
+            aggregate_usage,
+            message=str(protocol_error),
+        ) from repair_error
+    except (ValidationError, ValueError, TypeError, KeyError) as repair_error:
+        raise StageProtocolError(
+            protocol_error.code,
+            aggregate_usage,
+            message=str(protocol_error),
+        ) from repair_error
+    return parsed, aggregate_usage, True
 
 
 def _strict_schema(model: type[BaseModel]) -> dict[str, Any]:
@@ -238,9 +310,16 @@ class PlannerAgent:
             reasoning_effort=self.reasoning_effort,
         )
         def parse(response: Any) -> AgentPlan:
-            plan = AgentPlan.model_validate(response.parsed)
+            try:
+                plan = AgentPlan.model_validate(response.parsed)
+            except ValidationError as error:
+                raise StageProtocolError(StageValidationCode.SCHEMA, Usage()) from error
             if not 1 <= len(plan.steps) <= self.max_steps:
-                raise ValueError(f"planner must return between 1 and {self.max_steps} steps")
+                raise StageProtocolError(
+                    StageValidationCode.SCHEMA,
+                    Usage(),
+                    message=f"planner must return between 1 and {self.max_steps} steps",
+                )
             return _route_unsupported_visual_steps(plan, task, self.provider)
 
         try:
@@ -249,20 +328,15 @@ class PlannerAgent:
                 request,
                 parse,
             )
-        except ValidationError as error:
-            self._last_usage.set(getattr(error, "_gaia_usage", Usage()))
-            raise
-        except _StageValidationError as error:
+        except StageProtocolError as error:
             self._last_usage.set(error.usage)
-            raise
-        except _StageRepairError as error:
+            if not error.repairable:
+                raise
             # Planning is a routing concern. If the model cannot satisfy the
             # protocol twice, continue with a conservative, answer-free route.
             self._last_repair.set(True)
             self._last_fallback.set(True)
-            self._last_usage.set(error.usage)
-            plan = _fallback_plan(task, self.provider)
-            return plan
+            return _fallback_plan(task, self.provider)
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
         return plan
@@ -338,15 +412,25 @@ class SpecialistAgent:
             if response.parsed is None:
                 fallback = _extract_final_answer(response.output_text)
                 if fallback is None:
-                    raise ValueError(
-                        "specialist response did not contain a structured or final answer"
+                    raise StageProtocolError(
+                        StageValidationCode.SCHEMA,
+                        Usage(),
+                        message="specialist response did not contain a structured or final answer",
                     )
                 result = AgentResult(specialist=self.name, candidate_answer=fallback)
             else:
-                result = AgentResult.model_validate(response.parsed)
+                try:
+                    result = AgentResult.model_validate(response.parsed)
+                except ValidationError as error:
+                    raise StageProtocolError(StageValidationCode.SCHEMA, Usage()) from error
             if result.specialist != self.name:
-                raise ValueError(
-                    f"result specialist {result.specialist.value} does not match agent {self.name.value}"
+                raise StageProtocolError(
+                    StageValidationCode.ROLE_MISMATCH,
+                    Usage(),
+                    message=(
+                        f"result specialist {result.specialist.value} does not match "
+                        f"agent {self.name.value}"
+                    ),
                 )
             _validate_evidence(result.evidence, self.allowed_evidence_kinds)
             prior_ids = {item.evidence_id for item in evidence}
@@ -354,7 +438,12 @@ class SpecialistAgent:
                 item.evidence_id for item in result.evidence if item.evidence_id in prior_ids
             )
             if duplicate_prior_ids:
-                raise ValueError(f"evidence IDs duplicate prior evidence: {duplicate_prior_ids}")
+                raise StageProtocolError(
+                    StageValidationCode.EVIDENCE_SHAPE,
+                    Usage(),
+                    repairable=False,
+                    message=f"evidence IDs duplicate prior evidence: {duplicate_prior_ids}",
+                )
             candidate = _normalize_candidate_answer(result.candidate_answer)
             return result.model_copy(update={"candidate_answer": candidate})
 
@@ -365,15 +454,9 @@ class SpecialistAgent:
                 parse,
                 executor=tools,
             )
-        except ValidationError as error:
-            self._last_usage.set(getattr(error, "_gaia_usage", Usage()))
-            raise
-        except _StageValidationError as error:
+        except StageProtocolError as error:
             self._last_usage.set(error.usage)
-            raise
-        except _StageRepairError as error:
-            self._last_repair.set(True)
-            self._last_usage.set(error.usage)
+            self._last_repair.set(error.repairable)
             raise
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
@@ -524,21 +607,49 @@ class CriticAgent:
         known_ids = {item.evidence_id for item in evidence}
 
         def parse(response: Any) -> CriticDecision:
-            decision = CriticDecision.model_validate(response.parsed)
+            try:
+                decision = CriticDecision.model_validate(response.parsed)
+            except ValidationError as error:
+                raise StageProtocolError(StageValidationCode.SCHEMA, Usage()) from error
             corrected_answer = _normalize_candidate_answer(decision.corrected_answer)
             if decision.verdict == "revise" and not corrected_answer:
-                raise ValueError("revised critic decision must propose one correction")
+                raise StageProtocolError(
+                    StageValidationCode.CANDIDATE_FORMAT,
+                    Usage(),
+                    message="revised critic decision must propose one correction",
+                )
             if decision.verdict != "revise" and corrected_answer is not None:
-                raise ValueError("only a revised critic decision may correct the answer")
+                raise StageProtocolError(
+                    StageValidationCode.CANDIDATE_FORMAT,
+                    Usage(),
+                    message="only a revised critic decision may correct the answer",
+                )
             if decision.verdict == "approve" and not decision.checked_evidence_ids:
-                raise ValueError("approved critic decision must name checked evidence")
+                raise StageProtocolError(
+                    StageValidationCode.CHECKED_EVIDENCE,
+                    Usage(),
+                    message="approved critic decision must name checked evidence",
+                )
             if decision.verdict == "approve" and candidate is None:
-                raise ValueError("critic cannot approve a missing candidate")
+                raise StageProtocolError(
+                    StageValidationCode.CANDIDATE_FORMAT,
+                    Usage(),
+                    message="critic cannot approve a missing candidate",
+                )
             unknown_ids = set(decision.checked_evidence_ids) - known_ids
             if unknown_ids:
-                raise ValueError(f"critic checked unknown evidence IDs: {sorted(unknown_ids)}")
+                raise StageProtocolError(
+                    StageValidationCode.CHECKED_EVIDENCE,
+                    Usage(),
+                    repairable=False,
+                    message=f"critic checked unknown evidence IDs: {sorted(unknown_ids)}",
+                )
             if len(set(decision.checked_evidence_ids)) != len(decision.checked_evidence_ids):
-                raise ValueError("critic checked evidence IDs must be unique")
+                raise StageProtocolError(
+                    StageValidationCode.CHECKED_EVIDENCE,
+                    Usage(),
+                    message="critic checked evidence IDs must be unique",
+                )
             has_allowed_tool_evidence = any(
                 event.name in self.allowed_tool_names
                 and _has_tool_contract_evidence(event.name, event.output)
@@ -549,9 +660,14 @@ class CriticAgent:
                 and not decision.checked_evidence_ids
                 and not has_allowed_tool_evidence
             ):
-                raise ValueError(
-                    "revised critic decision must be grounded in checked evidence "
-                    "or an allowed tool event"
+                raise StageProtocolError(
+                    StageValidationCode.CHECKED_EVIDENCE,
+                    Usage(),
+                    repairable=False,
+                    message=(
+                        "revised critic decision must be grounded in checked evidence "
+                        "or an allowed tool event"
+                    ),
                 )
             return decision.model_copy(update={"corrected_answer": corrected_answer})
 
@@ -562,15 +678,13 @@ class CriticAgent:
                 parse,
                 executor=tools,
             )
-        except ValidationError as error:
-            self._last_usage.set(getattr(error, "_gaia_usage", Usage()))
-            raise
-        except _StageValidationError as error:
+        except StageProtocolError as error:
             self._last_usage.set(error.usage)
-            raise
-        except _StageRepairError as error:
+            if not error.repairable:
+                raise
+            if error.code != StageValidationCode.SCHEMA:
+                raise
             self._last_repair.set(True)
-            self._last_usage.set(error.usage)
             return _fallback_critic_decision(candidate, evidence)
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
@@ -743,14 +857,30 @@ def _validate_evidence(
 ) -> None:
     evidence_ids = [item.evidence_id for item in evidence]
     if any(not evidence_id.strip() for evidence_id in evidence_ids):
-        raise ValueError("evidence IDs must be non-empty")
+        raise StageProtocolError(
+            StageValidationCode.EVIDENCE_SHAPE,
+            Usage(),
+            message="evidence IDs must be non-empty",
+        )
     if len(set(evidence_ids)) != len(evidence_ids):
-        raise ValueError("evidence IDs must be unique")
+        raise StageProtocolError(
+            StageValidationCode.EVIDENCE_SHAPE,
+            Usage(),
+            message="evidence IDs must be unique",
+        )
     for item in evidence:
         if item.kind not in allowed_evidence_kinds:
-            raise ValueError(f"evidence kind {item.kind} is not allowed for this specialist")
+            raise StageProtocolError(
+                StageValidationCode.EVIDENCE_SHAPE,
+                Usage(),
+                message=f"evidence kind {item.kind} is not allowed for this specialist",
+            )
         if item.kind == "source" and not item.source_url:
-            raise ValueError("source evidence must include a URL")
+            raise StageProtocolError(
+                StageValidationCode.SOURCE_URL_MISSING,
+                Usage(),
+                message="source evidence must include a URL",
+            )
 
 
 def _normalize_candidate_answer(candidate: str | None) -> str | None:
@@ -762,7 +892,11 @@ def _normalize_candidate_answer(candidate: str | None) -> str | None:
         or "\n" in normalized
         or normalized.casefold().startswith("final answer:")
     ):
-        raise ValueError("candidate answer must use the concise GAIA format")
+        raise StageProtocolError(
+            StageValidationCode.CANDIDATE_FORMAT,
+            Usage(),
+            message="candidate answer must use the concise GAIA format",
+        )
     return normalized
 
 

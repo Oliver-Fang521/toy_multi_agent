@@ -11,8 +11,12 @@ from gaia_agent.agents import (
     FileAnalysisAgent,
     LookupAgent,
     PlannerAgent,
+    StageProtocolError,
+    StageValidationCode,
     VisualAgent,
+    _complete_with_local_repair,
 )
+from gaia_agent.mcp_client import AttachmentPolicyError
 from gaia_agent.models import Evidence, PlanStep, SpecialistName, Usage
 from gaia_agent.providers import ModelRequest, ModelResponse, ToolEvent
 
@@ -114,11 +118,16 @@ def test_lookup_prompt_bounds_web_research_before_synthesis() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("steps", [[], [{"specialist": "lookup", "instruction": "x"}] * 5])
-async def test_planner_rejects_empty_or_oversized_plans(fake_provider, task, steps) -> None:
+async def test_planner_falls_back_after_repairing_empty_or_oversized_plans(
+    fake_provider, task, steps
+) -> None:
+    fake_provider.return_parsed({"restatement": "Bounded plan", "steps": steps})
     fake_provider.return_parsed({"restatement": "Bounded plan", "steps": steps})
 
-    with pytest.raises(ValueError, match="between 1 and 4"):
-        await PlannerAgent(fake_provider, max_steps=4).plan(task)
+    plan = await PlannerAgent(fake_provider, max_steps=4).plan(task)
+
+    assert plan.steps[0].specialist == SpecialistName.LOOKUP
+    assert len(fake_provider.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -324,6 +333,74 @@ async def test_specialist_repairs_one_malformed_response_without_tools(
 
 
 @pytest.mark.asyncio
+async def test_specialist_repairs_a_parsed_result_with_the_wrong_role(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "computation", "evidence": [], "candidate_answer": "42"},
+        usage=Usage(input_tokens=3, total_tokens=3),
+    )
+    fake_provider.return_parsed(
+        {"specialist": "lookup", "evidence": [], "candidate_answer": "Marie Curie"},
+        usage=Usage(output_tokens=5, total_tokens=5),
+    )
+    agent = LookupAgent(fake_provider)
+
+    result = await agent.run(
+        task,
+        PlanStep(specialist="lookup", instruction="Find a source"),
+        (),
+        fake_tools,
+    )
+
+    assert result.candidate_answer == "Marie Curie"
+    assert result.usage == Usage(input_tokens=3, output_tokens=5, total_tokens=8)
+    assert agent.last_usage == result.usage
+    assert agent.last_repair_attempted is True
+    assert len(fake_provider.requests) == 2
+    assert fake_provider.requests[1].allowed_tools == ()
+    assert fake_provider.requests[1].max_tool_calls == 0
+    assert fake_provider.executors == [fake_tools, None]
+    repaired_input = json.loads(fake_provider.requests[1].input_items[0]["content"][0]["text"])
+    assert repaired_input == {
+        "specialist": "computation",
+        "evidence": [],
+        "candidate_answer": "42",
+    }
+    assert "Repair code: role_mismatch" in fake_provider.requests[1].instructions
+
+
+@pytest.mark.asyncio
+async def test_attachment_policy_error_does_not_enter_local_repair(fake_provider) -> None:
+    fake_provider.return_parsed({"untrusted": "payload"})
+
+    def parse(_: Any) -> None:
+        raise AttachmentPolicyError("attachment identity changed")
+
+    with pytest.raises(AttachmentPolicyError):
+        await _complete_with_local_repair(
+            fake_provider,
+            ModelRequest(
+                instructions="Validate attachment result",
+                input_items=(),
+                output_schema={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+                allowed_tools=(),
+                max_output_tokens=1,
+                max_tool_calls=0,
+                reasoning_effort="max",
+            ),
+            parse,
+        )
+
+    assert len(fake_provider.requests) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("output_text, expected", [("FINAL ANSWER: 42", "42"), ("42", "42")])
 async def test_specialist_extracts_a_concise_answer_from_non_json_text(
     fake_provider, fake_tools, task, output_text, expected
@@ -359,6 +436,9 @@ async def test_specialist_usage_survives_malformed_semantic_output(
     fake_provider.return_parsed(
         {"specialist": "lookup", "evidence": "not-an-array", "candidate_answer": None},
         usage=Usage(input_tokens=9, output_tokens=4, total_tokens=13),
+    )
+    fake_provider.return_parsed(
+        {"specialist": "lookup", "evidence": "not-an-array", "candidate_answer": None},
     )
     agent = LookupAgent(fake_provider)
 
@@ -638,6 +718,7 @@ async def test_specialist_rejects_untraceable_evidence(
     fake_provider, fake_tools, task, parsed, message
 ) -> None:
     fake_provider.return_parsed(parsed)
+    fake_provider.return_parsed(parsed)
     step = PlanStep(specialist="lookup", instruction="Find a source")
 
     with pytest.raises(ValueError, match=message):
@@ -684,6 +765,9 @@ async def test_specialist_rejects_a_result_for_the_wrong_role(fake_provider, fak
     fake_provider.return_parsed(
         {"specialist": "computation", "evidence": [], "candidate_answer": "42"}
     )
+    fake_provider.return_parsed(
+        {"specialist": "computation", "evidence": [], "candidate_answer": "42"}
+    )
     step = PlanStep(specialist="lookup", instruction="Find a source")
 
     with pytest.raises((ValueError, ValidationError), match="specialist"):
@@ -707,6 +791,22 @@ async def test_critic_uses_only_verification_tools_and_returns_typed_decision(
             "verdict": "approve",
             "feedback": "The cited source supports the candidate.",
             "checked_evidence_ids": ["source-1"],
+            "corrected_answer": None,
+        }
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "Unsupported approval",
+            "checked_evidence_ids": [],
+            "corrected_answer": None,
+        }
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "Unsupported approval",
+            "checked_evidence_ids": [],
             "corrected_answer": None,
         }
     )
@@ -772,14 +872,14 @@ async def test_critic_exposes_only_the_current_provider_invocation_usage(
 async def test_critic_approval_must_name_existing_checked_evidence(
     fake_provider, fake_tools, task
 ) -> None:
-    fake_provider.return_parsed(
-        {
-            "verdict": "approve",
-            "feedback": "Unsupported approval",
-            "checked_evidence_ids": [],
-            "corrected_answer": None,
-        }
-    )
+    parsed = {
+        "verdict": "approve",
+        "feedback": "Unsupported approval",
+        "checked_evidence_ids": [],
+        "corrected_answer": None,
+    }
+    fake_provider.return_parsed(parsed)
+    fake_provider.return_parsed(parsed)
 
     with pytest.raises(ValueError, match="approved critic decision must name checked evidence"):
         await CriticAgent(fake_provider).verify(task, "Marie Curie", (), fake_tools)
@@ -798,8 +898,12 @@ async def test_critic_rejects_unknown_checked_evidence_id(
         }
     )
 
-    with pytest.raises(ValueError, match="unknown evidence IDs"):
+    with pytest.raises(StageProtocolError) as captured:
         await CriticAgent(fake_provider).verify(task, "Marie Curie", (), fake_tools)
+
+    assert captured.value.code == StageValidationCode.CHECKED_EVIDENCE
+    assert captured.value.repairable is False
+    assert len(fake_provider.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -818,6 +922,14 @@ async def test_critic_rejects_unknown_checked_evidence_id(
 async def test_critic_correction_is_single_and_verdict_scoped(
     fake_provider, fake_tools, task, verdict, corrected_answer, message
 ) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": verdict,
+            "feedback": "Check the evidence",
+            "checked_evidence_ids": [],
+            "corrected_answer": corrected_answer,
+        }
+    )
     fake_provider.return_parsed(
         {
             "verdict": verdict,
@@ -1010,18 +1122,20 @@ async def test_critic_rejects_revision_grounded_only_by_non_evidence_tool_event(
 
 
 @pytest.mark.asyncio
-async def test_critic_rejects_an_unknown_verdict(fake_provider, fake_tools, task) -> None:
-    fake_provider.return_parsed(
-        {
-            "verdict": "maybe",
-            "feedback": "Unstructured indecision",
-            "checked_evidence_ids": [],
-            "corrected_answer": None,
-        }
-    )
+async def test_critic_falls_back_after_two_unknown_verdicts(fake_provider, fake_tools, task) -> None:
+    parsed = {
+        "verdict": "maybe",
+        "feedback": "Unstructured indecision",
+        "checked_evidence_ids": [],
+        "corrected_answer": None,
+    }
+    fake_provider.return_parsed(parsed)
+    fake_provider.return_parsed(parsed)
 
-    with pytest.raises(ValidationError, match="verdict"):
-        await CriticAgent(fake_provider).verify(task, "candidate", (), fake_tools)
+    decision = await CriticAgent(fake_provider).verify(task, "candidate", (), fake_tools)
+
+    assert decision.verdict == "insufficient_evidence"
+    assert len(fake_provider.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -1029,6 +1143,14 @@ async def test_critic_rejects_an_unknown_verdict(fake_provider, fake_tools, task
 async def test_critic_rejects_a_non_concise_correction(
     fake_provider, fake_tools, task, corrected_answer
 ) -> None:
+    fake_provider.return_parsed(
+        {
+            "verdict": "revise",
+            "feedback": "A correction is needed",
+            "checked_evidence_ids": [],
+            "corrected_answer": corrected_answer,
+        }
+    )
     fake_provider.return_parsed(
         {
             "verdict": "revise",
@@ -1053,6 +1175,14 @@ async def test_critic_cannot_approve_a_missing_candidate(
             summary="A checked source",
             source_url="https://example.test",
         ),
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "No candidate exists",
+            "checked_evidence_ids": ["source-1"],
+            "corrected_answer": None,
+        }
     )
     fake_provider.return_parsed(
         {
@@ -1088,6 +1218,9 @@ def test_role_prompts_enforce_grounded_observable_and_concise_behavior() -> None
 async def test_specialist_rejects_non_concise_candidate_format(
     fake_provider, fake_tools, task, candidate
 ) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "computation", "evidence": [], "candidate_answer": candidate}
+    )
     fake_provider.return_parsed(
         {"specialist": "computation", "evidence": [], "candidate_answer": candidate}
     )

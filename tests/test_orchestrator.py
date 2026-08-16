@@ -9,6 +9,7 @@ from typing import Any, Self
 
 import pytest
 
+from gaia_agent.agents import StageProtocolError, StageValidationCode
 from gaia_agent.config import RunConfig
 from gaia_agent.mcp_client import AttachmentPolicyError, MCPToolClient, ToolExecutionError
 from gaia_agent.models import (
@@ -840,6 +841,61 @@ async def test_orchestrator_routes_every_specialist_in_plan_order(tmp_path: Path
         "evidence-0003",
         "evidence-0004",
     )
+
+
+@pytest.mark.asyncio
+async def test_optional_enrichment_failure_verifies_and_submits_prior_candidate() -> None:
+    calls: list[str] = []
+    source = _evidence("source-1", "source")
+    lookup = FakeSpecialist(
+        SpecialistName.LOOKUP,
+        calls,
+        [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
+    )
+    computation = FakeSpecialist(
+        SpecialistName.COMPUTATION,
+        calls,
+        [],
+        error=StageProtocolError(
+            StageValidationCode.CANDIDATE_FORMAT,
+            Usage(input_tokens=2, total_tokens=2),
+        ),
+    )
+    orchestrator = _orchestrator(
+        planner=FakePlanner(
+            calls,
+            _plan(SpecialistName.LOOKUP, SpecialistName.COMPUTATION),
+        ),
+        specialists={
+            SpecialistName.LOOKUP: lookup,
+            SpecialistName.COMPUTATION: computation,
+        },
+        critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
+        tools=FakeTools(calls),
+    )
+
+    result = await orchestrator.run(_task())
+
+    assert result.answer == "Marie Curie"
+    assert calls == ["planner", "lookup", "computation", "critic", "submit_answer"]
+    assert [event.event_type for event in orchestrator.audit_events] == [
+        "plan_started",
+        "plan_completed",
+        "act_started",
+        "act_completed",
+        "act_started",
+        "soft_step_failure",
+        "verify_started",
+        "verify_completed",
+        "submit_started",
+        "tool_call_started",
+        "tool_call_completed",
+        "submit_completed",
+    ]
+    soft_failure = next(
+        event for event in orchestrator.audit_events if event.event_type == "soft_step_failure"
+    )
+    assert soft_failure.payload == {"step_number": 2, "code": "candidate_format"}
 
 
 @pytest.mark.asyncio
