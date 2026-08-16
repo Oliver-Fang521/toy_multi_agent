@@ -18,6 +18,7 @@ from gaia_agent.agents import (
     _specialist_input,
     context_size_bytes,
     normalize_plan,
+    specialist_context_size_bytes,
 )
 from gaia_agent.mcp_client import AttachmentPolicyError
 from gaia_agent.models import AgentPlan, Evidence, PlanStep, SpecialistName, Usage
@@ -856,6 +857,31 @@ async def test_visual_specialist_counts_image_payload_against_context_budget(
             tools=fake_tools,
             max_json_bytes=300,
         )
+
+
+@pytest.mark.asyncio
+async def test_visual_context_estimator_matches_actual_serialized_request(
+    fake_tools, image_task
+) -> None:
+    step = PlanStep(specialist="visual", instruction="Inspect")
+
+    input_items = await _specialist_input(
+        image_task,
+        step,
+        (),
+        visual=True,
+        tools=fake_tools,
+        max_json_bytes=2_000,
+    )
+    estimated_bytes, item_count = specialist_context_size_bytes(
+        image_task,
+        step,
+        (),
+        max_json_bytes=2_000,
+    )
+
+    assert estimated_bytes == context_size_bytes(input_items)
+    assert item_count == 0
 
 
 @pytest.mark.asyncio

@@ -519,6 +519,73 @@ async def test_visual_payload_size_triggers_context_pressure_before_visual_enric
     assert pressure[0].payload["bytes"] >= int(24_576 * 0.7)
 
 
+@pytest.mark.asyncio
+async def test_initial_oversized_visual_stage_routes_to_critic_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "large.png"
+    attachment.write_bytes(b"x" * 20_000)
+    calls: list[str] = []
+    visual = FakeSpecialist(
+        SpecialistName.VISUAL,
+        calls,
+        [_result(SpecialistName.VISUAL, (), None)],
+    )
+    critic = FakeCritic(
+        calls,
+        [
+            _decision("insufficient_evidence", ()),
+            _decision("insufficient_evidence", ()),
+        ],
+    )
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.VISUAL)),
+        specialists={SpecialistName.VISUAL: visual},
+        critic=critic,
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(max_steps=1, quality_policy="benchmark"),
+    )
+
+    prediction = await orchestrator.run(_task(attachment_path=attachment))
+
+    assert prediction.error_category == TerminalErrorCategory.CRITIC_REJECTION
+    assert "visual" not in calls
+    pressure = [event for event in orchestrator.audit_events if event.event_type == "context_budget_pressure"]
+    assert pressure
+
+
+@pytest.mark.asyncio
+async def test_correction_oversized_visual_stage_is_not_dispatched(tmp_path: Path) -> None:
+    attachment = tmp_path / "large.png"
+    attachment.write_bytes(b"x" * 20_000)
+    calls: list[str] = []
+    visual = FakeSpecialist(
+        SpecialistName.VISUAL,
+        calls,
+        [_result(SpecialistName.VISUAL, (), None)],
+    )
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.VISUAL)),
+        specialists={SpecialistName.VISUAL: visual},
+        critic=FakeCritic(calls, []),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(quality_policy="benchmark"),
+    )
+    state = _TaskState(plan=_plan(SpecialistName.VISUAL), candidate="answer")
+    tools = _BudgetedToolClient(FakeTools(calls), max_calls=4, audit=lambda *_: None)
+
+    await orchestrator._correct_once(
+        state,
+        _task(attachment_path=attachment),
+        _decision("insufficient_evidence", ()),
+        tools,
+    )
+
+    assert calls == []
+    assert state.step_count == 0
+    assert any(event.event_type == "context_budget_pressure" for event in orchestrator.audit_events)
+
+
 def _config(**overrides: Any) -> RunConfig:
     values: dict[str, Any] = {
         "openai_api_key": "sk-test",

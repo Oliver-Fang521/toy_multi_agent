@@ -469,6 +469,13 @@ class Orchestrator:
         step_index = graph_state.get("next_step_index", 0)
         if step_index < 0 or step_index >= len(state.plan.steps):
             raise ValueError("graph act node received an invalid plan index")
+        if pressure := self._context_budget_pressure(
+            state,
+            task,
+            state.plan.steps[step_index],
+        ):
+            self._audit_context_budget_pressure(pressure)
+            return {"runtime": state, "next_step_index": len(state.plan.steps)}
         try:
             await self._act(
                 state,
@@ -504,26 +511,12 @@ class Orchestrator:
         step_index = graph_state.get("next_step_index", 0)
         if step_index < len(state.plan.steps):
             next_step = state.plan.steps[step_index]
-            max_context_bytes = getattr(
-                self._specialists.get(next_step.specialist),
-                "max_context_bytes",
-                _DEFAULT_STAGE_CONTEXT_MAX_BYTES,
-            )
-            context_bytes, item_count = specialist_context_size_bytes(
+            if pressure := self._context_budget_pressure(
+                state,
                 graph_state["task"],
                 next_step,
-                state.evidence,
-                max_json_bytes=max_context_bytes,
-            )
-            if context_bytes >= max_context_bytes * _CONTEXT_BUDGET_PRESSURE_RATIO:
-                self._audit(
-                    "context_budget_pressure",
-                    {
-                        "bytes": context_bytes,
-                        "item_count": item_count,
-                        "max_bytes": max_context_bytes,
-                    },
-                )
+            ):
+                self._audit_context_budget_pressure(pressure)
                 return "verify"
             if _ready_for_critic(state):
                 self._audit(
@@ -827,7 +820,10 @@ class Orchestrator:
         else:
             target = self._correction_specialist(state)
             step = PlanStep(specialist=target, instruction=decision.feedback)
-            await self._act(state, task, step, tools, correction=True)
+            if pressure := self._context_budget_pressure(state, task, step):
+                self._audit_context_budget_pressure(pressure)
+            else:
+                await self._act(state, task, step, tools, correction=True)
         self._audit(
             "correction_completed",
             {
@@ -843,6 +839,34 @@ class Orchestrator:
         if any(step.specialist == SpecialistName.LOOKUP for step in state.plan.steps):
             return SpecialistName.LOOKUP
         return state.plan.steps[-1].specialist
+
+    def _context_budget_pressure(
+        self,
+        state: _TaskState,
+        task: GaiaTask,
+        step: PlanStep,
+    ) -> dict[str, int] | None:
+        max_context_bytes = getattr(
+            self._specialists.get(step.specialist),
+            "max_context_bytes",
+            _DEFAULT_STAGE_CONTEXT_MAX_BYTES,
+        )
+        context_bytes, item_count = specialist_context_size_bytes(
+            task,
+            step,
+            state.evidence,
+            max_json_bytes=max_context_bytes,
+        )
+        if context_bytes < max_context_bytes * _CONTEXT_BUDGET_PRESSURE_RATIO:
+            return None
+        return {
+            "bytes": context_bytes,
+            "item_count": item_count,
+            "max_bytes": max_context_bytes,
+        }
+
+    def _audit_context_budget_pressure(self, payload: dict[str, int]) -> None:
+        self._audit("context_budget_pressure", payload)
 
     def _has_sufficient_evidence(self, state: _TaskState) -> bool:
         if state.candidate is None:
