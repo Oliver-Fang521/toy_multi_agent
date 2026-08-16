@@ -83,11 +83,13 @@ class StageProtocolError(ValueError):
         repairable: bool = True,
         *,
         message: str | None = None,
+        repair_attempted: bool = False,
     ) -> None:
         super().__init__(message or code.value)
         self.code = code
         self.usage = usage
         self.repairable = repairable
+        self.repair_attempted = repair_attempted
 
 
 def _max_output_tokens(reasoning_effort: ReasoningEffort) -> int:
@@ -149,12 +151,22 @@ def _parsed_repair_input(parsed: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     )
 
 
-def _with_usage(error: StageProtocolError, usage: Usage) -> StageProtocolError:
+def _with_usage(
+    error: StageProtocolError,
+    usage: Usage,
+    *,
+    repair_attempted: bool | None = None,
+) -> StageProtocolError:
     return StageProtocolError(
         error.code,
         usage,
         error.repairable,
         message=str(error),
+        repair_attempted=(
+            error.repair_attempted
+            if repair_attempted is None
+            else repair_attempted
+        ),
     )
 
 
@@ -176,7 +188,7 @@ async def _complete_with_local_repair(
     except AttachmentPolicyError:
         raise
     except StageProtocolError as error:
-        protocol_error = _with_usage(error, response.usage)
+        protocol_error = _with_usage(error, response.usage, repair_attempted=False)
     except (ValidationError, ValueError, TypeError, KeyError) as error:
         protocol_error = StageProtocolError(StageValidationCode.SCHEMA, response.usage)
         protocol_error.__cause__ = error
@@ -199,17 +211,19 @@ async def _complete_with_local_repair(
         raise
     except StageProtocolError as repair_error:
         if not repair_error.repairable:
-            raise _with_usage(repair_error, aggregate_usage)
+            raise _with_usage(repair_error, aggregate_usage, repair_attempted=True)
         raise StageProtocolError(
-            protocol_error.code,
+            repair_error.code,
             aggregate_usage,
-            message=str(protocol_error),
+            message=str(repair_error),
+            repair_attempted=True,
         ) from repair_error
     except (ValidationError, ValueError, TypeError, KeyError) as repair_error:
         raise StageProtocolError(
-            protocol_error.code,
+            StageValidationCode.SCHEMA,
             aggregate_usage,
-            message=str(protocol_error),
+            message=str(repair_error),
+            repair_attempted=True,
         ) from repair_error
     return parsed, aggregate_usage, True
 

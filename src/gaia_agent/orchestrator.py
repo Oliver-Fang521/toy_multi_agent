@@ -420,6 +420,7 @@ class Orchestrator:
         except StageProtocolError as error:
             if (
                 not error.repairable
+                or not error.repair_attempted
                 or graph_state.get("soft_step_failures", 0) >= 1
                 or state.candidate is None
                 or not state.evidence

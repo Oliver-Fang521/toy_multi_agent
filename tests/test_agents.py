@@ -371,6 +371,32 @@ async def test_specialist_repairs_a_parsed_result_with_the_wrong_role(
 
 
 @pytest.mark.asyncio
+async def test_semantic_repair_reports_the_final_validation_code(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_parsed(
+        {"specialist": "computation", "evidence": [], "candidate_answer": "42"},
+        usage=Usage(input_tokens=3, total_tokens=3),
+    )
+    fake_provider.return_parsed(
+        {"specialist": "lookup", "evidence": [], "candidate_answer": ""},
+        usage=Usage(output_tokens=5, total_tokens=5),
+    )
+
+    with pytest.raises(StageProtocolError) as captured:
+        await LookupAgent(fake_provider).run(
+            task,
+            PlanStep(specialist="lookup", instruction="Find a source"),
+            (),
+            fake_tools,
+        )
+
+    assert captured.value.code == StageValidationCode.CANDIDATE_FORMAT
+    assert captured.value.repair_attempted is True
+    assert captured.value.usage == Usage(input_tokens=3, output_tokens=5, total_tokens=8)
+
+
+@pytest.mark.asyncio
 async def test_attachment_policy_error_does_not_enter_local_repair(fake_provider) -> None:
     fake_provider.return_parsed({"untrusted": "payload"})
 
