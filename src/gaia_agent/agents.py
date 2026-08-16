@@ -289,6 +289,14 @@ class PlannerAgent:
         self._last_usage.set(Usage())
         self._last_repair.set(False)
         self._last_fallback.set(False)
+        attachment = _attachment_metadata(task)
+        capabilities = {
+            "attachment_present": task.attachment_path is not None,
+            "attachment_media_type": attachment["media_type"] if attachment else None,
+            "allowed_specialists": [
+                item.value for item in _allowed_specialists(task, self.provider)
+            ],
+        }
         output_schema = _strict_schema(AgentPlan)
         output_schema["properties"]["steps"].update(
             {"minItems": 1, "maxItems": self.max_steps}
@@ -309,6 +317,7 @@ class PlannerAgent:
                                     "attachment": task.attachment_path.name
                                     if task.attachment_path
                                     else None,
+                                    "capabilities": capabilities,
                                 },
                                 sort_keys=True,
                                 separators=(",", ":"),
@@ -334,7 +343,7 @@ class PlannerAgent:
                     Usage(),
                     message=f"planner must return between 1 and {self.max_steps} steps",
                 )
-            return _route_unsupported_visual_steps(plan, task, self.provider)
+            return normalize_plan(plan, task, self.provider)
 
         try:
             plan, usage, repaired = await _complete_with_local_repair(
@@ -350,7 +359,7 @@ class PlannerAgent:
             # protocol twice, continue with a conservative, answer-free route.
             self._last_repair.set(True)
             self._last_fallback.set(True)
-            return _fallback_plan(task, self.provider)
+            return normalize_plan(_fallback_plan(task, self.provider), task, self.provider)
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
         return plan
@@ -800,30 +809,93 @@ def _provider_supports_vision(provider: ModelProvider) -> bool:
     return bool(getattr(provider, "supports_vision", True))
 
 
-def _route_unsupported_visual_steps(
+def _allowed_specialists(
+    task: GaiaTask,
+    provider: ModelProvider,
+) -> tuple[SpecialistName, ...]:
+    attachment = _attachment_metadata(task)
+    allowed = [SpecialistName.LOOKUP, SpecialistName.COMPUTATION]
+    if attachment is not None:
+        allowed.append(SpecialistName.FILE)
+        if attachment["media_type"].startswith("image/") and _provider_supports_vision(provider):
+            allowed.append(SpecialistName.VISUAL)
+    return tuple(allowed)
+
+
+def _fallback_specialist(task: GaiaTask) -> tuple[SpecialistName, str]:
+    question = task.question.casefold()
+    computation_cues = (
+        "calculate",
+        "compute",
+        "how many",
+        "how much",
+        "times",
+        "multiply",
+        "divide",
+        "percent",
+        "percentage",
+        "average",
+        "ratio",
+        "sum",
+        "difference",
+    )
+    if any(cue in question for cue in computation_cues):
+        return (
+            SpecialistName.COMPUTATION,
+            "Use the computation tool to calculate the requested value.",
+        )
+    return (
+        SpecialistName.LOOKUP,
+        "Use web tools to find observable primary-source evidence.",
+    )
+
+
+def normalize_plan(
     plan: AgentPlan,
     task: GaiaTask,
     provider: ModelProvider,
+    max_initial_steps: int = 2,
 ) -> AgentPlan:
-    if _provider_supports_vision(provider):
-        return plan
-    if not any(step.specialist == SpecialistName.VISUAL for step in plan.steps):
-        return plan
-    steps = tuple(
-        step.model_copy(
-            update={
-                "specialist": SpecialistName.FILE,
-                "instruction": (
-                    f"{step.instruction} Use the registered attachment with file tools; "
-                    "the configured provider has no native image-input capability."
-                ),
-            }
-        )
-        if step.specialist == SpecialistName.VISUAL
-        else step
-        for step in plan.steps
-    )
-    return plan.model_copy(update={"steps": steps})
+    """Rewrite impossible routes and keep only the initial executable work."""
+    if max_initial_steps < 1:
+        raise ValueError("max_initial_steps must be positive")
+    allowed = set(_allowed_specialists(task, provider))
+    attachment = _attachment_metadata(task)
+    routed: list[PlanStep] = []
+    for step in plan.steps:
+        if step.specialist in allowed:
+            routed_step = step
+        elif step.specialist == SpecialistName.VISUAL and SpecialistName.FILE in allowed:
+            reason = (
+                "the attachment is not an image"
+                if attachment is not None and not attachment["media_type"].startswith("image/")
+                else "the configured provider has no native image-input capability"
+            )
+            routed_step = step.model_copy(
+                update={
+                    "specialist": SpecialistName.FILE,
+                    "instruction": (
+                        f"{step.instruction} Use the registered attachment with file tools; {reason}."
+                    ),
+                }
+            )
+        else:
+            specialist, instruction = _fallback_specialist(task)
+            routed_step = step.model_copy(
+                update={
+                    "specialist": specialist,
+                    "instruction": f"{step.instruction} {instruction}",
+                }
+            )
+        if routed and routed[-1].specialist == routed_step.specialist:
+            routed[-1] = routed[-1].model_copy(
+                update={
+                    "instruction": f"{routed[-1].instruction}\n{routed_step.instruction}",
+                }
+            )
+        else:
+            routed.append(routed_step)
+    return plan.model_copy(update={"steps": tuple(routed[:max_initial_steps])})
 
 
 def _fallback_plan(task: GaiaTask, provider: ModelProvider) -> AgentPlan:
@@ -837,28 +909,7 @@ def _fallback_plan(task: GaiaTask, provider: ModelProvider) -> AgentPlan:
             specialist = SpecialistName.FILE
             instruction = "Inspect the registered attachment with the appropriate file tool."
     else:
-        question = task.question.casefold()
-        computation_cues = (
-            "calculate",
-            "compute",
-            "how many",
-            "how much",
-            "times",
-            "multiply",
-            "divide",
-            "percent",
-            "percentage",
-            "average",
-            "ratio",
-            "sum",
-            "difference",
-        )
-        if any(cue in question for cue in computation_cues):
-            specialist = SpecialistName.COMPUTATION
-            instruction = "Use the computation tool to calculate the requested value."
-        else:
-            specialist = SpecialistName.LOOKUP
-            instruction = "Use web tools to find observable primary-source evidence."
+        specialist, instruction = _fallback_specialist(task)
     return AgentPlan(
         restatement="Use a conservative evidence-gathering route for the task.",
         steps=(PlanStep(specialist=specialist, instruction=instruction),),

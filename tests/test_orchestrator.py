@@ -844,29 +844,26 @@ async def test_orchestrator_routes_every_specialist_in_plan_order(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_optional_enrichment_failure_verifies_and_submits_prior_candidate() -> None:
+async def test_orchestrator_stops_the_plan_early_when_candidate_has_source_evidence() -> None:
     calls: list[str] = []
-    source = _evidence("source-1", "source")
     lookup = FakeSpecialist(
         SpecialistName.LOOKUP,
         calls,
-        [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
-    )
-    exhausted_error = StageProtocolError(
-        StageValidationCode.CANDIDATE_FORMAT,
-        Usage(input_tokens=2, total_tokens=2),
-        repair_attempted=True,
+        [_result(SpecialistName.LOOKUP, (_evidence("source-1", "source"),), "Marie Curie")],
     )
     computation = FakeSpecialist(
         SpecialistName.COMPUTATION,
         calls,
-        [],
-        error=exhausted_error,
+        [_result(SpecialistName.COMPUTATION, (), None)],
     )
     orchestrator = _orchestrator(
         planner=FakePlanner(
             calls,
-            _plan(SpecialistName.LOOKUP, SpecialistName.COMPUTATION),
+            _plan(
+                SpecialistName.LOOKUP,
+                SpecialistName.COMPUTATION,
+                SpecialistName.LOOKUP,
+            ),
         ),
         specialists={
             SpecialistName.LOOKUP: lookup,
@@ -879,29 +876,13 @@ async def test_optional_enrichment_failure_verifies_and_submits_prior_candidate(
     result = await orchestrator.run(_task())
 
     assert result.answer == "Marie Curie"
-    assert calls == ["planner", "lookup", "computation", "critic", "submit_answer"]
-    assert [event.event_type for event in orchestrator.audit_events] == [
-        "plan_started",
-        "plan_completed",
-        "act_started",
-        "act_completed",
-        "act_started",
-        "soft_step_failure",
-        "verify_started",
-        "verify_completed",
-        "submit_started",
-        "tool_call_started",
-        "tool_call_completed",
-        "submit_completed",
-    ]
-    soft_failure = next(
-        event for event in orchestrator.audit_events if event.event_type == "soft_step_failure"
+    assert calls == ["planner", "lookup", "critic", "submit_answer"]
+    early_stop = next(
+        event for event in orchestrator.audit_events if event.event_type == "plan_early_stop"
     )
-    assert soft_failure.payload == {"step_number": 2, "code": "candidate_format"}
-
-
+    assert early_stop.payload == {"completed_steps": 1, "remaining_steps": 2}
 @pytest.mark.asyncio
-async def test_fresh_protocol_error_does_not_soft_fail_a_partial_candidate() -> None:
+async def test_early_stop_prevents_a_later_protocol_error() -> None:
     calls: list[str] = []
     source = _evidence("source-1", "source")
     lookup = FakeSpecialist(
@@ -933,10 +914,10 @@ async def test_fresh_protocol_error_does_not_soft_fail_a_partial_candidate() -> 
 
     result = await orchestrator.run(_task())
 
-    assert result.answer is None
-    assert result.error_category == TerminalErrorCategory.MALFORMED_RESPONSE
-    assert calls == ["planner", "lookup", "computation"]
-    assert all(event.event_type != "soft_step_failure" for event in orchestrator.audit_events)
+    assert result.answer == "Marie Curie"
+    assert result.error_category is None
+    assert calls == ["planner", "lookup", "critic", "submit_answer"]
+    assert any(event.event_type == "plan_early_stop" for event in orchestrator.audit_events)
 
 
 @pytest.mark.asyncio

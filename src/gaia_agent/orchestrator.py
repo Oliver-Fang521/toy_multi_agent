@@ -104,6 +104,32 @@ class _TaskState:
     critic_verdict: str = "not_run"
 
 
+def _ready_for_critic(state: _TaskState) -> bool:
+    if state.candidate is None:
+        return False
+    kinds = {item.kind for item in state.evidence}
+    if _numeric_value(state.candidate) is not None:
+        final_value = _numeric_value(state.candidate)
+        computation_origins = {
+            state.evidence_origins[item.evidence_id]
+            for item in state.evidence
+            if item.kind == "computation"
+        }
+        agreeing_origins = {
+            origin
+            for origin in computation_origins
+            if _numeric_value(state.candidate_origins.get(origin)) == final_value
+        }
+        return len(agreeing_origins) >= 2 or (
+            bool(agreeing_origins) and "source" in kinds
+        )
+    if state.plan is not None and any(
+        step.specialist == SpecialistName.LOOKUP for step in state.plan.steps
+    ):
+        return "source" in kinds
+    return bool(state.evidence)
+
+
 class _BudgetedToolClient:
     def __init__(
         self,
@@ -443,6 +469,15 @@ class Orchestrator:
             raise ValueError("graph act router requires a plan")
         step_index = graph_state.get("next_step_index", 0)
         if step_index < len(state.plan.steps):
+            if _ready_for_critic(state):
+                self._audit(
+                    "plan_early_stop",
+                    {
+                        "completed_steps": state.step_count,
+                        "remaining_steps": len(state.plan.steps) - step_index,
+                    },
+                )
+                return "verify"
             return "act"
         if step_index == len(state.plan.steps):
             return "verify"

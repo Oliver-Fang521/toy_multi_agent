@@ -15,9 +15,10 @@ from gaia_agent.agents import (
     StageValidationCode,
     VisualAgent,
     _complete_with_local_repair,
+    normalize_plan,
 )
 from gaia_agent.mcp_client import AttachmentPolicyError
-from gaia_agent.models import Evidence, PlanStep, SpecialistName, Usage
+from gaia_agent.models import AgentPlan, Evidence, PlanStep, SpecialistName, Usage
 from gaia_agent.providers import ModelRequest, ModelResponse, ToolEvent
 
 
@@ -170,11 +171,92 @@ async def test_planner_context_is_deterministic_and_excludes_reference_answer(
     assert first == second
     assert context == {
         "attachment": "synthetic.png",
+        "capabilities": {
+            "allowed_specialists": ["lookup", "computation", "file", "visual"],
+            "attachment_media_type": "image/png",
+            "attachment_present": True,
+        },
         "level": 2,
         "question": "What is visible in the image?",
         "task_id": "synthetic-image-task",
     }
     assert "Hidden Image Answer" not in repr(first)
+
+
+@pytest.mark.parametrize(
+    ("question", "specialist"),
+    [
+        ("Who discovered the synthetic element?", SpecialistName.LOOKUP),
+        ("Calculate 6 times 7", SpecialistName.COMPUTATION),
+    ],
+)
+def test_normalize_plan_rewrites_attachment_specialists_without_an_attachment(
+    fake_provider, task, question, specialist
+) -> None:
+    plan = AgentPlan(
+        restatement="Gather evidence",
+        steps=(
+            PlanStep(specialist=SpecialistName.VISUAL, instruction="Inspect the image"),
+            PlanStep(specialist=SpecialistName.FILE, instruction="Read the file"),
+        ),
+    )
+
+    normalized = normalize_plan(
+        plan,
+        task.model_copy(update={"question": question}),
+        fake_provider,
+    )
+
+    assert [step.specialist for step in normalized.steps] == [specialist]
+    assert all(
+        step.specialist not in {SpecialistName.FILE, SpecialistName.VISUAL}
+        for step in normalized.steps
+    )
+
+
+def test_normalize_plan_rewrites_visual_for_a_pdf_and_keeps_only_eligible_routes(
+    fake_provider, task, tmp_path
+) -> None:
+    pdf = tmp_path / "registered.pdf"
+    pdf.write_bytes(b"%PDF-1.7")
+    plan = AgentPlan(
+        restatement="Inspect attachment",
+        steps=(PlanStep(specialist=SpecialistName.VISUAL, instruction="Inspect it"),),
+    )
+
+    normalized = normalize_plan(
+        plan,
+        task.model_copy(update={"attachment_path": pdf}),
+        fake_provider,
+    )
+
+    assert [step.specialist for step in normalized.steps] == [SpecialistName.FILE]
+    assert SpecialistName.VISUAL not in {step.specialist for step in normalized.steps}
+
+
+def test_normalize_plan_coalesces_adjacent_routes_and_limits_initial_steps(
+    fake_provider, image_task
+) -> None:
+    plan = AgentPlan(
+        restatement="Gather evidence",
+        steps=(
+            PlanStep(specialist=SpecialistName.LOOKUP, instruction="Find a source"),
+            PlanStep(specialist=SpecialistName.LOOKUP, instruction="Find corroboration"),
+            PlanStep(specialist=SpecialistName.COMPUTATION, instruction="Calculate it"),
+            PlanStep(specialist=SpecialistName.COMPUTATION, instruction="Check arithmetic"),
+            PlanStep(specialist=SpecialistName.VISUAL, instruction="Inspect the image"),
+        ),
+    )
+
+    normalized = normalize_plan(plan, image_task, fake_provider)
+
+    assert [step.specialist for step in normalized.steps] == [
+        SpecialistName.LOOKUP,
+        SpecialistName.COMPUTATION,
+    ]
+    assert len(normalized.steps) == 2
+    assert "Find a source" in normalized.steps[0].instruction
+    assert "Find corroboration" in normalized.steps[0].instruction
 
 
 @pytest.mark.asyncio
