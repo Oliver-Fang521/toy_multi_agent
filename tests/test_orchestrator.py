@@ -483,6 +483,42 @@ async def test_context_budget_pressure_forces_synthesis_before_enrichment() -> N
     assert pressure[0].payload["item_count"] == 12
 
 
+@pytest.mark.asyncio
+async def test_visual_payload_size_triggers_context_pressure_before_visual_enrichment(
+    tmp_path: Path,
+) -> None:
+    attachment = tmp_path / "large.png"
+    attachment.write_bytes(b"x" * 20_000)
+    calls: list[str] = []
+    planner = FakePlanner(calls, _plan(SpecialistName.COMPUTATION, SpecialistName.VISUAL))
+    computation = FakeSpecialist(
+        SpecialistName.COMPUTATION,
+        calls,
+        [_result(SpecialistName.COMPUTATION, (_evidence("calculation-1", "computation"),), "42")],
+    )
+    visual = FakeSpecialist(SpecialistName.VISUAL, calls, [])
+    critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
+    tools = FakeTools(calls)
+    orchestrator = Orchestrator(
+        planner=planner,
+        specialists={
+            SpecialistName.COMPUTATION: computation,
+            SpecialistName.VISUAL: visual,
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(tools),
+        config=_config(quality_policy="benchmark"),
+    )
+
+    prediction = await orchestrator.run(_task(question="Compute the answer", attachment_path=attachment))
+
+    assert prediction.answer == "42"
+    assert calls == ["planner", "computation", "critic", "submit_answer"]
+    pressure = [event for event in orchestrator.audit_events if event.event_type == "context_budget_pressure"]
+    assert len(pressure) == 1
+    assert pressure[0].payload["bytes"] >= int(24_576 * 0.7)
+
+
 def _config(**overrides: Any) -> RunConfig:
     values: dict[str, Any] = {
         "openai_api_key": "sk-test",

@@ -82,7 +82,7 @@ def _evidence_card(entry: NotebookEntry, index: int) -> tuple[int, int, dict[str
     }
     evidence_id = entry.result.get("evidence_id")
     if isinstance(evidence_id, str) and evidence_id.strip():
-        card["evidence_id"] = _bound_text(evidence_id, _MAX_CARD_TITLE_CHARS)
+        card["evidence_id"] = evidence_id
     card = {key: value for key, value in card.items() if value}
     content_hash = hashlib.sha256(
         _canonical_card_content(title, excerpt).encode("utf-8")

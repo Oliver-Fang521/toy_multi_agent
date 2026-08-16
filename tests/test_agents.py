@@ -896,6 +896,34 @@ async def test_critic_context_is_bounded_and_preserves_candidate_and_card_ids(
 
 
 @pytest.mark.asyncio
+async def test_critic_cards_preserve_long_evidence_ids_exactly(
+    fake_provider, fake_tools, task
+) -> None:
+    evidence_id = "source-" + "x" * 300
+    evidence = (
+        Evidence(
+            evidence_id=evidence_id,
+            kind="source",
+            summary="The source supports 42.",
+            source_url="https://primary.example/fact",
+        ),
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "The cited source supports the candidate.",
+            "checked_evidence_ids": [evidence_id],
+            "corrected_answer": None,
+        }
+    )
+
+    await CriticAgent(fake_provider).verify(task, "42", evidence, fake_tools)
+    context = json.loads(fake_provider.requests[0].input_items[0]["content"][0]["text"])
+
+    assert context["evidence"][0]["evidence_id"] == evidence_id
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("parsed", "message"),
     [

@@ -813,8 +813,29 @@ def specialist_context_size_bytes(
     max_json_bytes: int = _DEFAULT_MAX_CONTEXT_BYTES,
 ) -> tuple[int, int]:
     """Return the bounded text-context size and selected evidence-card count."""
-    context = _bounded_specialist_context(task, step, evidence, max_json_bytes)
-    return context_size_bytes(_context_input_items(context)), len(context["evidence"])
+    visual_payload_bytes = (
+        _visual_payload_context_bytes(task)
+        if step.specialist == SpecialistName.VISUAL
+        else 0
+    )
+    context = _specialist_context_base(task, step)
+    base_size = _context_size_with_extras(
+        context,
+        (),
+        visual_payload_bytes,
+    )
+    if base_size >= max_json_bytes:
+        return base_size, 0
+    context = _bounded_evidence_context(
+        context,
+        evidence,
+        max_json_bytes=max_json_bytes,
+        additional_context_bytes=visual_payload_bytes,
+    )
+    return (
+        context_size_bytes(_context_input_items(context)) + visual_payload_bytes,
+        len(context["evidence"]),
+    )
 
 
 def _bounded_specialist_context(
@@ -824,22 +845,26 @@ def _bounded_specialist_context(
     max_json_bytes: int,
     *,
     extra_content: Sequence[Mapping[str, Any]] = (),
+    additional_context_bytes: int = 0,
 ) -> dict[str, Any]:
-    attachment = _attachment_metadata(task)
-    context: dict[str, Any] = {
+    return _bounded_evidence_context(
+        _specialist_context_base(task, step),
+        evidence,
+        max_json_bytes=max_json_bytes,
+        extra_content=extra_content,
+        additional_context_bytes=additional_context_bytes,
+    )
+
+
+def _specialist_context_base(task: GaiaTask, step: PlanStep) -> dict[str, Any]:
+    return {
         "task_id": task.task_id,
         "question": _bounded_context_text(task.question, _MAX_CONTEXT_QUESTION_CHARS),
         "level": task.level,
         "instruction": _bounded_context_text(step.instruction, _MAX_CONTEXT_INSTRUCTION_CHARS),
-        "attachment": attachment,
+        "attachment": _attachment_metadata(task),
         "evidence": [],
     }
-    return _bounded_evidence_context(
-        context,
-        evidence,
-        max_json_bytes=max_json_bytes,
-        extra_content=extra_content,
-    )
 
 
 def _critic_input(
@@ -870,8 +895,16 @@ def _bounded_evidence_context(
     *,
     max_json_bytes: int,
     extra_content: Sequence[Mapping[str, Any]] = (),
+    additional_context_bytes: int = 0,
 ) -> dict[str, Any]:
-    if context_size_bytes(_context_input_items(context, extra_content)) > max_json_bytes:
+    if (
+        _context_size_with_extras(
+            context,
+            extra_content,
+            additional_context_bytes,
+        )
+        > max_json_bytes
+    ):
         raise ValueError("context exceeds max_json_bytes before evidence selection")
     cards = select_evidence_cards(
         _notebook_entries_for_evidence(evidence),
@@ -885,6 +918,7 @@ def _bounded_evidence_context(
             card,
             max_json_bytes=max_json_bytes,
             extra_content=extra_content,
+            additional_context_bytes=additional_context_bytes,
         )
         if fitted is not None:
             selected.append(fitted)
@@ -898,13 +932,15 @@ def _fit_card_within_context(
     *,
     max_json_bytes: int,
     extra_content: Sequence[Mapping[str, Any]],
+    additional_context_bytes: int,
 ) -> dict[str, Any] | None:
     def fits(candidate: Mapping[str, Any]) -> bool:
         candidate_context = {**context, "evidence": [*selected, dict(candidate)]}
-        return (
-            context_size_bytes(_context_input_items(candidate_context, extra_content))
-            <= max_json_bytes
-        )
+        return _context_size_with_extras(
+            candidate_context,
+            extra_content,
+            additional_context_bytes,
+        ) <= max_json_bytes
 
     candidate = dict(card)
     if fits(candidate):
@@ -951,6 +987,49 @@ def _context_input_items(
             ],
         },
     )
+
+
+def _context_size_with_extras(
+    context: Mapping[str, Any],
+    extra_content: Sequence[Mapping[str, Any]],
+    additional_context_bytes: int,
+) -> int:
+    return (
+        context_size_bytes(_context_input_items(context, extra_content))
+        + additional_context_bytes
+    )
+
+
+def _visual_payload_context_bytes(task: GaiaTask) -> int:
+    """Return the exact serialized contribution of a visual attachment payload.
+
+    Routing cannot asynchronously read the attachment, but base64 size is a
+    deterministic function of its regular-file size.  This avoids allocating a
+    duplicate placeholder for large attachments while matching the final input
+    item's compact JSON serialization.
+    """
+    if task.attachment_path is None:
+        return 0
+    try:
+        attachment_size = task.attachment_path.stat().st_size
+    except OSError:
+        return 0
+    media_type = _attachment_metadata(task)
+    content_type = media_type["media_type"] if media_type is not None else "image/png"
+    item = {
+        "type": "input_image",
+        "image_url": f"data:{content_type};base64,",
+        "detail": "high",
+    }
+    encoded_bytes = 4 * ((attachment_size + 2) // 3)
+    return 1 + len(
+        json.dumps(
+            item,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ) + encoded_bytes
 
 
 def _notebook_entries_for_evidence(evidence: Sequence[Evidence]) -> tuple[NotebookEntry, ...]:
