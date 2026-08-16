@@ -804,6 +804,98 @@ async def test_specialist_context_selects_bounded_unique_high_value_evidence(
 
 
 @pytest.mark.asyncio
+async def test_specialist_context_measures_final_unicode_json_serialization(fake_tools, task) -> None:
+    unicode_task = task.model_copy(update={"question": "¿qué? \"\\" + "é" * 160})
+    evidence = tuple(
+        Evidence(
+            evidence_id=f"source-{index}",
+            kind="source",
+            summary=f"résumé {index} \"\\" + "é" * 2_000,
+            source_url=f"https://source-{index}.example.test/fact",
+        )
+        for index in range(12)
+    )
+
+    input_items = await _specialist_input(
+        unicode_task,
+        PlanStep(specialist="lookup", instruction="Quote \"\\ evidence"),
+        evidence,
+        visual=False,
+        tools=fake_tools,
+        max_json_bytes=1_200,
+    )
+
+    assert context_size_bytes(input_items) <= 1_200
+
+
+@pytest.mark.asyncio
+async def test_specialist_rejects_a_context_budget_smaller_than_its_base(fake_tools, task) -> None:
+    oversized_question = task.model_copy(update={"question": "q" * 4_096})
+
+    with pytest.raises(ValueError, match="context exceeds max_json_bytes"):
+        await _specialist_input(
+            oversized_question,
+            PlanStep(specialist="lookup", instruction="Inspect"),
+            (),
+            visual=False,
+            tools=fake_tools,
+            max_json_bytes=200,
+        )
+
+
+@pytest.mark.asyncio
+async def test_visual_specialist_counts_image_payload_against_context_budget(
+    fake_tools, image_task
+) -> None:
+    with pytest.raises(ValueError, match="context exceeds max_json_bytes"):
+        await _specialist_input(
+            image_task,
+            PlanStep(specialist="visual", instruction="Inspect"),
+            (),
+            visual=True,
+            tools=fake_tools,
+            max_json_bytes=300,
+        )
+
+
+@pytest.mark.asyncio
+async def test_critic_context_is_bounded_and_preserves_candidate_and_card_ids(
+    fake_provider, fake_tools, task
+) -> None:
+    evidence = tuple(
+        Evidence(
+            evidence_id=f"source-{index}",
+            kind="source",
+            summary=f"evidence {index} " + "private webpage body " * 2_000,
+            source_url=f"https://source-{index}.example.test/fact",
+        )
+        for index in range(12)
+    )
+    fake_provider.return_parsed(
+        {
+            "verdict": "approve",
+            "feedback": "The selected source supports the candidate.",
+            "checked_evidence_ids": ["source-0"],
+            "corrected_answer": None,
+        }
+    )
+
+    await CriticAgent(fake_provider, max_context_bytes=1_500).verify(
+        task,
+        "42",
+        evidence,
+        fake_tools,
+    )
+    input_items = fake_provider.requests[0].input_items
+    context = json.loads(input_items[0]["content"][0]["text"])
+
+    assert context_size_bytes(input_items) <= 1_500
+    assert context["candidate_answer"] == "42"
+    assert context["evidence"][0]["evidence_id"] == "source-0"
+    assert "private webpage body " * 2_000 not in repr(input_items)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("parsed", "message"),
     [

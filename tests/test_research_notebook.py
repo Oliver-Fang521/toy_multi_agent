@@ -194,3 +194,22 @@ def test_evidence_cards_never_exceed_json_budget_or_include_full_webpage_bodies(
     assert len(encoded) <= 2_000
     assert all(len(str(card.get("excerpt", ""))) < 10_000 for card in cards)
     assert all("y" * 10_000 not in json.dumps(card) for card in cards)
+
+
+def test_evidence_cards_collapse_normalized_whitespace_content_duplicates() -> None:
+    cards = select_evidence_cards(
+        (
+            _notebook_entry(
+                "execute_python",
+                {"title": "  Computed\n value", "text": "Answer\t is 42"},
+                "first",
+            ),
+            _notebook_entry(
+                "execute_python",
+                {"title": "Computed value", "text": "Answer is   42"},
+                "duplicate",
+            ),
+        )
+    )
+
+    assert len(cards) == 1

@@ -49,6 +49,7 @@ _MAX_REASONING_OUTPUT_TOKENS = 8_000
 _DEFAULT_MAX_CONTEXT_BYTES = 24_576
 _MAX_CONTEXT_QUESTION_CHARS = 4_096
 _MAX_CONTEXT_INSTRUCTION_CHARS = 2_048
+_MAX_CARD_SELECTION_BYTES = 1_000_000
 _EVIDENCE_CARD_TIMESTAMP = datetime(1970, 1, 1, tzinfo=UTC)
 _REPAIR_INSTRUCTIONS = (
     "Your previous response did not match the required JSON schema. "
@@ -572,10 +573,14 @@ class CriticAgent:
         *,
         reasoning_effort: ReasoningEffort = "medium",
         max_tool_calls: int = 8,
+        max_context_bytes: int = _DEFAULT_MAX_CONTEXT_BYTES,
     ) -> None:
+        if max_context_bytes < 1:
+            raise ValueError("max_context_bytes must be positive")
         self.provider = provider
         self.reasoning_effort = reasoning_effort
         self.max_tool_calls = max_tool_calls
+        self.max_context_bytes = max_context_bytes
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"critic_usage_{id(self)}", default=None
         )
@@ -606,14 +611,6 @@ class CriticAgent:
         available_names = {tool.name for tool in allowed_tools}
         if missing := self.allowed_tool_names - available_names:
             raise ValueError(f"MCP client is missing required tools: {sorted(missing)}")
-        context = {
-            "task_id": task.task_id,
-            "question": task.question,
-            "level": task.level,
-            "candidate_answer": candidate,
-            "attachment": _attachment_metadata(task),
-            "evidence": [item.model_dump(mode="json") for item in evidence],
-        }
         output_schema = _strict_schema(CriticDecision)
         output_schema["properties"]["verdict"] = {
             "type": "string",
@@ -621,16 +618,11 @@ class CriticAgent:
         }
         request = ModelRequest(
             instructions=self.instructions,
-            input_items=(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": json.dumps(context, sort_keys=True, separators=(",", ":")),
-                        }
-                    ],
-                },
+            input_items=_critic_input(
+                task,
+                candidate,
+                evidence,
+                max_json_bytes=self.max_context_bytes,
             ),
             output_schema=output_schema,
             allowed_tools=allowed_tools,
@@ -773,13 +765,7 @@ async def _specialist_input(
     if max_json_bytes < 1:
         raise ValueError("max_json_bytes must be positive")
     attachment = _attachment_metadata(task)
-    context = _bounded_specialist_context(task, step, evidence, max_json_bytes)
-    content: list[dict[str, Any]] = [
-        {
-            "type": "input_text",
-            "text": json.dumps(context, sort_keys=True, separators=(",", ":")),
-        }
-    ]
+    extra_content: list[dict[str, Any]] = []
     if visual:
         if task.attachment_path is None:
             raise ValueError("visual agent requires a task attachment")
@@ -789,14 +775,21 @@ async def _specialist_input(
         encoded = b64encode(
             await tools.read_attachment_bytes(task.attachment_path)
         ).decode("ascii")
-        content.append(
+        extra_content.append(
             {
                 "type": "input_image",
                 "image_url": f"data:{media_type};base64,{encoded}",
                 "detail": "high",
             }
         )
-    return ({"role": "user", "content": content},)
+    context = _bounded_specialist_context(
+        task,
+        step,
+        evidence,
+        max_json_bytes,
+        extra_content=extra_content,
+    )
+    return _context_input_items(context, extra_content)
 
 
 def context_size_bytes(input_items: Sequence[Mapping[str, Any]]) -> int:
@@ -821,7 +814,7 @@ def specialist_context_size_bytes(
 ) -> tuple[int, int]:
     """Return the bounded text-context size and selected evidence-card count."""
     context = _bounded_specialist_context(task, step, evidence, max_json_bytes)
-    return context_size_bytes(_text_input_items(context)), len(context["evidence"])
+    return context_size_bytes(_context_input_items(context)), len(context["evidence"])
 
 
 def _bounded_specialist_context(
@@ -829,6 +822,8 @@ def _bounded_specialist_context(
     step: PlanStep,
     evidence: Sequence[Evidence],
     max_json_bytes: int,
+    *,
+    extra_content: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     attachment = _attachment_metadata(task)
     context: dict[str, Any] = {
@@ -839,20 +834,106 @@ def _bounded_specialist_context(
         "attachment": attachment,
         "evidence": [],
     }
-    available_card_bytes = max(
-        0,
-        max_json_bytes - context_size_bytes(_text_input_items(context)),
+    return _bounded_evidence_context(
+        context,
+        evidence,
+        max_json_bytes=max_json_bytes,
+        extra_content=extra_content,
     )
-    context["evidence"] = list(
-        select_evidence_cards(
-            _notebook_entries_for_evidence(evidence),
-            max_json_bytes=available_card_bytes,
+
+
+def _critic_input(
+    task: GaiaTask,
+    candidate: str | None,
+    evidence: Sequence[Evidence],
+    *,
+    max_json_bytes: int,
+) -> tuple[dict[str, Any], ...]:
+    if max_json_bytes < 1:
+        raise ValueError("max_json_bytes must be positive")
+    context: dict[str, Any] = {
+        "task_id": task.task_id,
+        "question": _bounded_context_text(task.question, _MAX_CONTEXT_QUESTION_CHARS),
+        "level": task.level,
+        "candidate_answer": candidate,
+        "attachment": _attachment_metadata(task),
+        "evidence": [],
+    }
+    return _context_input_items(
+        _bounded_evidence_context(context, evidence, max_json_bytes=max_json_bytes)
+    )
+
+
+def _bounded_evidence_context(
+    context: dict[str, Any],
+    evidence: Sequence[Evidence],
+    *,
+    max_json_bytes: int,
+    extra_content: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    if context_size_bytes(_context_input_items(context, extra_content)) > max_json_bytes:
+        raise ValueError("context exceeds max_json_bytes before evidence selection")
+    cards = select_evidence_cards(
+        _notebook_entries_for_evidence(evidence),
+        max_json_bytes=_MAX_CARD_SELECTION_BYTES,
+    )
+    selected: list[dict[str, Any]] = []
+    for card in cards:
+        fitted = _fit_card_within_context(
+            context,
+            selected,
+            card,
+            max_json_bytes=max_json_bytes,
+            extra_content=extra_content,
         )
-    )
-    return context
+        if fitted is not None:
+            selected.append(fitted)
+    return {**context, "evidence": selected}
 
 
-def _text_input_items(context: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+def _fit_card_within_context(
+    context: Mapping[str, Any],
+    selected: Sequence[Mapping[str, Any]],
+    card: Mapping[str, Any],
+    *,
+    max_json_bytes: int,
+    extra_content: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    def fits(candidate: Mapping[str, Any]) -> bool:
+        candidate_context = {**context, "evidence": [*selected, dict(candidate)]}
+        return (
+            context_size_bytes(_context_input_items(candidate_context, extra_content))
+            <= max_json_bytes
+        )
+
+    candidate = dict(card)
+    if fits(candidate):
+        return candidate
+    excerpt = candidate.get("excerpt")
+    if not isinstance(excerpt, str):
+        return None
+    candidate.pop("excerpt")
+    if not fits(candidate):
+        return None
+    lower, upper = 0, len(excerpt)
+    while lower < upper:
+        midpoint = (lower + upper + 1) // 2
+        candidate["excerpt"] = excerpt[:midpoint]
+        if fits(candidate):
+            lower = midpoint
+        else:
+            upper = midpoint - 1
+    if lower:
+        candidate["excerpt"] = excerpt[:lower]
+    else:
+        candidate.pop("excerpt", None)
+    return candidate
+
+
+def _context_input_items(
+    context: Mapping[str, Any],
+    extra_content: Sequence[Mapping[str, Any]] = (),
+) -> tuple[dict[str, Any], ...]:
     return (
         {
             "role": "user",
@@ -865,7 +946,8 @@ def _text_input_items(context: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
                         separators=(",", ":"),
                         ensure_ascii=False,
                     ),
-                }
+                },
+                *(dict(item) for item in extra_content),
             ],
         },
     )

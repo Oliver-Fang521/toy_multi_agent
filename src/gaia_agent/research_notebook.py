@@ -70,13 +70,15 @@ def select_evidence_cards(
 
 def _evidence_card(entry: NotebookEntry, index: int) -> tuple[int, int, dict[str, Any], tuple[str, str]]:
     url, title, excerpt = _card_fields(entry.result)
+    title = _bound_text(title, _MAX_CARD_TITLE_CHARS)
+    excerpt = _bound_text(excerpt, _MAX_CARD_EXCERPT_CHARS)
     domain = urlparse(url).hostname if url else None
     card = {
         "entry_hash": hashlib.sha256(entry.signature.encode("utf-8")).hexdigest(),
         "tool_kind": _bound_text(entry.tool, _MAX_CARD_TITLE_CHARS),
-        "title": _bound_text(title, _MAX_CARD_TITLE_CHARS),
+        "title": title,
         "domain": _bound_text(domain, _MAX_CARD_DOMAIN_CHARS),
-        "excerpt": _bound_text(excerpt, _MAX_CARD_EXCERPT_CHARS),
+        "excerpt": excerpt,
     }
     evidence_id = entry.result.get("evidence_id")
     if isinstance(evidence_id, str) and evidence_id.strip():
