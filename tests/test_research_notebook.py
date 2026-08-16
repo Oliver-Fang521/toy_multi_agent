@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -15,6 +16,21 @@ from gaia_agent.research_notebook import (
     ResearchNotebook,
     select_evidence_cards,
 )
+
+
+def _rewrite_with_test_digest(path: Path, **updates: object) -> None:
+    entry = json.loads(path.read_text(encoding="utf-8"))
+    entry.update(updates)
+    unsigned = {key: value for key, value in entry.items() if key != "integrity_sha256"}
+    canonical = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    entry["integrity_sha256"] = hashlib.sha256(canonical).hexdigest()
+    path.write_text(json.dumps(entry), encoding="utf-8")
 
 
 def test_notebook_persists_private_bounded_result(tmp_path: Path) -> None:
@@ -57,6 +73,72 @@ def test_notebook_treats_corrupt_entry_as_a_cache_miss(tmp_path: Path) -> None:
     entry.write_text("not json", encoding="utf-8")
 
     assert notebook.lookup("web_search", {"query": "q"}) is None
+
+
+def test_notebook_treats_parseable_result_tampering_as_a_cache_miss(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    arguments = {"query": "q"}
+    notebook.record("web_search", arguments, {"answer": "trusted"})
+    entry = next((tmp_path / "private").rglob("*.json"))
+    raw = json.loads(entry.read_text(encoding="utf-8"))
+    raw["result"] = {"answer": "fabricated"}
+    entry.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert notebook.lookup("web_search", arguments) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "stale_value"),
+    [
+        pytest.param("schema_version", 999, id="unknown-schema"),
+        pytest.param("schema_version", 1.0, id="invalid-schema-type"),
+        pytest.param("contract", "gaia.research-notebook.stale", id="unknown-contract"),
+        pytest.param("task_id", "task-2", id="wrong-task-scope"),
+    ],
+)
+def test_notebook_rejects_rehashed_stale_contracts(
+    tmp_path: Path,
+    field: str,
+    stale_value: object,
+) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    arguments = {"query": "q"}
+    notebook.record("web_search", arguments, {"answer": "trusted"})
+    entry = next((tmp_path / "private").rglob("*.json"))
+    _rewrite_with_test_digest(entry, **{field: stale_value})
+
+    assert notebook.lookup("web_search", arguments) is None
+
+
+def test_notebook_does_not_trust_legacy_unsigned_entries(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    arguments = {"query": "q"}
+    notebook.record("web_search", arguments, {"answer": "trusted"})
+    entry = next((tmp_path / "private").rglob("*.json"))
+    raw = json.loads(entry.read_text(encoding="utf-8"))
+    for key in (
+        "schema_version",
+        "contract",
+        "notebook_scope",
+        "task_id",
+        "integrity_sha256",
+    ):
+        raw.pop(key, None)
+    entry.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert notebook.lookup("web_search", arguments) is None
+
+
+def test_notebook_does_not_replay_entry_copied_from_another_run_root(tmp_path: Path) -> None:
+    arguments = {"query": "q"}
+    first = ResearchNotebook(tmp_path / "run-one.private", "task-1")
+    first.record("web_search", arguments, {"answer": "first run"})
+    source = next(first.root.rglob("*.json"))
+    second = ResearchNotebook(tmp_path / "run-two.private", "task-1")
+    destination = second.root / "task-1" / source.name
+    destination.write_bytes(source.read_bytes())
+
+    assert second.lookup("web_search", arguments) is None
 
 
 def test_notebook_rejects_task_ids_that_escape_its_root(tmp_path: Path) -> None:

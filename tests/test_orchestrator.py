@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from collections import deque
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
@@ -441,6 +442,44 @@ async def test_budgeted_tool_client_restores_private_notebook_result_across_scop
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_budgeted_tool_client_executes_backend_for_tampered_notebook_entry(
+    tmp_path: Path,
+) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    arguments = {"query": "private query"}
+    notebook.record("web_search", arguments, {"answer": "trusted"})
+    entry = next((tmp_path / "private").rglob("*.json"))
+    raw = json.loads(entry.read_text(encoding="utf-8"))
+    raw["result"] = {"answer": "fabricated"}
+    entry.write_text(json.dumps(raw), encoding="utf-8")
+
+    class FreshBackend:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            return {"answer": "fresh"}
+
+    backend = FreshBackend()
+    client = _BudgetedToolClient(
+        backend,
+        max_calls=2,
+        audit=lambda *_: None,
+        notebook=notebook,
+    )
+
+    result = await client.call("web_search", arguments)
+
+    assert result == {"answer": "fresh"}
+    assert backend.calls == 1
+    assert client.executed_call_count == 1
+    assert client.restored_call_count == 0
 
 
 @pytest.mark.asyncio

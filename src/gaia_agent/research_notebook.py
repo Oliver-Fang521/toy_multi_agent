@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
 import os
 import stat
@@ -18,6 +19,21 @@ from urllib.parse import urlparse
 _MAX_CARD_TITLE_CHARS = 256
 _MAX_CARD_DOMAIN_CHARS = 255
 _MAX_CARD_EXCERPT_CHARS = 1_536
+_ENTRY_SCHEMA_VERSION = 1
+_ENTRY_CONTRACT = "gaia.research-notebook.entry"
+_ENTRY_BODY_KEYS = frozenset(
+    {
+        "schema_version",
+        "contract",
+        "notebook_scope",
+        "task_id",
+        "signature",
+        "tool",
+        "result",
+        "created_at",
+    }
+)
+_ENTRY_KEYS = _ENTRY_BODY_KEYS | {"integrity_sha256"}
 
 
 @dataclass(frozen=True)
@@ -188,7 +204,11 @@ class ResearchNotebook:
             if payload is None:
                 return None
             raw_entry = json.loads(payload)
-            entry = _parse_entry(raw_entry)
+            entry = _parse_entry(
+                raw_entry,
+                expected_notebook_scope=_notebook_scope(self.root),
+                expected_task_id=self.task_id,
+            )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
         if entry.signature != signature or entry.tool != tool:
@@ -208,7 +228,11 @@ class ResearchNotebook:
             result=copy.deepcopy(dict(result)),
             created_at=datetime.now(UTC),
         )
-        payload = _encode_entry(entry)
+        payload = _encode_entry(
+            entry,
+            notebook_scope=_notebook_scope(self.root),
+            task_id=self.task_id,
+        )
         if len(payload) > self.max_entry_bytes:
             raise ValueError("notebook entry exceeds max_entry_bytes")
         self._assert_private_directory(self.root)
@@ -297,13 +321,45 @@ def _signature(tool: str, arguments: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _encode_entry(entry: NotebookEntry) -> bytes:
+def _notebook_scope(root: Path) -> str:
+    return hashlib.sha256(str(root.absolute()).encode("utf-8")).hexdigest()
+
+
+def _entry_body(
+    entry: NotebookEntry,
+    *,
+    notebook_scope: str,
+    task_id: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _ENTRY_SCHEMA_VERSION,
+        "contract": _ENTRY_CONTRACT,
+        "notebook_scope": notebook_scope,
+        "task_id": task_id,
+        "signature": entry.signature,
+        "tool": entry.tool,
+        "result": entry.result,
+        "created_at": entry.created_at.isoformat(),
+    }
+
+
+def _integrity_digest(body: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        dict(body),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _encode_entry(entry: NotebookEntry, *, notebook_scope: str, task_id: str) -> bytes:
+    body = _entry_body(entry, notebook_scope=notebook_scope, task_id=task_id)
     return json.dumps(
         {
-            "signature": entry.signature,
-            "tool": entry.tool,
-            "result": entry.result,
-            "created_at": entry.created_at.isoformat(),
+            **body,
+            "integrity_sha256": _integrity_digest(body),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -312,17 +368,42 @@ def _encode_entry(entry: NotebookEntry) -> bytes:
     ).encode("utf-8")
 
 
-def _parse_entry(value: object) -> NotebookEntry:
-    if not isinstance(value, dict):
+def _parse_entry(
+    value: object,
+    *,
+    expected_notebook_scope: str,
+    expected_task_id: str,
+) -> NotebookEntry:
+    if not isinstance(value, dict) or set(value) != _ENTRY_KEYS:
         raise TypeError("notebook entry must be an object")
+    schema_version = value.get("schema_version")
+    contract = value.get("contract")
+    notebook_scope = value.get("notebook_scope")
+    task_id = value.get("task_id")
     signature = value.get("signature")
     tool = value.get("tool")
     result = value.get("result")
     created_at = value.get("created_at")
+    integrity_sha256 = value.get("integrity_sha256")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != _ENTRY_SCHEMA_VERSION
+    ):
+        raise ValueError("notebook entry schema is not supported")
+    if contract != _ENTRY_CONTRACT:
+        raise ValueError("notebook entry contract is not supported")
+    if notebook_scope != expected_notebook_scope:
+        raise ValueError("notebook entry run scope does not match")
+    if task_id != expected_task_id:
+        raise ValueError("notebook entry task scope does not match")
     if not isinstance(signature, str) or not isinstance(tool, str) or not isinstance(result, dict):
         raise TypeError("notebook entry has invalid fields")
-    if not isinstance(created_at, str):
+    if not isinstance(created_at, str) or not isinstance(integrity_sha256, str):
         raise TypeError("notebook entry has invalid timestamp")
+    body = {key: value[key] for key in _ENTRY_BODY_KEYS}
+    if not hmac.compare_digest(integrity_sha256, _integrity_digest(body)):
+        raise ValueError("notebook entry failed integrity validation")
     return NotebookEntry(
         signature=signature,
         tool=tool,
