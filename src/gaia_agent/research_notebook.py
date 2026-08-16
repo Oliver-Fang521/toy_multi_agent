@@ -39,8 +39,13 @@ class ResearchNotebook:
 
     def lookup(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any] | None:
         signature = _signature(tool, arguments)
+        entry_path = self._entry_path(signature)
         try:
-            raw_entry = json.loads(self._entry_path(signature).read_text(encoding="utf-8"))
+            self._assert_private_directory(self.root)
+            self._assert_private_directory(self._task_root)
+            if entry_path.is_symlink() or entry_path.stat().st_size > self.max_entry_bytes:
+                return None
+            raw_entry = json.loads(entry_path.read_text(encoding="utf-8"))
             entry = _parse_entry(raw_entry)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -64,12 +69,22 @@ class ResearchNotebook:
         payload = _encode_entry(entry)
         if len(payload) > self.max_entry_bytes:
             raise ValueError("notebook entry exceeds max_entry_bytes")
+        self._assert_private_directory(self.root)
+        self._assert_private_directory(self._task_root)
         self._atomic_write(self._entry_path(signature), payload)
 
     @staticmethod
     def _create_private_directory(path: Path) -> None:
+        _reject_symlink_components(path)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ResearchNotebook._assert_private_directory(path)
         path.chmod(0o700)
+
+    @staticmethod
+    def _assert_private_directory(path: Path) -> None:
+        _reject_symlink_components(path)
+        if not path.is_dir():
+            raise ValueError("notebook storage path must be a directory")
 
     def _entry_path(self, signature: str) -> Path:
         return self._task_root / f"{signature}.json"
@@ -98,6 +113,15 @@ class ResearchNotebook:
 def _is_contained_task_id(task_id: str) -> bool:
     path = Path(task_id)
     return bool(task_id) and path.name == task_id and "/" not in task_id and "\\" not in task_id
+
+
+def _reject_symlink_components(path: Path) -> None:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError("notebook storage must not traverse symlinks")
 
 
 def _signature(tool: str, arguments: Mapping[str, Any]) -> str:

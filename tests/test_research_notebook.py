@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import stat
 from pathlib import Path
 
@@ -62,3 +63,41 @@ def test_notebook_rejects_oversized_entries_without_writing_them(tmp_path: Path)
         notebook.record("web_search", {"query": "q"}, {"answer": "x" * 100})
 
     assert list((tmp_path / "private").rglob("*.json")) == []
+
+
+def test_notebook_rejects_a_private_root_symlink(tmp_path: Path) -> None:
+    public_output = tmp_path / "public-output"
+    public_output.mkdir()
+    private_root = tmp_path / "private"
+    private_root.symlink_to(public_output, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        ResearchNotebook(private_root, "task-1")
+
+    assert list(public_output.iterdir()) == []
+
+
+def test_notebook_rejects_a_task_directory_symlink(tmp_path: Path) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    escaped = tmp_path / "escaped"
+    escaped.mkdir()
+    (private_root / "task-1").symlink_to(escaped, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        ResearchNotebook(private_root, "task-1")
+
+    assert list(escaped.iterdir()) == []
+
+
+def test_notebook_treats_existing_oversized_entry_as_a_cache_miss(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1", max_entry_bytes=512)
+    arguments = {"query": "q"}
+    notebook.record("web_search", arguments, {"answer": "a"})
+    entry = next((tmp_path / "private").rglob("*.json"))
+    raw = json.loads(entry.read_text(encoding="utf-8"))
+    raw["result"] = {"answer": "x" * 1_000}
+    entry.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert entry.stat().st_size > notebook.max_entry_bytes
+    assert notebook.lookup("web_search", arguments) is None
