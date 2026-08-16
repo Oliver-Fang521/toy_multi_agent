@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from decimal import Decimal
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -307,6 +309,30 @@ def test_generation_records_configured_model_cost_details() -> None:
     }
 
 
+def test_generation_omits_non_finite_cost_details() -> None:
+    client = _FakeClient()
+    observability = Observability(
+        ObservabilityConfig(
+            enabled=True,
+            public_key="pk",
+            secret_key="sk",
+            input_cost_per_million=Decimal("1e999999"),
+        ),
+        client=client,
+    )
+    trace = observability.start_task(
+        "task-cost-overflow",
+        level=1,
+        model="test-model",
+        reasoning_effort="max",
+        evaluation_mode="test",
+    )
+
+    trace.generation("provider-generation").end(status="ok", usage=Usage(input_tokens=1))
+
+    assert "cost_details" not in client.observations[-1].updates[-1]
+
+
 def test_flush_reports_a_safe_warning_on_sdk_failure(caplog: pytest.LogCaptureFixture) -> None:
     client = _FakeClient(fail_flush=True)
     config = ObservabilityConfig(
@@ -434,8 +460,150 @@ async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
         "provider_retry_count": 0,
         "tool_success_count": 0,
         "tool_failure_count": 0,
+        "provider_latency_ms": 0.0,
+        "tool_latency_ms": 0.0,
         "checkpoint_restored": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_runner_traces_resumed_selected_tasks_with_persisted_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gaia_agent import runner as runner_module
+    from gaia_agent.config import RunConfig
+
+    tasks = [
+        GaiaTask(task_id=f"resume-task-{level}", question="private", level=level, final_answer="answer")
+        for level in (1, 2, 3)
+    ]
+    config = RunConfig(
+        openai_api_key="sk-test",
+        hf_token="hf-test",
+        sample_size=3,
+        output_dir=tmp_path / "run",
+    )
+
+    class _Orchestrator:
+        audit_events: tuple[()] = ()
+
+        async def run(self, task: GaiaTask) -> TaskPrediction:
+            return TaskPrediction(
+                task_id=task.task_id,
+                level=task.level,
+                answer="answer",
+                critic_verdict="approve",
+            )
+
+    monkeypatch.setattr(runner_module, "sample_stratified", lambda *_args: tasks)
+    monkeypatch.setattr(runner_module, "question_scorer", lambda *_args: True)
+    first = EvaluationRunner(
+        config=config,
+        dataset_loader=lambda _config: (tasks, "revision"),
+        orchestrator_factory=lambda _task: _Orchestrator(),
+    )
+    await first._run()
+
+    client = _FakeClient()
+    resumed = EvaluationRunner(
+        config=config.model_copy(update={"resume": True}),
+        dataset_loader=lambda _config: (tasks, "revision"),
+        orchestrator_factory=lambda _task: _Orchestrator(),
+        observability=Observability(
+            ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+        ),
+    )
+    await resumed._run()
+
+    roots = [observation for observation in client.observations if observation.name == "gaia-task"]
+    assert [root.kwargs["metadata"]["task_id"] for root in roots] == [task.task_id for task in tasks]
+    assert all(root.ended for root in roots)
+    assert all(root.updates[-1]["output"]["correct"] is True for root in roots)
+
+
+@pytest.mark.asyncio
+async def test_runner_records_safe_failure_when_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gaia_agent import runner as runner_module
+    from gaia_agent.config import RunConfig
+
+    tasks = [
+        GaiaTask(task_id=f"persist-task-{level}", question="private", level=level, final_answer="answer")
+        for level in (1, 2, 3)
+    ]
+    config = RunConfig(
+        openai_api_key="sk-test",
+        hf_token="hf-test",
+        sample_size=3,
+        output_dir=tmp_path / "run",
+    )
+
+    class _Orchestrator:
+        audit_events: tuple[()] = ()
+
+        async def run(self, task: GaiaTask) -> TaskPrediction:
+            return TaskPrediction(
+                task_id=task.task_id,
+                level=task.level,
+                answer="answer",
+                critic_verdict="approve",
+            )
+
+    client = _FakeClient()
+    monkeypatch.setattr(runner_module, "sample_stratified", lambda *_args: tasks)
+    monkeypatch.setattr(runner_module, "question_scorer", lambda *_args: True)
+    monkeypatch.setattr(runner_module, "_persist_task_artifacts", lambda *_args: (_ for _ in ()).throw(OSError()))
+    runner = EvaluationRunner(
+        config=config,
+        dataset_loader=lambda _config: (tasks, "revision"),
+        orchestrator_factory=lambda _task: _Orchestrator(),
+        observability=Observability(
+            ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+        ),
+    )
+
+    with pytest.raises(OSError):
+        await runner._run()
+
+    outcome = client.observations[0].updates[-1]["output"]
+    assert outcome["correct"] is False
+    assert outcome["error_category"] == "retry_exhausted"
+
+
+def test_task_trace_aggregates_provider_and_tool_latency(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gaia_agent import observability as observability_module
+
+    ticks = iter((0.0, 10.0, 12.0, 20.0, 25.0))
+    monkeypatch.setattr(observability_module.time, "monotonic", lambda: next(ticks))
+    client = _FakeClient()
+    trace = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+    ).start_task(
+        "task-latency",
+        level=1,
+        model="test-model",
+        reasoning_effort="max",
+        evaluation_mode="test",
+    )
+
+    trace.generation("provider-generation").end(status="ok", usage=Usage(input_tokens=1))
+    trace.span("mcp-tool").end(status="ok")
+    trace.finish(
+        TaskTraceOutcome(
+            answer_present=False,
+            evidence_count=0,
+            critic_verdict="not_run",
+            error_category="retry_exhausted",
+            correct=False,
+        )
+    )
+
+    output = client.observations[0].updates[-1]["output"]
+    assert output["provider_latency_ms"] == 2000.0
+    assert output["tool_latency_ms"] == 5000.0
 
 
 def test_task_trace_outcome_bounds_counts_and_categories() -> None:
@@ -460,5 +628,7 @@ def test_task_trace_outcome_bounds_counts_and_categories() -> None:
         "provider_retry_count": 0,
         "tool_success_count": 0,
         "tool_failure_count": 0,
+        "provider_latency_ms": 0.0,
+        "tool_latency_ms": 0.0,
         "checkpoint_restored": False,
     }

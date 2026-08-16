@@ -175,9 +175,8 @@ class EvaluationRunner:
             evaluation_mode=self._evaluation_mode,
         )
 
+        completed_predictions = {prediction.task_id: prediction for prediction in store.load_predictions()}
         for task in selected:
-            if task.task_id in store.completed_task_ids():
-                continue
             started = time.monotonic()
             trace = self._observability.start_task(
                 task.task_id,
@@ -188,8 +187,12 @@ class EvaluationRunner:
                 attempt_number=1,
                 evaluation_mode=self._evaluation_mode,
             )
+            if (persisted_prediction := completed_predictions.get(task.task_id)) is not None:
+                trace.finish(_task_trace_outcome(persisted_prediction, checkpoint_restored=True))
+                continue
             task_run: _TaskRun | None = None
             prediction: TaskPrediction | None = None
+            trace_failed = False
             try:
                 task_run = await self._run_task(task)
                 prediction = task_run.prediction
@@ -213,21 +216,20 @@ class EvaluationRunner:
                 # A plain append deliberately invokes Task 7's repair path for a
                 # parseable incomplete or corrupt record on resume.
                 store.append(prediction)
+            except Exception:
+                trace_failed = True
+                raise
             finally:
-                terminal = prediction or _failure_prediction(
+                terminal = (
+                    _failure_prediction(task, TerminalErrorCategory.RETRY_EXHAUSTED)
+                    if trace_failed
+                    else prediction
+                ) or _failure_prediction(
                     task, TerminalErrorCategory.RETRY_EXHAUSTED
                 )
                 trace.finish(
-                    TaskTraceOutcome(
-                        answer_present=terminal.answer is not None,
-                        evidence_count=len(terminal.evidence_ids),
-                        critic_verdict=terminal.critic_verdict,
-                        error_category=(
-                            terminal.error_category.value
-                            if terminal.error_category is not None
-                            else None
-                        ),
-                        correct=terminal.correct,
+                    _task_trace_outcome(
+                        terminal,
                         checkpoint_restored=bool(
                             task_run
                             and any(
@@ -673,6 +675,21 @@ def _failure_prediction(
         correct=False,
         critic_verdict="not_run",
         error_category=category,
+    )
+
+
+def _task_trace_outcome(
+    prediction: TaskPrediction,
+    *,
+    checkpoint_restored: bool,
+) -> TaskTraceOutcome:
+    return TaskTraceOutcome(
+        answer_present=prediction.answer is not None,
+        evidence_count=len(prediction.evidence_ids),
+        critic_verdict=prediction.critic_verdict,
+        error_category=(prediction.error_category.value if prediction.error_category is not None else None),
+        correct=prediction.correct,
+        checkpoint_restored=checkpoint_restored,
     )
 
 

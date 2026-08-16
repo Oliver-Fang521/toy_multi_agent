@@ -50,6 +50,8 @@ _TASK_OUTCOME_KEYS = frozenset(
         "provider_retry_count",
         "tool_success_count",
         "tool_failure_count",
+        "provider_latency_ms",
+        "tool_latency_ms",
         "checkpoint_restored",
     }
 )
@@ -181,12 +183,26 @@ def _parse_cost_rate(value: object) -> Decimal | None:
     return rate if rate.is_finite() and rate >= 0 else None
 
 
+def _finite_decimal_float(value: Decimal) -> float | None:
+    try:
+        result = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
 def _bounded_count(value: object) -> int:
     if isinstance(value, bool):
         return 0
     if not isinstance(value, int):
         return 0
     return min(_MAX_OUTCOME_COUNT, max(0, value))
+
+
+def _bounded_latency_ms(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 0.0
+    return min(1_000_000_000.0, max(0.0, float(value)))
 
 
 @dataclass(frozen=True)
@@ -201,6 +217,8 @@ class TaskTraceOutcome:
     provider_retry_count: int = 0
     tool_success_count: int = 0
     tool_failure_count: int = 0
+    provider_latency_ms: float = 0.0
+    tool_latency_ms: float = 0.0
     checkpoint_restored: bool = False
 
     def as_output(self) -> dict[str, object]:
@@ -217,6 +235,8 @@ class TaskTraceOutcome:
             "provider_retry_count": _bounded_count(self.provider_retry_count),
             "tool_success_count": _bounded_count(self.tool_success_count),
             "tool_failure_count": _bounded_count(self.tool_failure_count),
+            "provider_latency_ms": _bounded_latency_ms(self.provider_latency_ms),
+            "tool_latency_ms": _bounded_latency_ms(self.tool_latency_ms),
             "checkpoint_restored": bool(self.checkpoint_restored),
         }
 
@@ -302,6 +322,8 @@ def _sanitize_task_outcome(value: dict[str, object] | object) -> dict[str, objec
         provider_retry_count=raw.get("provider_retry_count", 0),
         tool_success_count=raw.get("tool_success_count", 0),
         tool_failure_count=raw.get("tool_failure_count", 0),
+        provider_latency_ms=raw.get("provider_latency_ms", 0.0),
+        tool_latency_ms=raw.get("tool_latency_ms", 0.0),
         checkpoint_restored=bool(raw.get("checkpoint_restored", False)),
     ).as_output()
 
@@ -512,15 +534,21 @@ class TaskTrace:
     def _cost_details(self, usage: Usage) -> dict[str, float] | None:
         details: dict[str, float] = {}
         if self._input_cost_per_million is not None:
-            details["input"] = float(
-                Decimal(max(0, usage.input_tokens)) * self._input_cost_per_million / Decimal(1_000_000)
+            cost = _finite_decimal_float(
+                Decimal(max(0, usage.input_tokens))
+                * self._input_cost_per_million
+                / Decimal(1_000_000)
             )
+            if cost is not None:
+                details["input"] = cost
         if self._output_cost_per_million is not None:
-            details["output"] = float(
+            cost = _finite_decimal_float(
                 Decimal(max(0, usage.output_tokens))
                 * self._output_cost_per_million
                 / Decimal(1_000_000)
             )
+            if cost is not None:
+                details["output"] = cost
         return details or None
 
     def _record_stage(
@@ -593,6 +621,12 @@ class TaskTrace:
             ),
             tool_success_count=_bounded_count(outcome.tool_success_count + self._tool_success_count),
             tool_failure_count=_bounded_count(outcome.tool_failure_count + self._tool_failure_count),
+            provider_latency_ms=_bounded_latency_ms(
+                outcome.provider_latency_ms + self._provider_latency_seconds * 1000
+            ),
+            tool_latency_ms=_bounded_latency_ms(
+                outcome.tool_latency_ms + self._tool_latency_seconds * 1000
+            ),
         )
         output = completed.as_output()
         self._root.end(
