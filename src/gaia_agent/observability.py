@@ -55,6 +55,37 @@ _SAFE_TRACE_CATEGORIES = _SAFE_ERROR_CATEGORIES | frozenset(
         "not_run",
     }
 )
+_SAFE_RETRY_CATEGORIES = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "RateLimitError",
+        "InternalServerError",
+        "provider_transient",
+        "task_transient",
+        "TimeoutError",
+        "ConnectionError",
+    }
+)
+_SAFE_RETRY_DECISIONS = frozenset(
+    {"not_needed", "retry", "recovered", "exhausted", "not_retryable"}
+)
+_SAFE_RETRY_REASONS = frozenset(
+    {"provider_transient_exhausted", "timeout", "task_transient"}
+)
+_SAFE_TERMINAL_ROUTES = frozenset(
+    {"submit", "recovered_submit", "checkpoint_restored", "terminal_failure"}
+)
+_SAFE_ROOT_STAGES = frozenset({"plan", "act", "verify", "correct", "submit", "recovery"})
+_SAFE_RECOVERY_CODES = frozenset({"not_needed", "succeeded", "exhausted", "checkpoint"})
+_SAFE_CRITIC_FALLBACK_REASONS = frozenset(
+    {
+        "critic_repair_exhausted_degraded_approval",
+        "critic_repair_exhausted_policy_denied",
+        "critic_repair_exhausted_candidate_missing",
+        "critic_repair_exhausted_evidence_unusable",
+    }
+)
 _TRACE_DECISION_KEYS = frozenset(
     {
         "provider",
@@ -80,6 +111,12 @@ _TASK_OUTCOME_KEYS = frozenset(
         "provider_latency_ms",
         "tool_latency_ms",
         "checkpoint_restored",
+        "attempt_number",
+        "recovery_count",
+        "recovery_succeeded",
+        "retry_reason",
+        "retry_category",
+        "terminal_route",
     }
 )
 
@@ -119,11 +156,12 @@ _SAFE_METADATA_KEYS = frozenset(
         "result_key_count",
         "argument_key_count",
         "tool_call_count",
+        "attempt_number",
         "provider_attempt_count",
         "provider_retry_count",
         "retry_category",
+        "retry_decision",
         "run_id",
-        "attempt_number",
         *_TASK_OUTCOME_KEYS,
     }
 )
@@ -156,9 +194,14 @@ _SAFE_SUMMARY_KEYS = frozenset(
         "parsed",
         "refused",
         "tool_call_count",
+        "attempt_number",
         "provider_attempt_count",
         "provider_retry_count",
         "retry_category",
+        "retry_decision",
+        "recovery",
+        "stages",
+        "fallback_reason",
     }
 )
 _CURRENT_TRACE: ContextVar[TaskTrace | None] = ContextVar("gaia_langfuse_trace", default=None)
@@ -253,6 +296,13 @@ class TaskTraceOutcome:
     provider_latency_ms: float = 0.0
     tool_latency_ms: float = 0.0
     checkpoint_restored: bool = False
+    attempt_number: int = 1
+    recovery_count: int = 0
+    recovery_succeeded: bool = False
+    retry_reason: str | None = None
+    retry_category: str | None = None
+    terminal_route: str = "terminal_failure"
+    stage_codes: tuple[str, ...] = ()
 
     def as_output(self) -> dict[str, object]:
         return {
@@ -271,6 +321,40 @@ class TaskTraceOutcome:
             "provider_latency_ms": _bounded_latency_ms(self.provider_latency_ms),
             "tool_latency_ms": _bounded_latency_ms(self.tool_latency_ms),
             "checkpoint_restored": bool(self.checkpoint_restored),
+            "attempt_number": max(1, _bounded_count(self.attempt_number)),
+            "recovery_count": _bounded_count(self.recovery_count),
+            "recovery_succeeded": bool(self.recovery_succeeded),
+            "retry_reason": (
+                self.retry_reason if self.retry_reason in _SAFE_RETRY_REASONS else None
+            ),
+            "retry_category": (
+                self.retry_category if self.retry_category in _SAFE_RETRY_CATEGORIES else None
+            ),
+            "terminal_route": (
+                self.terminal_route
+                if self.terminal_route in _SAFE_TERMINAL_ROUTES
+                else "terminal_failure"
+            ),
+        }
+
+    def reasoning_summary(self) -> dict[str, object]:
+        route = (
+            self.terminal_route
+            if self.terminal_route in _SAFE_TERMINAL_ROUTES
+            else "terminal_failure"
+        )
+        if self.checkpoint_restored:
+            recovery = "checkpoint"
+        elif self.recovery_succeeded:
+            recovery = "succeeded"
+        elif self.recovery_count:
+            recovery = "exhausted"
+        else:
+            recovery = "not_needed"
+        return {
+            "route": route,
+            "recovery": recovery,
+            "stages": [code for code in self.stage_codes if code in _SAFE_ROOT_STAGES][:16],
         }
 
 
@@ -325,6 +409,14 @@ def _sanitize_metadata(metadata: dict[str, object] | None) -> dict[str, object]:
             sanitized = _safe_trace_decision(key, value)
             if sanitized is not None:
                 safe[key] = sanitized
+            continue
+        if key == "retry_category":
+            if value in _SAFE_RETRY_CATEGORIES:
+                safe[key] = value
+            continue
+        if key == "retry_decision":
+            if value in _SAFE_RETRY_DECISIONS:
+                safe[key] = value
             continue
         if key in _TASK_OUTCOME_KEYS:
             sanitized = _sanitize_task_outcome({key: value})[key]
@@ -388,6 +480,14 @@ def _sanitize_task_outcome(value: dict[str, object] | object) -> dict[str, objec
         provider_latency_ms=raw.get("provider_latency_ms", 0.0),
         tool_latency_ms=raw.get("tool_latency_ms", 0.0),
         checkpoint_restored=bool(raw.get("checkpoint_restored", False)),
+        attempt_number=raw.get("attempt_number", 1),
+        recovery_count=raw.get("recovery_count", 0),
+        recovery_succeeded=bool(raw.get("recovery_succeeded", False)),
+        retry_reason=(str(raw["retry_reason"]) if raw.get("retry_reason") is not None else None),
+        retry_category=(
+            str(raw["retry_category"]) if raw.get("retry_category") is not None else None
+        ),
+        terminal_route=str(raw.get("terminal_route", "terminal_failure")),
     ).as_output()
 
 
@@ -405,13 +505,37 @@ def _sanitize_summary(value: dict[str, object] | None) -> dict[str, object]:
         elif isinstance(raw_value, int) and not isinstance(raw_value, bool):
             safe[key] = max(0, raw_value) if key.endswith(("_count", "_number")) else raw_value
         elif isinstance(raw_value, str):
-            safe[key] = raw_value[:_MAX_STRING_LENGTH]
+            if key == "retry_category":
+                if raw_value in _SAFE_RETRY_CATEGORIES:
+                    safe[key] = raw_value
+            elif key == "retry_decision":
+                if raw_value in _SAFE_RETRY_DECISIONS:
+                    safe[key] = raw_value
+            elif key == "recovery":
+                if raw_value in _SAFE_RECOVERY_CODES:
+                    safe[key] = raw_value
+            elif key == "fallback_reason":
+                if raw_value in _SAFE_CRITIC_FALLBACK_REASONS:
+                    safe[key] = raw_value
+            elif key == "route":
+                allowed_routes = _SAFE_TERMINAL_ROUTES | frozenset(
+                    {"lookup", "computation", "file", "visual", "multi_stage"}
+                )
+                if raw_value in allowed_routes:
+                    safe[key] = raw_value
+            else:
+                safe[key] = raw_value[:_MAX_STRING_LENGTH]
         elif isinstance(raw_value, (list, tuple)):
-            safe[key] = [
-                item[:_MAX_STRING_LENGTH]
-                for item in raw_value
-                if isinstance(item, str)
-            ][:32]
+            if key == "stages":
+                safe[key] = [
+                    item for item in raw_value if isinstance(item, str) and item in _SAFE_ROOT_STAGES
+                ][:16]
+            else:
+                safe[key] = [
+                    item[:_MAX_STRING_LENGTH]
+                    for item in raw_value
+                    if isinstance(item, str)
+                ][:32]
     return safe
 
 
@@ -694,8 +818,17 @@ class TaskTrace:
         output = completed.as_output()
         self._root.end(
             status="error" if output["error_category"] is not None else "ok",
+            metadata={
+                "attempt_number": output["attempt_number"],
+                "recovery_count": output["recovery_count"],
+                "recovery_succeeded": output["recovery_succeeded"],
+                "retry_reason": output["retry_reason"],
+                "retry_category": output["retry_category"],
+                "terminal_route": output["terminal_route"],
+            },
             usage=self._provider_usage,
             output=output,
+            summary=completed.reasoning_summary(),
         )
         self._closed = True
         _CURRENT_TRACE.reset(self._token)

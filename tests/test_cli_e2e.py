@@ -975,6 +975,9 @@ def test_seed_selection_and_task_level_manifest_are_literal_and_stable(
 
 @pytest.mark.asyncio
 async def test_runner_retries_one_transient_failure_once_only(tmp_path: Path) -> None:
+    class PrivateConnectionError(ConnectionError):
+        pass
+
     tasks, revision = _fixture_tasks()
     selected_ids = ("synthetic-l1-a", "synthetic-l2-b", "synthetic-l3-b")
     selected = {task.task_id: task for task in tasks if task.task_id in selected_ids}
@@ -989,7 +992,7 @@ async def test_runner_retries_one_transient_failure_once_only(tmp_path: Path) ->
             critic_verdict="not_run",
             error_category=TerminalErrorCategory.TIMEOUT,
         ),
-        ConnectionError("temporary"),
+        PrivateConnectionError("temporary"),
     )
     outcomes: dict[str, deque[object]] = {}
     for task_id, first_failure in zip(selected, first_failures, strict=True):
@@ -1032,6 +1035,142 @@ async def test_runner_retries_one_transient_failure_once_only(tmp_path: Path) ->
     ]
     assert sleeps == [0.05, 0.05, 0.05]
     assert summary.total_tokens == 7
+    predictions = [
+        json.loads(line)
+        for line in (tmp_path / "predictions.jsonl").read_text().splitlines()
+    ]
+    assert predictions[2]["retry_category"] == "ConnectionError"
+    assert "PrivateConnectionError" not in repr(predictions)
+
+
+@pytest.mark.asyncio
+async def test_runner_recovers_one_typed_provider_exhaustion_and_persists_safe_counters(
+    tmp_path: Path,
+) -> None:
+    tasks, revision = _fixture_tasks()
+    selected_ids = ("synthetic-l1-a", "synthetic-l2-b", "synthetic-l3-b")
+    calls: list[str] = []
+    outcomes: dict[str, deque[object]] = {}
+    for task_id in selected_ids:
+        task = next(item for item in tasks if item.task_id == task_id)
+        scripted: list[object] = []
+        if task_id == selected_ids[0]:
+            scripted.append(
+                TaskPrediction(
+                    task_id=task_id,
+                    level=task.level,
+                    answer=None,
+                    critic_verdict="not_run",
+                    error_category=TerminalErrorCategory.RETRY_EXHAUSTED,
+                    retry_reason="provider_transient_exhausted",
+                    retry_category="APIConnectionError",
+                    provider_attempt_count=4,
+                )
+            )
+        scripted.append(
+            TaskPrediction(
+                task_id=task_id,
+                level=task.level,
+                answer="offline answer",
+                critic_verdict="approve",
+                evidence_ids=("evidence-0001",),
+            )
+        )
+        outcomes[task_id] = deque(scripted)
+
+    runner = EvaluationRunner(
+        config=_config(tmp_path),
+        dataset_loader=lambda _config: (tasks, revision),
+        orchestrator_factory=lambda task: _ScriptedOrchestrator(
+            task, outcomes[task.task_id], calls
+        ),
+        sleep=lambda _delay: asyncio.sleep(0),
+    )
+
+    await runner.run()
+
+    predictions = [
+        json.loads(line)
+        for line in (tmp_path / "predictions.jsonl").read_text().splitlines()
+    ]
+    recovered = predictions[0]
+    assert calls.count(selected_ids[0]) == 2
+    assert recovered["attempt_number"] == 2
+    assert recovered["recovery_count"] == 1
+    assert recovered["recovery_succeeded"] is True
+    assert recovered["retry_reason"] == "provider_transient_exhausted"
+    assert recovered["retry_category"] == "APIConnectionError"
+    assert recovered["provider_attempt_count"] == 4
+    audit = [
+        json.loads(line)
+        for line in (tmp_path / "tasks" / selected_ids[0] / "audit.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert audit[-1]["event_type"] == "task_recovery"
+    assert audit[-1]["payload"] == {
+        "attempt_number": 2,
+        "recovery_succeeded": True,
+        "retry_category": "APIConnectionError",
+        "retry_reason": "provider_transient_exhausted",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runner_stops_after_one_failed_provider_exhaustion_recovery(tmp_path: Path) -> None:
+    tasks, revision = _fixture_tasks()
+    selected_ids = ("synthetic-l1-a", "synthetic-l2-b", "synthetic-l3-b")
+    calls: list[str] = []
+    outcomes: dict[str, deque[object]] = {}
+    for task_id in selected_ids:
+        task = next(item for item in tasks if item.task_id == task_id)
+        if task_id == selected_ids[0]:
+            scripted = [
+                TaskPrediction(
+                    task_id=task_id,
+                    level=task.level,
+                    answer=None,
+                    critic_verdict="not_run",
+                    error_category=TerminalErrorCategory.RETRY_EXHAUSTED,
+                    retry_reason="provider_transient_exhausted",
+                    retry_category="APIConnectionError",
+                    provider_attempt_count=4,
+                )
+                for _ in range(2)
+            ]
+        else:
+            scripted = [
+                TaskPrediction(
+                    task_id=task_id,
+                    level=task.level,
+                    answer="offline answer",
+                    critic_verdict="approve",
+                )
+            ]
+        outcomes[task_id] = deque(scripted)
+
+    runner = EvaluationRunner(
+        config=_config(tmp_path),
+        dataset_loader=lambda _config: (tasks, revision),
+        orchestrator_factory=lambda task: _ScriptedOrchestrator(
+            task, outcomes[task.task_id], calls
+        ),
+        sleep=lambda _delay: asyncio.sleep(0),
+    )
+
+    await runner.run()
+
+    predictions = [
+        json.loads(line)
+        for line in (tmp_path / "predictions.jsonl").read_text().splitlines()
+    ]
+    exhausted = predictions[0]
+    assert calls.count(selected_ids[0]) == 2
+    assert exhausted["error_category"] == "retry_exhausted"
+    assert exhausted["attempt_number"] == 2
+    assert exhausted["recovery_count"] == 1
+    assert exhausted["recovery_succeeded"] is False
+    assert exhausted["provider_attempt_count"] == 8
 
 
 @pytest.mark.asyncio
@@ -1104,6 +1243,8 @@ async def test_runner_uses_configured_odd_votes_and_stops_only_after_strict_majo
     predictions = [json.loads(line) for line in (tmp_path / "predictions.jsonl").read_text().splitlines()]
     assert all(item["answer"] == "winner" for item in predictions)
     assert all(item["vote_count"] == 3 for item in predictions)
+    assert all(item["attempt_number"] == 1 for item in predictions)
+    assert all(item["recovery_count"] == 0 for item in predictions)
 
 
 def test_resume_skips_complete_records_and_plain_append_repairs_incomplete_record(

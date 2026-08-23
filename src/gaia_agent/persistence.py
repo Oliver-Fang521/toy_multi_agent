@@ -23,6 +23,7 @@ from gaia_agent.models import (
     TaskPrediction,
     TerminalErrorCategory,
 )
+from gaia_agent.reliability import TRANSIENT_PROVIDER_ERROR_NAMES
 
 _TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _OPAQUE_EVIDENCE_ID_PATTERN = re.compile(r"evidence-[0-9]{4}\Z")
@@ -38,6 +39,12 @@ _SECRET_VALUE_PATTERNS = (
 )
 _PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _PUBLIC_PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_PUBLIC_RETRY_REASONS = frozenset(
+    {"provider_transient_exhausted", "timeout", "task_transient"}
+)
+_PUBLIC_RETRY_CATEGORIES = TRANSIENT_PROVIDER_ERROR_NAMES | frozenset(
+    {"TimeoutError", "ConnectionError", "provider_transient", "task_transient"}
+)
 _PUBLIC_TOOL_NAMES = frozenset(
     {
         "web_search",
@@ -103,6 +110,7 @@ _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
         "context_budget_pressure",
         "plan_early_stop",
         "soft_step_failure",
+        "task_recovery",
     }
 )
 _PUBLIC_AUDIT_EVENT_KEYS = {
@@ -134,6 +142,9 @@ _PUBLIC_AUDIT_EVENT_KEYS = {
     "context_budget_pressure": frozenset({"bytes", "item_count", "max_bytes"}),
     "plan_early_stop": frozenset({"completed_steps", "remaining_steps"}),
     "soft_step_failure": frozenset({"step_number", "code"}),
+    "task_recovery": frozenset(
+        {"attempt_number", "retry_reason", "retry_category", "recovery_succeeded"}
+    ),
 }
 _PUBLIC_CRITIC_VERDICTS = frozenset({"approve", "revise", "insufficient_evidence", "not_run"})
 _NORMAL_CRITIC_VERDICTS = _PUBLIC_CRITIC_VERDICTS - {"not_run"}
@@ -150,6 +161,12 @@ _PREDICTION_KEYS = frozenset(
         "error_category",
         "run_index",
         "vote_count",
+        "attempt_number",
+        "recovery_count",
+        "recovery_succeeded",
+        "retry_reason",
+        "retry_category",
+        "provider_attempt_count",
     }
 )
 
@@ -596,6 +613,7 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
             "item_count",
             "completed_steps",
             "remaining_steps",
+            "attempt_number",
         }:
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000_000:
                 raise ValueError("audit counter must be a bounded integer")
@@ -625,8 +643,12 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
                 raise ValueError("audit evidence IDs must be trusted opaque IDs")
             if len(value) > 9_999:
                 raise ValueError("audit evidence IDs exceed the public limit")
-        elif key == "has_candidate" and not isinstance(value, bool):
-            raise ValueError("audit has_candidate must be boolean")
+        elif key in {"has_candidate", "recovery_succeeded"} and not isinstance(value, bool):
+            raise ValueError("audit boolean field must be boolean")
+        elif key == "retry_reason" and value not in _PUBLIC_RETRY_REASONS:
+            raise ValueError("audit retry reason is not allowlisted")
+        elif key == "retry_category" and value not in _PUBLIC_RETRY_CATEGORIES:
+            raise ValueError("audit retry category is not allowlisted")
         public[key] = value
     if event_type in {
         "tool_call_started",
@@ -736,6 +758,12 @@ def _public_prediction_record(prediction: TaskPrediction) -> dict[str, Any]:
         ),
         "run_index": prediction.run_index,
         "vote_count": prediction.vote_count,
+        "attempt_number": prediction.attempt_number,
+        "recovery_count": prediction.recovery_count,
+        "recovery_succeeded": prediction.recovery_succeeded,
+        "retry_reason": prediction.retry_reason,
+        "retry_category": prediction.retry_category,
+        "provider_attempt_count": prediction.provider_attempt_count,
     }
 
 
@@ -754,6 +782,15 @@ def validate_public_prediction(prediction: TaskPrediction) -> None:
         or not isinstance(prediction.error_category, TerminalErrorCategory)
     ):
         raise ValueError("not_run prediction must be an incorrect terminal failure")
+    if prediction.retry_reason is not None and prediction.retry_reason not in _PUBLIC_RETRY_REASONS:
+        raise ValueError("prediction retry reason is not public")
+    if (
+        prediction.retry_category is not None
+        and prediction.retry_category not in _PUBLIC_RETRY_CATEGORIES
+    ):
+        raise ValueError("prediction retry category is not public")
+    if prediction.recovery_succeeded and prediction.recovery_count < 1:
+        raise ValueError("successful recovery requires a recorded recovery")
 
 
 def _validated_prediction_record(
@@ -776,6 +813,24 @@ def _validated_prediction_record(
     if not isinstance(record.get("run_index"), int) or record["run_index"] < 0:
         return None
     if not isinstance(record.get("vote_count"), int) or record["vote_count"] < 1:
+        return None
+    if not isinstance(record.get("attempt_number"), int) or isinstance(
+        record["attempt_number"], bool
+    ) or record["attempt_number"] < 1:
+        return None
+    if not isinstance(record.get("recovery_count"), int) or isinstance(
+        record["recovery_count"], bool
+    ) or record["recovery_count"] < 0:
+        return None
+    if not isinstance(record.get("recovery_succeeded"), bool):
+        return None
+    if record.get("retry_reason") not in _PUBLIC_RETRY_REASONS | {None}:
+        return None
+    if record.get("retry_category") not in _PUBLIC_RETRY_CATEGORIES | {None}:
+        return None
+    if not isinstance(record.get("provider_attempt_count"), int) or isinstance(
+        record["provider_attempt_count"], bool
+    ) or record["provider_attempt_count"] < 0:
         return None
     usage = record.get("usage")
     if not isinstance(usage, dict) or set(usage) != {

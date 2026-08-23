@@ -498,7 +498,12 @@ def _parse_trust_anchor(payload: bytes) -> tuple[str, bytes]:
         "hmac_key_hex",
     }:
         raise ValueError("notebook trust anchor contract is invalid")
-    if value.get("schema_version") != _TRUST_ANCHOR_SCHEMA_VERSION:
+    schema_version = value.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != _TRUST_ANCHOR_SCHEMA_VERSION
+    ):
         raise ValueError("notebook trust anchor schema is unsupported")
     if value.get("contract") != _TRUST_ANCHOR_CONTRACT:
         raise ValueError("notebook trust anchor contract is unsupported")

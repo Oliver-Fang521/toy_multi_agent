@@ -610,6 +610,69 @@ async def test_mcp_client_records_tool_shape_without_arguments_or_results(
 
 
 @pytest.mark.asyncio
+async def test_mcp_span_omits_argument_and_result_keys_outside_the_tool_contract(
+    tmp_path: Path,
+    run_config: RunConfig,
+) -> None:
+    class UnexpectedShapeClient:
+        async def call_tool(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                is_error=False,
+                content=[],
+                structured_content={
+                    "url": "https://private.test/article",
+                    "text": "private body",
+                    "prompt": "private prompt",
+                    "raw_body": "private raw body",
+                },
+            )
+
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "task-1",
+        level=1,
+        model="test-model",
+        reasoning_effort="max",
+        run_index=0,
+        evaluation_mode="test",
+    )
+    client = MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        allowed={"read_webpage"},
+        observability=observability,
+    )
+    client._client = UnexpectedShapeClient()
+
+    await client.call(
+        "read_webpage",
+        {
+            "url": "https://private.test/article",
+            "prompt": "private prompt",
+            "raw_body": "private raw body",
+        },
+    )
+    trace.close()
+
+    span = trace_client.observations[-1]
+    assert span.kwargs["input"] == {
+        "argument_count": 1,
+        "argument_keys": ["url"],
+    }
+    assert span.updates[-1]["metadata"]["result_key_count"] == 2
+    assert span.updates[-1]["output"] == {
+        "result_key_count": 2,
+        "result_keys": ["text", "url"],
+    }
+    assert "prompt" not in repr(span.kwargs)
+    assert "raw_body" not in repr(span.updates)
+
+
+@pytest.mark.asyncio
 async def test_mcp_failure_span_records_only_bounded_structured_failure_metadata(
     tmp_path: Path, run_config: RunConfig
 ) -> None:

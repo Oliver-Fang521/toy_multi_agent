@@ -19,9 +19,11 @@ from gaia_agent.providers.base import (
     serialize_tool_output,
 )
 from gaia_agent.reliability import (
+    ProviderTransientExhaustedError,
     RetryPolicy,
     is_transient_provider_error,
     retry_delay,
+    transient_provider_error_category,
 )
 
 
@@ -30,11 +32,14 @@ class _ProviderRetryMetadata:
     attempt_count: int = 0
     retry_count: int = 0
     retry_category: str | None = None
+    retry_decision: str = "not_needed"
 
     def as_dict(self) -> dict[str, object]:
         metadata: dict[str, object] = {
             "provider_attempt_count": self.attempt_count,
             "provider_retry_count": self.retry_count,
+            "attempt_number": max(1, self.attempt_count),
+            "retry_decision": self.retry_decision,
         }
         if self.retry_category is not None:
             metadata["retry_category"] = self.retry_category
@@ -300,13 +305,26 @@ class OpenAIProvider:
                 retry_metadata = _CURRENT_RETRY_METADATA.get()
                 if retry_metadata is not None:
                     retry_metadata.attempt_count += 1
-                return await self._client.responses.create(**kwargs)
+                response = await self._client.responses.create(**kwargs)
+                retry_metadata = _CURRENT_RETRY_METADATA.get()
+                if retry_metadata is not None and retry_metadata.retry_count:
+                    retry_metadata.retry_decision = "recovered"
+                return response
             except Exception as error:
-                if (
-                    not is_transient_provider_error(error)
-                    or attempt == self._retry_policy.max_attempts
-                ):
+                if not is_transient_provider_error(error):
+                    retry_metadata = _CURRENT_RETRY_METADATA.get()
+                    if retry_metadata is not None:
+                        retry_metadata.retry_decision = "not_retryable"
                     raise
+                if attempt == self._retry_policy.max_attempts:
+                    retry_metadata = _CURRENT_RETRY_METADATA.get()
+                    if retry_metadata is not None:
+                        retry_metadata.retry_category = transient_provider_error_category(error)
+                        retry_metadata.retry_decision = "exhausted"
+                    raise ProviderTransientExhaustedError(
+                        retry_category=transient_provider_error_category(error),
+                        attempt_count=attempt,
+                    ) from error
                 self._record_retry(error, attempt)
                 await self._sleep(retry_delay(self._retry_policy, attempt, self._jitter))
         raise AssertionError("bounded provider retry did not return or raise")
@@ -316,7 +334,8 @@ class OpenAIProvider:
         retry_metadata = _CURRENT_RETRY_METADATA.get()
         if retry_metadata is not None:
             retry_metadata.retry_count += 1
-            retry_metadata.retry_category = type(error).__name__
+            retry_metadata.retry_category = transient_provider_error_category(error)
+            retry_metadata.retry_decision = "retry"
 
 
 def _aggregate_usage(responses: list[Any]) -> Usage:

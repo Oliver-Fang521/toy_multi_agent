@@ -34,6 +34,7 @@ from gaia_agent.orchestrator import (
     choose_majority,
 )
 from gaia_agent.providers import ToolSpec
+from gaia_agent.reliability import ProviderTransientExhaustedError
 from gaia_agent.research_notebook import ResearchNotebook
 
 
@@ -523,7 +524,7 @@ async def test_context_budget_pressure_forces_synthesis_before_enrichment() -> N
 
 
 @pytest.mark.asyncio
-async def test_visual_payload_size_triggers_context_pressure_before_visual_enrichment(
+async def test_visual_payload_size_does_not_trigger_text_pressure_before_visual_enrichment(
     tmp_path: Path,
 ) -> None:
     attachment = tmp_path / "large.png"
@@ -535,7 +536,11 @@ async def test_visual_payload_size_triggers_context_pressure_before_visual_enric
         calls,
         [_result(SpecialistName.COMPUTATION, (_evidence("calculation-1", "computation"),), "42")],
     )
-    visual = FakeSpecialist(SpecialistName.VISUAL, calls, [])
+    visual = FakeSpecialist(
+        SpecialistName.VISUAL,
+        calls,
+        [_result(SpecialistName.VISUAL, (_evidence("visual-1", "visual"),), "42")],
+    )
     critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
     tools = FakeTools(calls)
     orchestrator = Orchestrator(
@@ -552,31 +557,27 @@ async def test_visual_payload_size_triggers_context_pressure_before_visual_enric
     prediction = await orchestrator.run(_task(question="Compute the answer", attachment_path=attachment))
 
     assert prediction.answer == "42"
-    assert calls == ["planner", "computation", "critic", "submit_answer"]
+    assert calls == ["planner", "computation", "visual", "critic", "submit_answer"]
     pressure = [event for event in orchestrator.audit_events if event.event_type == "context_budget_pressure"]
-    assert len(pressure) == 1
-    assert pressure[0].payload["bytes"] >= int(24_576 * 0.7)
+    assert pressure == []
 
 
 @pytest.mark.asyncio
-async def test_initial_oversized_visual_stage_routes_to_critic_without_dispatch(
+async def test_initial_visual_stage_dispatches_a_normal_image_outside_the_text_budget(
     tmp_path: Path,
 ) -> None:
     attachment = tmp_path / "large.png"
-    attachment.write_bytes(b"x" * 2_000_000)
+    attachment.write_bytes(b"x" * 20_000)
     calls: list[str] = []
     visual = FakeSpecialist(
         SpecialistName.VISUAL,
         calls,
-        [_result(SpecialistName.VISUAL, (), None)],
+        [_result(SpecialistName.VISUAL, (_evidence("visual-1", "visual"),), "blue")],
     )
-    visual.max_context_bytes = 1_048_576
+    visual.max_context_bytes = 1_000
     critic = FakeCritic(
         calls,
-        [
-            _decision("insufficient_evidence", ()),
-            _decision("insufficient_evidence", ()),
-        ],
+        [_decision("approve", ("evidence-0001",))],
     )
     orchestrator = Orchestrator(
         planner=FakePlanner(calls, _plan(SpecialistName.VISUAL)),
@@ -584,38 +585,38 @@ async def test_initial_oversized_visual_stage_routes_to_critic_without_dispatch(
         critic=critic,
         tool_client_factory=FakeToolFactory(FakeTools(calls)),
         config=_config(
-            max_steps=1,
             quality_policy="benchmark",
-            stage_context_max_bytes=1_048_576,
+            stage_context_max_bytes=1_000,
         ),
     )
 
     prediction = await orchestrator.run(_task(attachment_path=attachment))
 
-    assert prediction.error_category == TerminalErrorCategory.CRITIC_REJECTION
-    assert "visual" not in calls
+    assert prediction.answer == "blue"
+    assert calls == ["planner", "visual", "critic", "submit_answer"]
     pressure = [event for event in orchestrator.audit_events if event.event_type == "context_budget_pressure"]
-    assert [event.payload for event in pressure] == [
-        {"bytes": 1_048_576, "item_count": 0, "max_bytes": 1_048_576}
-    ] * 2
+    assert pressure == []
 
 
 @pytest.mark.asyncio
-async def test_correction_oversized_visual_stage_is_not_dispatched(tmp_path: Path) -> None:
+async def test_correction_visual_stage_dispatches_a_normal_image_outside_the_text_budget(
+    tmp_path: Path,
+) -> None:
     attachment = tmp_path / "large.png"
     attachment.write_bytes(b"x" * 20_000)
     calls: list[str] = []
     visual = FakeSpecialist(
         SpecialistName.VISUAL,
         calls,
-        [_result(SpecialistName.VISUAL, (), None)],
+        [_result(SpecialistName.VISUAL, (_evidence("visual-1", "visual"),), "answer")],
     )
+    visual.max_context_bytes = 1_000
     orchestrator = Orchestrator(
         planner=FakePlanner(calls, _plan(SpecialistName.VISUAL)),
         specialists={SpecialistName.VISUAL: visual},
         critic=FakeCritic(calls, []),
         tool_client_factory=FakeToolFactory(FakeTools(calls)),
-        config=_config(quality_policy="benchmark"),
+        config=_config(quality_policy="benchmark", stage_context_max_bytes=1_000),
     )
     state = _TaskState(plan=_plan(SpecialistName.VISUAL), candidate="answer")
     tools = _BudgetedToolClient(FakeTools(calls), max_calls=4, audit=lambda *_: None)
@@ -627,9 +628,12 @@ async def test_correction_oversized_visual_stage_is_not_dispatched(tmp_path: Pat
         tools,
     )
 
-    assert calls == []
-    assert state.step_count == 0
-    assert any(event.event_type == "context_budget_pressure" for event in orchestrator.audit_events)
+    assert calls == ["visual"]
+    assert state.step_count == 1
+    assert not any(
+        event.event_type == "context_budget_pressure"
+        for event in orchestrator.audit_events
+    )
 
 
 def _config(**overrides: Any) -> RunConfig:
@@ -882,6 +886,7 @@ async def test_orchestrator_publishes_safe_reasoning_summaries() -> None:
     critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
     tools = FakeTools(calls)
     client = TraceClient()
+    critic.last_fallback_reason = "critic_repair_exhausted_degraded_approval"
     observability = Observability(
         ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
         client=client,
@@ -921,6 +926,10 @@ async def test_orchestrator_publishes_safe_reasoning_summaries() -> None:
     ]
     assert {summary.get("route") for summary in summaries} & {"lookup"}
     assert any(summary.get("verdict") == "approve" for summary in summaries)
+    assert any(
+        summary.get("fallback_reason") == "critic_repair_exhausted_degraded_approval"
+        for summary in summaries
+    )
     assert any(summary.get("decision") == "submit" for summary in summaries)
     assert all("Marie Curie" not in repr(summary) for summary in summaries)
 
@@ -1752,6 +1761,30 @@ async def test_exceptions_map_to_stable_terminal_categories(
 
     assert result.error_category == expected
     assert result.answer is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_preserves_safe_provider_transient_exhaustion_cause() -> None:
+    calls: list[str] = []
+    result = await _orchestrator(
+        planner=FakePlanner(
+            calls,
+            _plan(SpecialistName.LOOKUP),
+            error=ProviderTransientExhaustedError(
+                retry_category="APIConnectionError",
+                attempt_count=4,
+            ),
+        ),
+        specialists={},
+        critic=FakeCritic(calls, []),
+        tools=FakeTools(calls),
+    ).run(_task())
+
+    assert result.error_category == TerminalErrorCategory.RETRY_EXHAUSTED
+    assert result.retry_reason == "provider_transient_exhausted"
+    assert result.retry_category == "APIConnectionError"
+    assert result.provider_attempt_count == 4
+    assert "api.openai.com" not in result.model_dump_json()
 
 
 @pytest.mark.asyncio

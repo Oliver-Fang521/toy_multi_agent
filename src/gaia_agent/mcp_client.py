@@ -30,6 +30,50 @@ _PUBLIC_TOOLS = frozenset(
         "submit_answer",
     }
 )
+_PUBLIC_TOOL_TRACE_ARGUMENT_KEYS = {
+    "web_search": frozenset({"query"}),
+    "read_webpage": frozenset({"url"}),
+    "execute_python": frozenset(
+        {"instruction", "code", "paths", "attachment_ids", "file_ids"}
+    ),
+    "read_attachment": frozenset({"path"}),
+    "transcribe_audio": frozenset({"path"}),
+    "submit_answer": frozenset({"answer", "evidence_ids"}),
+}
+_PUBLIC_TOOL_TRACE_RESULT_KEYS = {
+    "web_search": frozenset({"answer", "sources", "output", "truncated"}),
+    "read_webpage": frozenset(
+        {
+            "url",
+            "status_code",
+            "content_type",
+            "text",
+            "truncated",
+            "answer",
+            "sources",
+            "fallback",
+            "output",
+        }
+    ),
+    "execute_python": frozenset({"output_text", "outputs", "output", "truncated"}),
+    "read_attachment": frozenset(
+        {
+            "path",
+            "kind",
+            "text",
+            "rows",
+            "data",
+            "page_count",
+            "sheets",
+            "media_type",
+            "size_bytes",
+            "output",
+            "truncated",
+        }
+    ),
+    "transcribe_audio": frozenset({"text", "output", "truncated"}),
+    "submit_answer": frozenset({"answer", "evidence_ids", "output", "truncated"}),
+}
 _MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
 _ATTACHMENT_READ_CHUNK_BYTES = 1024 * 1024
 _SAFE_FAILURE_CATEGORIES = frozenset(
@@ -62,6 +106,17 @@ class _ObservedToolResult(dict[str, Any]):
     def __init__(self, payload: dict[str, Any], trace_metadata: dict[str, Any]) -> None:
         super().__init__(payload)
         self.trace_metadata = trace_metadata
+
+
+def _public_tool_trace_keys(
+    name: str,
+    value: dict[str, Any],
+    *,
+    allowed_by_tool: dict[str, frozenset[str]],
+) -> list[str]:
+    """Return only the public contract keys registered for this tool."""
+    allowed = allowed_by_tool.get(name, frozenset())
+    return sorted(key for key in value if key in allowed)
 
 
 class MCPToolClient:
@@ -145,14 +200,19 @@ class MCPToolClient:
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self._call_count += 1
+        argument_keys = _public_tool_trace_keys(
+            name,
+            arguments,
+            allowed_by_tool=_PUBLIC_TOOL_TRACE_ARGUMENT_KEYS,
+        )
         trace = self._observability.current_trace() if self._observability else None
         span = (
             trace.span(
                 "mcp-tool",
                 {"tool": name, "call_number": self._call_count},
                 input={
-                    "argument_count": len(arguments),
-                    "argument_keys": sorted(arguments),
+                    "argument_count": len(argument_keys),
+                    "argument_keys": argument_keys,
                 },
             )
             if trace is not None
@@ -171,7 +231,12 @@ class MCPToolClient:
                 )
             raise
         if span is not None:
-            metadata = {"result_key_count": len(result)}
+            result_keys = _public_tool_trace_keys(
+                name,
+                result,
+                allowed_by_tool=_PUBLIC_TOOL_TRACE_RESULT_KEYS,
+            )
+            metadata = {"result_key_count": len(result_keys)}
             metadata.update(getattr(result, "trace_metadata", {}))
             if result.get("fallback") == "search":
                 metadata["fallback_used"] = True
@@ -179,8 +244,8 @@ class MCPToolClient:
                 status="ok",
                 metadata=metadata,
                 output={
-                    "result_key_count": len(result),
-                    "result_keys": sorted(result),
+                    "result_key_count": len(result_keys),
+                    "result_keys": result_keys,
                 },
             )
         return result

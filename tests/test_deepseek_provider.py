@@ -122,6 +122,32 @@ class RecordingExecutor:
         return self.result
 
 
+class _RecordingGeneration:
+    def __init__(self) -> None:
+        self.ended: list[dict[str, Any]] = []
+
+    def end(self, **kwargs: Any) -> None:
+        self.ended.append(kwargs)
+
+
+class _RecordingTrace:
+    def __init__(self) -> None:
+        self.generation_span = _RecordingGeneration()
+
+    def generation(self, name: str, metadata: dict[str, object]) -> _RecordingGeneration:
+        assert name == "provider-generation"
+        assert "prompt" not in metadata
+        return self.generation_span
+
+
+class _RecordingObservability:
+    def __init__(self) -> None:
+        self.trace = _RecordingTrace()
+
+    def current_trace(self) -> _RecordingTrace:
+        return self.trace
+
+
 @pytest.mark.asyncio
 async def test_deepseek_provider_executes_tool_loop_and_echoes_reasoning(
     fake_chat_client: FakeChatClient,
@@ -249,6 +275,53 @@ async def test_deepseek_provider_retries_transient_error_once(
 
     assert response.parsed == {"answer": "42"}
     assert len(fake_chat_client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_emits_bounded_retry_attempt_and_decision_metadata(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.extend(
+        [
+            _status_error(RateLimitError, 429),
+            _chat_response(_chat_message(content='{"answer":"42"}')),
+        ]
+    )
+    observability = _RecordingObservability()
+
+    async def sleep(_delay: float) -> None:
+        return None
+
+    await DeepSeekProvider(
+        fake_chat_client,
+        "deepseek-v4-flash",
+        observability=observability,  # type: ignore[arg-type]
+        sleep=sleep,
+        jitter=lambda: 0.0,
+    ).complete(model_request())
+
+    ended = observability.trace.generation_span.ended[-1]
+    assert ended["metadata"] == {
+        "parsed": True,
+        "refused": False,
+        "tool_call_count": 0,
+        "attempt_number": 2,
+        "provider_attempt_count": 2,
+        "provider_retry_count": 1,
+        "retry_category": "RateLimitError",
+        "retry_decision": "recovered",
+    }
+    assert ended["summary"] == {
+        "decision": "parsed",
+        "parsed": True,
+        "refused": False,
+        "tool_call_count": 0,
+        "attempt_number": 2,
+        "provider_attempt_count": 2,
+        "provider_retry_count": 1,
+        "retry_category": "RateLimitError",
+        "retry_decision": "recovered",
+    }
 
 
 @pytest.mark.asyncio

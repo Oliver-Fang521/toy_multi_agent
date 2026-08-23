@@ -43,7 +43,7 @@ from gaia_agent.observability import Observability, ObservabilityConfig, TaskTra
 from gaia_agent.orchestrator import Orchestrator, choose_majority
 from gaia_agent.persistence import RunManifest, RunStore
 from gaia_agent.providers import DeepSeekProvider, ModelProvider, OpenAIProvider
-from gaia_agent.reliability import RetryPolicy
+from gaia_agent.reliability import RetryPolicy, transient_provider_error_category
 from gaia_agent.reporting import (
     EvaluationSummary,
     LevelMetrics,
@@ -184,16 +184,19 @@ class EvaluationRunner:
         completed_predictions = {prediction.task_id: prediction for prediction in store.load_predictions()}
         for task in selected:
             started = time.monotonic()
+            persisted_prediction = completed_predictions.get(task.task_id)
             trace = self._observability.start_task(
                 task.task_id,
                 level=task.level,
                 model=self._config.model,
                 reasoning_effort=self._config.reasoning_effort,
                 run_id=store.manifest.run_id,
-                attempt_number=1,
+                attempt_number=(
+                    persisted_prediction.attempt_number if persisted_prediction is not None else 1
+                ),
                 evaluation_mode=self._evaluation_mode,
             )
-            if (persisted_prediction := completed_predictions.get(task.task_id)) is not None:
+            if persisted_prediction is not None:
                 trace.finish(_task_trace_outcome(persisted_prediction, checkpoint_restored=True))
                 continue
             task_run: _TaskRun | None = None
@@ -243,6 +246,7 @@ class EvaluationRunner:
                                 for event in task_run.audit_events
                             )
                         ),
+                        audit_events=task_run.audit_events if task_run is not None else (),
                     )
                 )
 
@@ -283,7 +287,25 @@ class EvaluationRunner:
 
         selected = choose_majority(predictions, self._config.votes)
         usage = _sum_usage(predictions)
-        selected = selected.model_copy(update={"usage": usage})
+        selected = selected.model_copy(
+            update={
+                "usage": usage,
+                "attempt_number": max(item.attempt_number for item in predictions),
+                "recovery_count": sum(item.recovery_count for item in predictions),
+                "recovery_succeeded": any(item.recovery_succeeded for item in predictions),
+                "provider_attempt_count": sum(
+                    item.provider_attempt_count for item in predictions
+                ),
+                "retry_reason": next(
+                    (item.retry_reason for item in predictions if item.retry_reason is not None),
+                    None,
+                ),
+                "retry_category": next(
+                    (item.retry_category for item in predictions if item.retry_category is not None),
+                    None,
+                ),
+            }
+        )
         return _TaskRun(
             prediction=selected,
             audit_events=tuple(audit_events),
@@ -294,6 +316,9 @@ class EvaluationRunner:
         audit_events: list[AuditEvent] = []
         first_plan: AgentPlan | None = None
         prior_predictions: list[TaskPrediction] = []
+        retry_reason: str | None = None
+        retry_category: str | None = None
+        provider_attempt_count = 0
         for attempt in range(2):
             orchestrator = self._orchestrator_factory(task)
             try:
@@ -303,37 +328,63 @@ class EvaluationRunner:
                 events = tuple(getattr(orchestrator, "audit_events", ()))
                 audit_events.extend(events)
                 first_plan = first_plan or _plan_from_audit(events)
-                if attempt == 0 and _is_transient_failure(error):
-                    await self._sleep(0.05)
-                    continue
+                is_transient = _is_transient_failure(error)
                 category = (
                     TerminalErrorCategory.RETRY_EXHAUSTED
-                    if _is_transient_failure(error)
+                    if is_transient
                     else _category_for_exception(error)
                 )
                 prediction = _failure_prediction(task, category)
-                if prior_predictions:
+                if is_transient:
                     prediction = prediction.model_copy(
-                        update={"usage": _sum_usage([*prior_predictions, prediction])}
+                        update={
+                            "retry_reason": (
+                                "timeout" if isinstance(error, TimeoutError) else "task_transient"
+                            ),
+                            "retry_category": _transient_failure_category(error),
+                        }
                     )
             else:
                 events = tuple(getattr(orchestrator, "audit_events", ()))
                 audit_events.extend(events)
                 first_plan = first_plan or _plan_from_audit(events)
-                if _is_transient_prediction(prediction):
-                    prior_predictions.append(prediction)
-                    if attempt == 0:
-                        await self._sleep(0.05)
-                        continue
-                    prediction = prediction.model_copy(
-                        update={"error_category": TerminalErrorCategory.RETRY_EXHAUSTED}
-                    )
-                    charged_predictions = prior_predictions
-                else:
-                    charged_predictions = [*prior_predictions, prediction]
-                prediction = prediction.model_copy(
-                    update={"usage": _sum_usage(charged_predictions)}
+            if retry_reason is None and _is_transient_prediction(prediction):
+                retry_reason = prediction.retry_reason or "timeout"
+                retry_category = prediction.retry_category or (
+                    "TimeoutError"
+                    if prediction.error_category == TerminalErrorCategory.TIMEOUT
+                    else "provider_transient"
                 )
+                provider_attempt_count += prediction.provider_attempt_count
+                if attempt == 0:
+                    prior_predictions.append(prediction)
+                    await self._sleep(0.05)
+                    continue
+            elif retry_reason is not None:
+                provider_attempt_count += prediction.provider_attempt_count
+
+            recovery_succeeded = retry_reason is not None and prediction.error_category is None
+            if retry_reason is not None:
+                audit_events.append(
+                    _task_recovery_event(
+                        sequence=len(audit_events) + 1,
+                        attempt_number=attempt + 1,
+                        retry_reason=retry_reason,
+                        retry_category=retry_category or "provider_transient",
+                        recovery_succeeded=recovery_succeeded,
+                    )
+                )
+            prediction = prediction.model_copy(
+                update={
+                    "usage": _sum_usage([*prior_predictions, prediction]),
+                    "attempt_number": attempt + 1,
+                    "recovery_count": 1 if retry_reason is not None else 0,
+                    "recovery_succeeded": recovery_succeeded,
+                    "retry_reason": retry_reason,
+                    "retry_category": retry_category,
+                    "provider_attempt_count": provider_attempt_count,
+                }
+            )
             return _TaskRun(prediction, tuple(audit_events), first_plan)
         raise AssertionError("bounded retry loop did not return")
 
@@ -483,6 +534,7 @@ def build_runner(
         reasoning_effort=config.reasoning_effort,
         max_tool_calls=agent_tool_calls,
         max_context_bytes=config.stage_context_max_bytes,
+        quality_policy=config.quality_policy,
     )
     notebook_generation: str | None = None
 
@@ -707,7 +759,40 @@ def _is_transient_failure(error: BaseException) -> bool:
 
 
 def _is_transient_prediction(prediction: TaskPrediction) -> bool:
-    return prediction.error_category == TerminalErrorCategory.TIMEOUT
+    return prediction.error_category == TerminalErrorCategory.TIMEOUT or (
+        prediction.error_category == TerminalErrorCategory.RETRY_EXHAUSTED
+        and prediction.retry_reason is not None
+    )
+
+
+def _transient_failure_category(error: BaseException) -> str:
+    if isinstance(error, TimeoutError):
+        return "TimeoutError"
+    if isinstance(error, ConnectionError):
+        return "ConnectionError"
+    provider_category = transient_provider_error_category(error)
+    return provider_category if provider_category != "provider_transient" else "task_transient"
+
+
+def _task_recovery_event(
+    *,
+    sequence: int,
+    attempt_number: int,
+    retry_reason: str,
+    retry_category: str,
+    recovery_succeeded: bool,
+) -> AuditEvent:
+    return AuditEvent(
+        sequence=sequence,
+        event_type="task_recovery",
+        timestamp=datetime.now(UTC),
+        payload={
+            "attempt_number": attempt_number,
+            "retry_reason": retry_reason,
+            "retry_category": retry_category,
+            "recovery_succeeded": recovery_succeeded,
+        },
+    )
 
 
 def _category_for_exception(error: BaseException) -> TerminalErrorCategory:
@@ -736,7 +821,17 @@ def _task_trace_outcome(
     prediction: TaskPrediction,
     *,
     checkpoint_restored: bool,
+    audit_events: Sequence[AuditEvent] = (),
 ) -> TaskTraceOutcome:
+    terminal_route = (
+        "checkpoint_restored"
+        if checkpoint_restored
+        else "terminal_failure"
+        if prediction.error_category is not None
+        else "recovered_submit"
+        if prediction.recovery_succeeded
+        else "submit"
+    )
     return TaskTraceOutcome(
         answer_present=prediction.answer is not None,
         evidence_count=len(prediction.evidence_ids),
@@ -744,7 +839,31 @@ def _task_trace_outcome(
         error_category=(prediction.error_category.value if prediction.error_category is not None else None),
         correct=prediction.correct,
         checkpoint_restored=checkpoint_restored,
+        attempt_number=prediction.attempt_number,
+        recovery_count=prediction.recovery_count,
+        recovery_succeeded=prediction.recovery_succeeded,
+        retry_reason=prediction.retry_reason,
+        retry_category=prediction.retry_category,
+        terminal_route=terminal_route,
+        stage_codes=_task_stage_codes(audit_events),
     )
+
+
+def _task_stage_codes(events: Sequence[AuditEvent]) -> tuple[str, ...]:
+    event_codes = {
+        "plan_completed": "plan",
+        "act_completed": "act",
+        "correction_act_completed": "correct",
+        "verify_completed": "verify",
+        "submit_completed": "submit",
+        "task_recovery": "recovery",
+    }
+    codes: list[str] = []
+    for event in events:
+        code = event_codes.get(event.event_type)
+        if code is not None and code not in codes:
+            codes.append(code)
+    return tuple(codes)
 
 
 def _sum_usage(predictions: Sequence[TaskPrediction]) -> Usage:

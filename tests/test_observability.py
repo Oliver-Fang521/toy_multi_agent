@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from contextlib import AbstractContextManager
 from decimal import Decimal
 from pathlib import Path
@@ -497,6 +498,17 @@ async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
         "provider_latency_ms": 0.0,
         "tool_latency_ms": 0.0,
         "checkpoint_restored": False,
+        "attempt_number": 1,
+        "recovery_count": 0,
+        "recovery_succeeded": False,
+        "retry_reason": None,
+        "retry_category": None,
+        "terminal_route": "submit",
+        "reasoning_summary": {
+            "route": "submit",
+            "recovery": "not_needed",
+            "stages": [],
+        },
     }
 
 
@@ -557,6 +569,107 @@ async def test_runner_traces_resumed_selected_tasks_with_persisted_outcomes(
 
 
 @pytest.mark.asyncio
+async def test_runner_root_records_recovered_attempt_and_resume_reuses_that_number(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gaia_agent import runner as runner_module
+    from gaia_agent.config import RunConfig
+    from gaia_agent.models import TerminalErrorCategory
+
+    tasks = [
+        GaiaTask(task_id=f"recover-trace-{level}", question="private", level=level, final_answer="a")
+        for level in (1, 2, 3)
+    ]
+    config = RunConfig(
+        openai_api_key="sk-test",
+        hf_token="hf-test",
+        sample_size=3,
+        output_dir=tmp_path / "run",
+    )
+    outcomes = {
+        task.task_id: deque(
+            [
+                *(
+                    [
+                        TaskPrediction(
+                            task_id=task.task_id,
+                            level=task.level,
+                            answer=None,
+                            critic_verdict="not_run",
+                            error_category=TerminalErrorCategory.RETRY_EXHAUSTED,
+                            retry_reason="provider_transient_exhausted",
+                            retry_category="APIConnectionError",
+                            provider_attempt_count=4,
+                        )
+                    ]
+                    if task.level == 1
+                    else []
+                ),
+                TaskPrediction(
+                    task_id=task.task_id,
+                    level=task.level,
+                    answer="a",
+                    critic_verdict="approve",
+                ),
+            ]
+        )
+        for task in tasks
+    }
+
+    class _Orchestrator:
+        audit_events: tuple[()] = ()
+
+        def __init__(self, task: GaiaTask) -> None:
+            self.task = task
+
+        async def run(self, _task: GaiaTask) -> TaskPrediction:
+            return outcomes[self.task.task_id].popleft()
+
+    monkeypatch.setattr(runner_module, "sample_stratified", lambda *_args: tasks)
+    monkeypatch.setattr(runner_module, "question_scorer", lambda *_args: True)
+    client = _FakeClient()
+    await EvaluationRunner(
+        config=config,
+        dataset_loader=lambda _config: (tasks, "revision"),
+        orchestrator_factory=_Orchestrator,
+        observability=Observability(
+            ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+        ),
+        sleep=lambda _delay: __import__("asyncio").sleep(0),
+    )._run()
+
+    root = next(item for item in client.observations if item.name == "gaia-task")
+    output = root.updates[-1]["output"]
+    assert output["attempt_number"] == 2
+    assert output["recovery_count"] == 1
+    assert output["recovery_succeeded"] is True
+    assert output["terminal_route"] == "recovered_submit"
+    assert output["reasoning_summary"] == {
+        "route": "recovered_submit",
+        "recovery": "succeeded",
+        "stages": ["recovery"],
+    }
+    assert root.updates[-1]["metadata"]["attempt_number"] == 2
+
+    resumed_client = _FakeClient()
+    await EvaluationRunner(
+        config=config.model_copy(update={"resume": True}),
+        dataset_loader=lambda _config: (tasks, "revision"),
+        orchestrator_factory=_Orchestrator,
+        observability=Observability(
+            ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+            client=resumed_client,
+        ),
+    )._run()
+    resumed_root = next(
+        item for item in resumed_client.observations if item.name == "gaia-task"
+    )
+    assert resumed_root.kwargs["metadata"]["attempt_number"] == 2
+    assert resumed_root.updates[-1]["output"]["terminal_route"] == "checkpoint_restored"
+
+
+@pytest.mark.asyncio
 async def test_runner_records_safe_failure_when_persistence_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -605,6 +718,7 @@ async def test_runner_records_safe_failure_when_persistence_fails(
     outcome = client.observations[0].updates[-1]["output"]
     assert outcome["correct"] is False
     assert outcome["error_category"] == "retry_exhausted"
+    assert outcome["terminal_route"] == "terminal_failure"
 
 
 def test_task_trace_aggregates_provider_and_tool_latency(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -665,4 +779,10 @@ def test_task_trace_outcome_bounds_counts_and_categories() -> None:
         "provider_latency_ms": 0.0,
         "tool_latency_ms": 0.0,
         "checkpoint_restored": False,
+        "attempt_number": 1,
+        "recovery_count": 0,
+        "recovery_succeeded": False,
+        "retry_reason": None,
+        "retry_category": None,
+        "terminal_route": "terminal_failure",
     }

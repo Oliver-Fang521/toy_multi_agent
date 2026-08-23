@@ -6,6 +6,8 @@ import asyncio
 import json
 import random
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from typing import Any
 
 from gaia_agent.models import Usage
@@ -19,7 +21,37 @@ from gaia_agent.providers.base import (
     serialize_tool_output,
 )
 from gaia_agent.providers.openai import _extract_json_object
-from gaia_agent.reliability import RetryPolicy, is_transient_provider_error, retry_delay
+from gaia_agent.reliability import (
+    ProviderTransientExhaustedError,
+    RetryPolicy,
+    is_transient_provider_error,
+    retry_delay,
+    transient_provider_error_category,
+)
+
+
+@dataclass
+class _ProviderRetryMetadata:
+    attempt_count: int = 0
+    retry_count: int = 0
+    retry_category: str | None = None
+    retry_decision: str = "not_needed"
+
+    def as_dict(self) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "attempt_number": max(1, self.attempt_count),
+            "provider_attempt_count": self.attempt_count,
+            "provider_retry_count": self.retry_count,
+            "retry_decision": self.retry_decision,
+        }
+        if self.retry_category is not None:
+            metadata["retry_category"] = self.retry_category
+        return metadata
+
+
+_CURRENT_RETRY_METADATA: ContextVar[_ProviderRetryMetadata | None] = ContextVar(
+    "gaia_deepseek_retry_metadata", default=None
+)
 
 
 def _content_to_text(content: Any) -> str:
@@ -175,6 +207,10 @@ class DeepSeekProvider:
     async def complete(
         self, request: ModelRequest, executor: ToolExecutor | None = None
     ) -> ModelResponse:
+        retry_metadata = _ProviderRetryMetadata()
+        retry_token: Token[_ProviderRetryMetadata | None] = _CURRENT_RETRY_METADATA.set(
+            retry_metadata
+        )
         trace = self._observability.current_trace() if self._observability else None
         generation = (
             trace.generation(
@@ -185,31 +221,40 @@ class DeepSeekProvider:
             else None
         )
         try:
-            response = await self._complete(request, executor)
-        except Exception as error:
+            try:
+                response = await self._complete(request, executor)
+            except Exception as error:
+                if generation is not None:
+                    generation.end(
+                        status="error",
+                        metadata={
+                            "error_type": type(error).__name__,
+                            **retry_metadata.as_dict(),
+                        },
+                        summary=retry_metadata.as_dict(),
+                    )
+                raise
             if generation is not None:
                 generation.end(
-                    status="error",
-                    metadata={"error_type": type(error).__name__},
+                    status="ok",
+                    metadata={
+                        "parsed": response.parsed is not None,
+                        "refused": bool(response.output_text and response.parsed is None),
+                        "tool_call_count": len(response.tool_events),
+                        **retry_metadata.as_dict(),
+                    },
+                    summary={
+                        "decision": "parsed" if response.parsed is not None else "unparsed",
+                        "parsed": response.parsed is not None,
+                        "refused": bool(response.output_text and response.parsed is None),
+                        "tool_call_count": len(response.tool_events),
+                        **retry_metadata.as_dict(),
+                    },
+                    usage=response.usage,
                 )
-            raise
-        if generation is not None:
-            generation.end(
-                status="ok",
-                metadata={
-                    "parsed": response.parsed is not None,
-                    "refused": bool(response.output_text and response.parsed is None),
-                    "tool_call_count": len(response.tool_events),
-                },
-                summary={
-                    "decision": "parsed" if response.parsed is not None else "unparsed",
-                    "parsed": response.parsed is not None,
-                    "refused": bool(response.output_text and response.parsed is None),
-                    "tool_call_count": len(response.tool_events),
-                },
-                usage=response.usage,
-            )
-        return response
+            return response
+        finally:
+            _CURRENT_RETRY_METADATA.reset(retry_token)
 
     async def _complete(
         self, request: ModelRequest, executor: ToolExecutor | None = None
@@ -326,12 +371,31 @@ class DeepSeekProvider:
     async def _create_with_retry(self, **kwargs: Any) -> Any:
         for attempt in range(1, self._retry_policy.max_attempts + 1):
             try:
-                return await self._client.chat.completions.create(**kwargs)
+                retry_metadata = _CURRENT_RETRY_METADATA.get()
+                if retry_metadata is not None:
+                    retry_metadata.attempt_count += 1
+                response = await self._client.chat.completions.create(**kwargs)
+                if retry_metadata is not None and retry_metadata.retry_count:
+                    retry_metadata.retry_decision = "recovered"
+                return response
             except Exception as error:
-                if (
-                    not is_transient_provider_error(error)
-                    or attempt == self._retry_policy.max_attempts
-                ):
+                retry_metadata = _CURRENT_RETRY_METADATA.get()
+                if not is_transient_provider_error(error):
+                    if retry_metadata is not None:
+                        retry_metadata.retry_decision = "not_retryable"
                     raise
+                category = transient_provider_error_category(error)
+                if retry_metadata is not None:
+                    retry_metadata.retry_category = category
+                if attempt == self._retry_policy.max_attempts:
+                    if retry_metadata is not None:
+                        retry_metadata.retry_decision = "exhausted"
+                    raise ProviderTransientExhaustedError(
+                        retry_category=category,
+                        attempt_count=attempt,
+                    ) from error
+                if retry_metadata is not None:
+                    retry_metadata.retry_count += 1
+                    retry_metadata.retry_decision = "retry"
                 await self._sleep(retry_delay(self._retry_policy, attempt, self._jitter))
         raise AssertionError("bounded provider retry did not return or raise")

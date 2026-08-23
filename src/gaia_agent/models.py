@@ -90,6 +90,14 @@ class TaskPrediction(FrozenModel):
     error_category: TerminalErrorCategory | None = None
     run_index: int = 0
     vote_count: int = 1
+    attempt_number: int = Field(default=1, ge=1, le=1_000_000)
+    recovery_count: int = Field(default=0, ge=0, le=1_000_000)
+    recovery_succeeded: bool = False
+    retry_reason: Literal[
+        "provider_transient_exhausted", "timeout", "task_transient"
+    ] | None = None
+    retry_category: str | None = None
+    provider_attempt_count: int = Field(default=0, ge=0, le=1_000_000)
 
 
 _SENSITIVE_KEY_PARTS = ("api_key", "authorization", "credential", "password", "secret", "token")

@@ -190,6 +190,23 @@ def test_notebook_creates_private_per_run_trust_anchor(tmp_path: Path) -> None:
     assert stat.S_IMODE(anchor.stat().st_mode) == 0o600
 
 
+@pytest.mark.parametrize("invalid_schema_version", [True, 1.0])
+def test_notebook_rejects_non_integer_trust_anchor_schema_versions(
+    tmp_path: Path,
+    invalid_schema_version: object,
+) -> None:
+    root = tmp_path / "private"
+    ResearchNotebook(root, "task-1")
+    anchor = root / ".trust-anchor"
+    payload = json.loads(anchor.read_text(encoding="utf-8"))
+    payload["schema_version"] = invalid_schema_version
+    anchor.write_text(json.dumps(payload), encoding="utf-8")
+    anchor.chmod(0o600)
+
+    with pytest.raises(ValueError, match="anchor schema"):
+        ResearchNotebook(root, "task-2")
+
+
 def test_notebook_rejects_symlinked_trust_anchor(tmp_path: Path) -> None:
     root = tmp_path / "private"
     root.mkdir(mode=0o700)

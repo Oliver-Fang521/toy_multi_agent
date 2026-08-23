@@ -248,13 +248,15 @@ async def test_offline_ten_task_trace_reliability_simulation(tmp_path: Path) -> 
         critic = trace.span("critic", {"stage": "verify", "verdict": "approve"})
         critic.end(status="ok")
         trace.finish(
-            TaskTraceOutcome(
-                answer_present=True,
-                evidence_count=1,
-                critic_verdict="approve",
-                error_category=None,
-                correct=True,
-            )
+                TaskTraceOutcome(
+                    answer_present=True,
+                    evidence_count=1,
+                    critic_verdict="approve",
+                    error_category=None,
+                    correct=True,
+                    terminal_route="submit",
+                    stage_codes=("verify", "submit"),
+                )
         )
         store.append(
             TaskPrediction(
@@ -308,6 +310,13 @@ async def test_offline_ten_task_trace_reliability_simulation(tmp_path: Path) -> 
         "provider_latency_ms",
         "tool_latency_ms",
         "checkpoint_restored",
+        "attempt_number",
+        "recovery_count",
+        "recovery_succeeded",
+        "retry_reason",
+        "retry_category",
+        "terminal_route",
+        "reasoning_summary",
     }
     assert all(set(output) == required_outcome_keys for output in terminal_outputs)
     assert all(
@@ -316,6 +325,11 @@ async def test_offline_ten_task_trace_reliability_simulation(tmp_path: Path) -> 
         and output["critic_verdict"] == "approve"
         and output["error_category"] is None
         and output["correct"] is True
+        and output["attempt_number"] == 1
+        and output["recovery_count"] == 0
+        and output["terminal_route"] == "submit"
+        and output["reasoning_summary"]
+        == {"route": "submit", "recovery": "not_needed", "stages": ["verify", "submit"]}
         for output in terminal_outputs
     )
     assert len(critic_stages) >= 8

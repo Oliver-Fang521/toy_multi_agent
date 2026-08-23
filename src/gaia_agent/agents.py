@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ValidationError
 
@@ -51,6 +52,10 @@ _MAX_CONTEXT_QUESTION_CHARS = 4_096
 _MAX_CONTEXT_INSTRUCTION_CHARS = 2_048
 _MAX_CARD_SELECTION_BYTES = 1_000_000
 _EVIDENCE_CARD_TIMESTAMP = datetime(1970, 1, 1, tzinfo=UTC)
+_CRITIC_FALLBACK_DEGRADED_APPROVAL = "critic_repair_exhausted_degraded_approval"
+_CRITIC_FALLBACK_POLICY_DENIED = "critic_repair_exhausted_policy_denied"
+_CRITIC_FALLBACK_CANDIDATE_MISSING = "critic_repair_exhausted_candidate_missing"
+_CRITIC_FALLBACK_EVIDENCE_UNUSABLE = "critic_repair_exhausted_evidence_unusable"
 _REPAIR_INSTRUCTIONS = (
     "Your previous response did not match the required JSON schema. "
     "Return only the JSON object exactly matching the schema, with no prose, "
@@ -574,18 +579,25 @@ class CriticAgent:
         reasoning_effort: ReasoningEffort = "medium",
         max_tool_calls: int = 8,
         max_context_bytes: int = _DEFAULT_MAX_CONTEXT_BYTES,
+        quality_policy: Literal["benchmark", "strict"] = "benchmark",
     ) -> None:
         if max_context_bytes < 1:
             raise ValueError("max_context_bytes must be positive")
+        if quality_policy not in {"benchmark", "strict"}:
+            raise ValueError("quality_policy must be benchmark or strict")
         self.provider = provider
         self.reasoning_effort = reasoning_effort
         self.max_tool_calls = max_tool_calls
         self.max_context_bytes = max_context_bytes
+        self.quality_policy = quality_policy
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"critic_usage_{id(self)}", default=None
         )
         self._last_repair: ContextVar[bool] = ContextVar(
             f"critic_repair_{id(self)}", default=False
+        )
+        self._last_fallback_reason: ContextVar[str | None] = ContextVar(
+            f"critic_fallback_reason_{id(self)}", default=None
         )
 
     @property
@@ -596,6 +608,10 @@ class CriticAgent:
     def last_repair_attempted(self) -> bool:
         return self._last_repair.get()
 
+    @property
+    def last_fallback_reason(self) -> str | None:
+        return self._last_fallback_reason.get()
+
     async def verify(
         self,
         task: GaiaTask,
@@ -605,6 +621,7 @@ class CriticAgent:
     ) -> CriticDecision:
         self._last_usage.set(Usage())
         self._last_repair.set(False)
+        self._last_fallback_reason.set(None)
         allowed_tools = tuple(
             tool for tool in tools.tool_specs if tool.name in self.allowed_tool_names
         )
@@ -711,7 +728,13 @@ class CriticAgent:
             if error.code != StageValidationCode.SCHEMA:
                 raise
             self._last_repair.set(True)
-            return _fallback_critic_decision(candidate, evidence)
+            decision = _fallback_critic_decision(
+                candidate,
+                evidence,
+                quality_policy=self.quality_policy,
+            )
+            self._last_fallback_reason.set(decision.feedback)
+            return decision
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
         return decision
@@ -720,20 +743,55 @@ class CriticAgent:
 def _fallback_critic_decision(
     candidate: str | None,
     evidence: tuple[Evidence, ...],
+    *,
+    quality_policy: Literal["benchmark", "strict"],
 ) -> CriticDecision:
-    """Keep a useful attempt alive without inventing evidence after critic failure."""
-    checked_ids = tuple(item.evidence_id for item in evidence)
-    if candidate is not None and checked_ids:
+    """Apply the configured degraded-submission policy without inventing evidence."""
+    normalized_candidate = candidate.strip() if candidate is not None else ""
+    if not normalized_candidate or "\n" in normalized_candidate:
         return CriticDecision(
-            verdict="approve",
-            feedback="Local critic fallback accepted the candidate with available evidence.",
+            verdict="insufficient_evidence",
+            feedback=_CRITIC_FALLBACK_CANDIDATE_MISSING,
+            checked_evidence_ids=(),
+        )
+    usable_evidence = tuple(item for item in evidence if _usable_fallback_evidence(item))
+    checked_ids = tuple(item.evidence_id for item in usable_evidence)
+    if not checked_ids:
+        return CriticDecision(
+            verdict="insufficient_evidence",
+            feedback=_CRITIC_FALLBACK_EVIDENCE_UNUSABLE,
+            checked_evidence_ids=(),
+        )
+    if quality_policy != "benchmark":
+        return CriticDecision(
+            verdict="insufficient_evidence",
+            feedback=_CRITIC_FALLBACK_POLICY_DENIED,
             checked_evidence_ids=checked_ids,
         )
     return CriticDecision(
-        verdict="insufficient_evidence",
-        feedback="Critic output could not be repaired and no evidence-backed approval is safe.",
+        verdict="approve",
+        feedback=_CRITIC_FALLBACK_DEGRADED_APPROVAL,
         checked_evidence_ids=checked_ids,
     )
+
+
+def _usable_fallback_evidence(item: Evidence) -> bool:
+    identifier = item.evidence_id
+    if (
+        not identifier.startswith("evidence-")
+        or len(identifier) != len("evidence-0000")
+        or any(character not in "0123456789" for character in identifier[-4:])
+        or int(identifier[-4:]) < 1
+    ):
+        return False
+    if not item.summary.strip():
+        return False
+    if item.kind != "source":
+        return True
+    if not item.source_url:
+        return False
+    parsed = urlsplit(item.source_url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def _agent_result_schema(
@@ -787,7 +845,6 @@ async def _specialist_input(
         step,
         evidence,
         max_json_bytes,
-        extra_content=extra_content,
     )
     return _context_input_items(context, extra_content)
 
@@ -813,27 +870,17 @@ def specialist_context_size_bytes(
     max_json_bytes: int = _DEFAULT_MAX_CONTEXT_BYTES,
 ) -> tuple[int, int]:
     """Return the bounded text-context size and selected evidence-card count."""
-    visual_payload_bytes = (
-        _visual_payload_context_bytes(task)
-        if step.specialist == SpecialistName.VISUAL
-        else 0
-    )
     context = _specialist_context_base(task, step)
-    base_size = _context_size_with_extras(
-        context,
-        (),
-        visual_payload_bytes,
-    )
+    base_size = context_size_bytes(_context_input_items(context))
     if base_size >= max_json_bytes:
         return base_size, 0
     context = _bounded_evidence_context(
         context,
         evidence,
         max_json_bytes=max_json_bytes,
-        additional_context_bytes=visual_payload_bytes,
     )
     return (
-        context_size_bytes(_context_input_items(context)) + visual_payload_bytes,
+        context_size_bytes(_context_input_items(context)),
         len(context["evidence"]),
     )
 
@@ -843,16 +890,11 @@ def _bounded_specialist_context(
     step: PlanStep,
     evidence: Sequence[Evidence],
     max_json_bytes: int,
-    *,
-    extra_content: Sequence[Mapping[str, Any]] = (),
-    additional_context_bytes: int = 0,
 ) -> dict[str, Any]:
     return _bounded_evidence_context(
         _specialist_context_base(task, step),
         evidence,
         max_json_bytes=max_json_bytes,
-        extra_content=extra_content,
-        additional_context_bytes=additional_context_bytes,
     )
 
 
@@ -998,38 +1040,6 @@ def _context_size_with_extras(
         context_size_bytes(_context_input_items(context, extra_content))
         + additional_context_bytes
     )
-
-
-def _visual_payload_context_bytes(task: GaiaTask) -> int:
-    """Return the exact serialized contribution of a visual attachment payload.
-
-    Routing cannot asynchronously read the attachment, but base64 size is a
-    deterministic function of its regular-file size.  This avoids allocating a
-    duplicate placeholder for large attachments while matching the final input
-    item's compact JSON serialization.
-    """
-    if task.attachment_path is None:
-        return 0
-    try:
-        attachment_size = task.attachment_path.stat().st_size
-    except OSError:
-        return 0
-    media_type = _attachment_metadata(task)
-    content_type = media_type["media_type"] if media_type is not None else "image/png"
-    item = {
-        "type": "input_image",
-        "image_url": f"data:{content_type};base64,",
-        "detail": "high",
-    }
-    encoded_bytes = 4 * ((attachment_size + 2) // 3)
-    return 1 + len(
-        json.dumps(
-            item,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ) + encoded_bytes
 
 
 def _notebook_entries_for_evidence(evidence: Sequence[Evidence]) -> tuple[NotebookEntry, ...]:

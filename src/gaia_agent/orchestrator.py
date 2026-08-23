@@ -35,6 +35,7 @@ from gaia_agent.models import (
 )
 from gaia_agent.observability import Observability, TaskTrace
 from gaia_agent.providers import ToolCallError, ToolSpec
+from gaia_agent.reliability import ProviderTransientExhaustedError
 from gaia_agent.research_notebook import ResearchNotebook
 from gaia_agent.scoring import parse_number_with_status
 
@@ -311,6 +312,7 @@ class Orchestrator:
         raw_tools: Any | None = None
         prediction: TaskPrediction | None = None
         category: TerminalErrorCategory | None = None
+        provider_exhaustion: ProviderTransientExhaustedError | None = None
         try:
             async with asyncio.timeout(self._config.timeout_seconds):
                 async with self._tool_client_factory(execution_task) as active_tools:
@@ -322,6 +324,9 @@ class Orchestrator:
                         notebook=self._notebook,
                     )
                     prediction = await self._execute(state, execution_task, budgeted_tools)
+        except ProviderTransientExhaustedError as error:
+            category = TerminalErrorCategory.RETRY_EXHAUSTED
+            provider_exhaustion = error
         except TimeoutError:
             category = TerminalErrorCategory.TIMEOUT
         except _ToolBudgetExhausted:
@@ -372,6 +377,15 @@ class Orchestrator:
             critic_verdict=state.critic_verdict,
             evidence_ids=tuple(item.evidence_id for item in state.evidence),
             error_category=category,
+            retry_reason=(
+                "provider_transient_exhausted" if provider_exhaustion is not None else None
+            ),
+            retry_category=(
+                provider_exhaustion.retry_category if provider_exhaustion is not None else None
+            ),
+            provider_attempt_count=(
+                provider_exhaustion.attempt_count if provider_exhaustion is not None else 0
+            ),
         )
 
     async def _execute(
@@ -733,6 +747,11 @@ class Orchestrator:
                         "candidate_present": state.candidate is not None,
                         "repair_attempted": bool(
                             getattr(self._critic, "last_repair_attempted", False)
+                        ),
+                        "fallback_reason": getattr(
+                            self._critic,
+                            "last_fallback_reason",
+                            None,
                         ),
                     }
                 )

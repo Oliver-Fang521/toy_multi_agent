@@ -657,13 +657,14 @@ async def test_critic_uses_an_evidence_preserving_fallback_after_two_malformed_r
     fake_provider.return_text("not valid critic output")
     fake_provider.return_text("still not valid critic output")
     evidence = Evidence(
-        evidence_id="source-1",
+        evidence_id="evidence-0001",
         kind="source",
         summary="Observable result",
         source_url="https://primary.example/fact",
     )
 
-    decision = await CriticAgent(fake_provider).verify(
+    critic = CriticAgent(fake_provider, quality_policy="benchmark")
+    decision = await critic.verify(
         task,
         "Marie Curie",
         (evidence,),
@@ -671,7 +672,51 @@ async def test_critic_uses_an_evidence_preserving_fallback_after_two_malformed_r
     )
 
     assert decision.verdict == "approve"
-    assert decision.checked_evidence_ids == ("source-1",)
+    assert decision.checked_evidence_ids == ("evidence-0001",)
+    assert decision.feedback == "critic_repair_exhausted_degraded_approval"
+    assert critic.last_fallback_reason == "critic_repair_exhausted_degraded_approval"
+
+
+@pytest.mark.asyncio
+async def test_critic_fallback_rejects_when_quality_policy_forbids_degraded_approval(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_text("not valid critic output")
+    fake_provider.return_text("still not valid critic output")
+    evidence = Evidence(
+        evidence_id="evidence-0001",
+        kind="source",
+        summary="Observable result",
+        source_url="https://primary.example/fact",
+    )
+
+    critic = CriticAgent(fake_provider, quality_policy="strict")
+    decision = await critic.verify(task, "Marie Curie", (evidence,), fake_tools)
+
+    assert decision.verdict == "insufficient_evidence"
+    assert decision.feedback == "critic_repair_exhausted_policy_denied"
+    assert critic.last_fallback_reason == "critic_repair_exhausted_policy_denied"
+
+
+@pytest.mark.asyncio
+async def test_critic_fallback_rejects_untrusted_or_unusable_evidence(
+    fake_provider, fake_tools, task
+) -> None:
+    fake_provider.return_text("not valid critic output")
+    fake_provider.return_text("still not valid critic output")
+    evidence = Evidence(
+        evidence_id="model-authored-id",
+        kind="source",
+        summary="Observable result",
+        source_url="https://primary.example/fact",
+    )
+
+    critic = CriticAgent(fake_provider, quality_policy="benchmark")
+    decision = await critic.verify(task, "Marie Curie", (evidence,), fake_tools)
+
+    assert decision.verdict == "insufficient_evidence"
+    assert decision.feedback == "critic_repair_exhausted_evidence_unusable"
+    assert critic.last_fallback_reason == "critic_repair_exhausted_evidence_unusable"
 
 
 @pytest.mark.asyncio
@@ -845,18 +890,30 @@ async def test_specialist_rejects_a_context_budget_smaller_than_its_base(fake_to
 
 
 @pytest.mark.asyncio
-async def test_visual_specialist_counts_image_payload_against_context_budget(
+async def test_visual_specialist_does_not_charge_valid_image_bytes_to_text_budget(
     fake_tools, image_task
 ) -> None:
-    with pytest.raises(ValueError, match="context exceeds max_json_bytes"):
-        await _specialist_input(
-            image_task,
-            PlanStep(specialist="visual", instruction="Inspect"),
-            (),
-            visual=True,
-            tools=fake_tools,
-            max_json_bytes=300,
-        )
+    assert image_task.attachment_path is not None
+    image_task.attachment_path.write_bytes(b"x" * 20_000)
+
+    input_items = await _specialist_input(
+        image_task,
+        PlanStep(specialist="visual", instruction="Inspect"),
+        (),
+        visual=True,
+        tools=fake_tools,
+        max_json_bytes=1_000,
+    )
+
+    content = input_items[0]["content"]
+    assert any(item["type"] == "input_image" for item in content)
+    text_only = (
+        {
+            **input_items[0],
+            "content": [item for item in content if item["type"] == "input_text"],
+        },
+    )
+    assert context_size_bytes(text_only) <= 1_000
 
 
 @pytest.mark.asyncio
@@ -880,7 +937,15 @@ async def test_visual_context_estimator_matches_actual_serialized_request(
         max_json_bytes=2_000,
     )
 
-    assert estimated_bytes == context_size_bytes(input_items)
+    text_only = (
+        {
+            **input_items[0],
+            "content": [
+                item for item in input_items[0]["content"] if item["type"] == "input_text"
+            ],
+        },
+    )
+    assert estimated_bytes == context_size_bytes(text_only)
     assert item_count == 0
 
 

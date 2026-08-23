@@ -317,8 +317,10 @@ async def test_openai_provider_records_safe_generation_metadata(
         "parsed": True,
         "refused": False,
         "tool_call_count": 0,
+        "attempt_number": 1,
         "provider_attempt_count": 1,
         "provider_retry_count": 0,
+        "retry_decision": "not_needed",
         "status": "ok",
     }
     assert generation.updates[-1]["output"]["reasoning_summary"] == {
@@ -326,8 +328,10 @@ async def test_openai_provider_records_safe_generation_metadata(
         "parsed": True,
         "refused": False,
         "tool_call_count": 0,
+        "attempt_number": 1,
         "provider_attempt_count": 1,
         "provider_retry_count": 0,
+        "retry_decision": "not_needed",
     }
     assert generation.updates[-1]["usage_details"] == {
         "input_tokens": 3,
@@ -377,9 +381,11 @@ async def test_openai_provider_records_safe_generation_retry_metadata() -> None:
         "parsed": False,
         "refused": False,
         "tool_call_count": 0,
+        "attempt_number": 2,
         "provider_attempt_count": 2,
         "provider_retry_count": 1,
         "retry_category": "APIConnectionError",
+        "retry_decision": "recovered",
         "status": "ok",
     }
     assert generation.updates[-1]["output"]["reasoning_summary"] == {
@@ -387,9 +393,11 @@ async def test_openai_provider_records_safe_generation_retry_metadata() -> None:
         "parsed": False,
         "refused": False,
         "tool_call_count": 0,
+        "attempt_number": 2,
         "provider_attempt_count": 2,
         "provider_retry_count": 1,
         "retry_category": "APIConnectionError",
+        "retry_decision": "recovered",
     }
 @pytest.mark.asyncio
 async def test_openai_provider_stateless_loop_resends_full_history_without_previous_id(
@@ -963,6 +971,38 @@ async def test_openai_provider_retries_initial_connection_error_in_place() -> No
 
     assert len(client.requests) == 2
     assert delays == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_raises_typed_safe_cause_after_transient_attempts_exhaust() -> None:
+    from gaia_agent.reliability import ProviderTransientExhaustedError
+
+    client = FakeResponsesClient()
+    client.queued.extend(
+        APIConnectionError(
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses")
+        )
+        for _ in range(4)
+    )
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    with pytest.raises(ProviderTransientExhaustedError) as caught:
+        await OpenAIProvider(
+            client,
+            "gpt-5.6-sol",
+            retry_policy=RetryPolicy(max_attempts=4),
+            sleep=sleep,
+            jitter=lambda: 0.0,
+        ).complete(model_request())
+
+    assert caught.value.attempt_count == 4
+    assert caught.value.retry_category == "APIConnectionError"
+    assert str(caught.value) == "provider transient attempts exhausted"
+    assert len(client.requests) == 4
+    assert delays == [0.5, 1.0, 2.0]
 
 
 @pytest.mark.asyncio
