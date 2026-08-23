@@ -228,6 +228,41 @@ async def test_search_chain_falls_through_nonretryable_provider_local_failures_w
 
 
 @pytest.mark.asyncio
+async def test_permanent_provider_failure_resets_transient_circuit_streak() -> None:
+    openai = _ScriptedProvider(
+        "openai",
+        [
+            _transient("openai"),
+            SearchProviderError(
+                provider="openai", category="parse_failure", retryable=False
+            ),
+            _transient("openai"),
+            {"answer": "primary recovered", "sources": []},
+        ],
+    )
+    serper = _ScriptedProvider(
+        "serper",
+        [
+            {"answer": "fallback one", "sources": []},
+            {"answer": "fallback two", "sources": []},
+            {"answer": "fallback three", "sources": []},
+        ],
+    )
+    chain = SearchProviderChain(
+        [openai, serper], RetryPolicy(max_attempts=1), clock=lambda: 0.0
+    )
+
+    assert (await chain.search("first"))["answer"] == "fallback one"
+    assert (await chain.search("second"))["answer"] == "fallback two"
+    assert (await chain.search("third"))["answer"] == "fallback three"
+    assert await chain.search("fourth") == {
+        "answer": "primary recovered",
+        "sources": [],
+    }
+    assert openai.queries == ["first", "second", "third", "fourth"]
+
+
+@pytest.mark.asyncio
 async def test_search_chain_raises_one_safe_unavailable_error_after_all_provider_local_failures() -> None:
     providers = [
         _ScriptedProvider(

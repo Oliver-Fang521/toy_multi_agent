@@ -106,6 +106,34 @@ def _normalize(payload: Any, *, provider: str, answer_key: str, results_key: str
     return {"answer": answer, "sources": sources}
 
 
+def _validate_normalized_result(payload: Any, *, provider: str) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise SearchProviderError(provider=provider, category="parse_failure", retryable=False)
+    answer = payload.get("answer")
+    sources = payload.get("sources")
+    if not isinstance(answer, str) or not isinstance(sources, list):
+        raise SearchProviderError(provider=provider, category="parse_failure", retryable=False)
+    for source in sources:
+        if not isinstance(source, dict):
+            raise SearchProviderError(
+                provider=provider, category="parse_failure", retryable=False
+            )
+        url = source.get("url")
+        title = source.get("title")
+        if (
+            not isinstance(url, str)
+            or not url
+            or title is not None
+            and not isinstance(title, str)
+        ):
+            raise SearchProviderError(
+                provider=provider, category="parse_failure", retryable=False
+            )
+    if not answer and not sources:
+        raise SearchProviderError(provider=provider, category="empty_content", retryable=False)
+    return dict(payload)
+
+
 def _http_error(provider: str, status: int) -> SearchProviderError:
     return SearchProviderError(
         provider=provider,
@@ -196,10 +224,10 @@ class OpenAISearchProvider:
 
     async def search(self, query: str) -> dict[str, Any]:
         try:
-            return await self._backend.search(query)
+            result = await self._backend.search(query)
         except SearchProviderError:
             raise
-        except Exception as error:  # noqa: BLE001 - normalize opaque SDK failures at this boundary.
+        except Exception as error:
             status = getattr(error, "status_code", None)
             if isinstance(status, int):
                 raise _http_error(self.provider, status) from None
@@ -208,9 +236,8 @@ class OpenAISearchProvider:
                 raise SearchProviderError(
                     provider=self.provider, category=category, retryable=True
                 ) from None
-            raise SearchProviderError(
-                provider=self.provider, category="provider_error", retryable=False
-            ) from None
+            raise
+        return _validate_normalized_result(result, provider=self.provider)
 
 
 @dataclass
@@ -255,6 +282,8 @@ class SearchProviderChain:
                     result = await provider.search(query)
                 except SearchProviderError as error:
                     if not error.retryable:
+                        circuit.failures = 0
+                        circuit.open_until = 0.0
                         break
                     if attempt < self._retry_policy.max_attempts:
                         await asyncio.sleep(retry_delay(self._retry_policy, attempt, lambda: 0.0))

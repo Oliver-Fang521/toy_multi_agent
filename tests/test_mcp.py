@@ -30,7 +30,12 @@ from gaia_agent.mcp_server import (
 )
 from gaia_agent.models import Usage
 from gaia_agent.observability import Observability, ObservabilityConfig
-from gaia_agent.search import SearchUnavailableError
+from gaia_agent.reliability import RetryPolicy
+from gaia_agent.search import (
+    OpenAISearchProvider,
+    SearchProviderChain,
+    SearchUnavailableError,
+)
 
 
 @pytest.fixture
@@ -88,6 +93,45 @@ async def test_settings_chain_classifies_transient_openai_failure_and_uses_serpe
             "answer": "fallback",
             "sources": [],
         }
+    finally:
+        await settings.aclose()
+
+
+@pytest.mark.asyncio
+async def test_settings_chain_propagates_untyped_openai_implementation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BadBackend:
+        async def search(self, query: str) -> dict[str, Any]:
+            raise RuntimeError("implementation defect")
+
+    class HealthySerper:
+        provider = "serper"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            return {"answer": "must not run", "sources": []}
+
+    serper = HealthySerper()
+    monkeypatch.setenv("GAIA_TASK_ROOT", str(tmp_path))
+    monkeypatch.setenv("GAIA_ATTACHMENTS", "[]")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("HF_TOKEN", "")
+    monkeypatch.setenv("SERPER_API_KEY", "serper-key")
+    monkeypatch.delenv("GAIA_MCP_FAKE_BACKEND", raising=False)
+    monkeypatch.setattr(mcp_server, "AsyncOpenAI", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(mcp_server, "HostedOpenAIBackend", lambda **kwargs: BadBackend())
+    monkeypatch.setattr(mcp_server, "SerperSearchProvider", lambda *args, **kwargs: serper)
+
+    settings = mcp_server._settings_from_env()
+    try:
+        assert settings.search_provider is not None
+        with pytest.raises(RuntimeError, match="implementation defect"):
+            await settings.search_provider.search("question")
+        assert serper.calls == 0
     finally:
         await settings.aclose()
 
@@ -1636,6 +1680,46 @@ async def test_hosted_search_requires_web_tool_and_extracts_sources(tmp_path: Pa
             "total_tokens": 18,
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_hosted_openai_empty_result_falls_through_to_healthy_provider(
+    tmp_path: Path,
+) -> None:
+    response = SimpleNamespace(
+        output_text="",
+        output=[],
+        usage=SimpleNamespace(
+            input_tokens=2,
+            output_tokens=0,
+            total_tokens=2,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+        ),
+    )
+    backend = HostedOpenAIBackend(
+        client=FakeHostedClient(response),
+        model="gpt-5.6-luna",
+        reasoning_effort="max",
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        timeout_seconds=1,
+    )
+
+    class HealthySerper:
+        provider = "serper"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            return {"answer": "healthy fallback", "sources": []}
+
+    chain = SearchProviderChain(
+        [OpenAISearchProvider(backend), HealthySerper()],
+        RetryPolicy(max_attempts=2),
+        clock=lambda: 0.0,
+    )
+
+    result = await chain.search("question")
+
+    assert result == {"answer": "healthy fallback", "sources": []}
+    assert result.provider == "serper"
 
 
 @pytest.mark.asyncio
