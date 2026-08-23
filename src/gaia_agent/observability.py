@@ -40,6 +40,33 @@ _SAFE_ERROR_CATEGORIES = frozenset(
     }
 )
 _MAX_OUTCOME_COUNT = 1_000_000
+_SAFE_TRACE_PROVIDERS = frozenset({"openai", "serper", "serpapi"})
+_SAFE_TRACE_CATEGORIES = _SAFE_ERROR_CATEGORIES | frozenset(
+    {
+        "tool_error",
+        "search_unavailable",
+        "transport",
+        "http_status",
+        "parse_failure",
+        "empty_content",
+        "policy_rejection",
+        "provider_error",
+        "insufficient_evidence",
+        "not_run",
+    }
+)
+_TRACE_DECISION_KEYS = frozenset(
+    {
+        "provider",
+        "category",
+        "retryable",
+        "attempt_count",
+        "http_status",
+        "circuit_open_count",
+        "fallback_attempted",
+        "fallback_used",
+    }
+)
 _TASK_OUTCOME_KEYS = frozenset(
     {
         "answer_present",
@@ -83,6 +110,12 @@ _SAFE_METADATA_KEYS = frozenset(
         "status",
         "error_type",
         "http_status",
+        "provider",
+        "retryable",
+        "attempt_count",
+        "circuit_open_count",
+        "fallback_attempted",
+        "fallback_used",
         "result_key_count",
         "argument_key_count",
         "tool_call_count",
@@ -255,6 +288,31 @@ def _safe_scalar(key: str, value: Any) -> Any:
     return None
 
 
+def _safe_trace_decision(key: str, value: Any) -> Any:
+    if key == "provider":
+        return value if isinstance(value, str) and value in _SAFE_TRACE_PROVIDERS else None
+    if key == "category":
+        return value if isinstance(value, str) and value in _SAFE_TRACE_CATEGORIES else None
+    if key in {"retryable", "fallback_attempted", "fallback_used"}:
+        return value if isinstance(value, bool) else None
+    if key == "http_status":
+        return (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and 100 <= value <= 599
+            else None
+        )
+    minimum = 1 if key == "attempt_count" else 0
+    return (
+        value
+        if isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum <= value <= _MAX_OUTCOME_COUNT
+        else None
+    )
+
+
 def _sanitize_metadata(metadata: dict[str, object] | None) -> dict[str, object]:
     if not metadata:
         return {}
@@ -262,6 +320,11 @@ def _sanitize_metadata(metadata: dict[str, object] | None) -> dict[str, object]:
     for raw_key, value in metadata.items():
         key = str(raw_key)
         if key not in _SAFE_METADATA_KEYS:
+            continue
+        if key in _TRACE_DECISION_KEYS:
+            sanitized = _safe_trace_decision(key, value)
+            if sanitized is not None:
+                safe[key] = sanitized
             continue
         if key in _TASK_OUTCOME_KEYS:
             sanitized = _sanitize_task_outcome({key: value})[key]

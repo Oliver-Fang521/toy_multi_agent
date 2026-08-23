@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 from mcp.server import MCPServer
+from mcp.types import CallToolResult, TextContent
 from openai import AsyncOpenAI
 from openpyxl import load_workbook
 from pypdf import PdfReader
@@ -41,6 +42,7 @@ from gaia_agent.search import (
     OpenAISearchProvider,
     SearchProvider,
     SearchProviderChain,
+    SearchProviderResult,
     SerpAPISearchProvider,
     SerperSearchProvider,
 )
@@ -75,6 +77,9 @@ _PDF_FILTER_LIMIT_NAMES = (
     "ZLIB_MAX_OUTPUT_LENGTH",
 )
 _PDF_FILTER_LOCK = threading.Lock()
+_TRACE_META_KEY = "gaia.trace"
+_MAX_TRACE_COUNT = 1_000_000
+_MAX_FALLBACK_URL_CHARS = 2_048
 
 
 class _TrustedHostedResult(dict[str, Any]):
@@ -82,7 +87,9 @@ class _TrustedHostedResult(dict[str, Any]):
 
 
 class _SearchFallbackResult(dict[str, Any]):
-    pass
+    def __init__(self, payload: dict[str, Any], trace_metadata: dict[str, Any]) -> None:
+        super().__init__(payload)
+        self.trace_metadata = trace_metadata
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -163,10 +170,10 @@ def _bounded_web_search_result(
     def candidate(answer_text: str) -> dict[str, Any]:
         return {"answer": answer_text, "sources": sources, **extra, **metadata}
 
-    if tool_output_size_bytes(candidate("")) > MAX_WEB_SEARCH_OUTPUT_BYTES:
-        extra.clear()
     while sources and tool_output_size_bytes(candidate("")) > MAX_WEB_SEARCH_OUTPUT_BYTES:
         sources.pop()
+    if tool_output_size_bytes(candidate("")) > MAX_WEB_SEARCH_OUTPUT_BYTES:
+        extra.clear()
     full = candidate(answer)
     if tool_output_size_bytes(full) <= MAX_WEB_SEARCH_OUTPUT_BYTES:
         return full
@@ -887,12 +894,89 @@ class MCPServerSettings:
         )
 
 
+def _safe_trace_metadata(values: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    provider = values.get("provider")
+    if provider in {"openai", "serper", "serpapi"}:
+        safe["provider"] = provider
+    category = values.get("category")
+    if category in {
+        "tool_error", "search_unavailable", "timeout", "transport", "http_status",
+        "parse_failure", "empty_content", "policy_rejection", "provider_error",
+    }:
+        safe["category"] = category
+    retryable = values.get("retryable")
+    if isinstance(retryable, bool):
+        safe["retryable"] = retryable
+    for key, minimum in (("attempt_count", 1), ("circuit_open_count", 0)):
+        value = values.get(key)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and minimum <= value <= _MAX_TRACE_COUNT
+        ):
+            safe[key] = value
+    http_status = values.get("http_status")
+    if (
+        isinstance(http_status, int)
+        and not isinstance(http_status, bool)
+        and 100 <= http_status <= 599
+    ):
+        safe["http_status"] = http_status
+    for key in ("fallback_attempted", "fallback_used"):
+        value = values.get(key)
+        if isinstance(value, bool):
+            safe[key] = value
+    return safe
+
+
+def _result_trace_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(result, SearchProviderResult):
+        return _safe_trace_metadata(
+            {
+                "provider": result.provider,
+                "attempt_count": result.attempt_count,
+                "circuit_open_count": result.circuit_open_count,
+                "fallback_used": result.fallback_used,
+            }
+        )
+    if isinstance(result, _SearchFallbackResult):
+        return _safe_trace_metadata(result.trace_metadata)
+    return {}
+
+
+def _failure_trace_metadata(error: ToolCallError, failure: SafeToolFailure) -> dict[str, Any]:
+    return _safe_trace_metadata(
+        {
+            **failure.model_dump(exclude={"tool"}),
+            "circuit_open_count": getattr(error, "circuit_open_count", None),
+            "fallback_attempted": getattr(error, "fallback_attempted", None),
+        }
+    )
+
+
+def _call_tool_result(
+    payload: dict[str, Any] | None,
+    *,
+    trace_metadata: dict[str, Any],
+    error_message: str | None = None,
+) -> CallToolResult:
+    text = error_message if error_message is not None else serialize_tool_output(payload or {})
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent=payload or {},
+        isError=error_message is not None,
+        _meta={_TRACE_META_KEY: trace_metadata},
+    )
+
+
 async def _safe_tool_call(
     settings: MCPServerSettings,
     operation: Awaitable[dict[str, Any]] | Callable[[], dict[str, Any]],
     *,
     web_result: bool = False,
-) -> dict[str, Any]:
+    mcp_result: bool = False,
+) -> dict[str, Any] | CallToolResult:
     try:
         result = await operation if hasattr(operation, "__await__") else operation()
         is_search_result = isinstance(result, _SearchFallbackResult)
@@ -904,23 +988,38 @@ async def _safe_tool_call(
             else None
         )
         redacted = _redact(payload, settings.secrets)
+        if is_search_result:
+            redacted = {
+                "url": str(redacted.get("url") or "")[:_MAX_FALLBACK_URL_CHARS],
+                "answer": str(redacted.get("answer") or ""),
+                "sources": redacted.get("sources")
+                if isinstance(redacted.get("sources"), list)
+                else [],
+                "fallback": "search",
+            }
         metadata = {HOSTED_USAGE_METADATA_KEY: usage} if usage is not None else None
-        if web_result or is_search_result:
-            return _bounded_web_search_result(redacted, metadata=metadata)
-        return _bounded_result(redacted, metadata=metadata)
+        bounded = (
+            _bounded_web_search_result(redacted, metadata=metadata)
+            if web_result or is_search_result
+            else _bounded_result(redacted, metadata=metadata)
+        )
+        trace_metadata = _result_trace_metadata(result)
+        if mcp_result and trace_metadata:
+            return _call_tool_result(bounded, trace_metadata=trace_metadata)
+        return bounded
     except ToolCallError as error:
         failure = SafeToolFailure.from_exception("tool", error)
         details = failure.model_dump(exclude={"tool", "http_status"})
         if failure.http_status is not None:
             details["http_status"] = failure.http_status
-        raise RuntimeError(
-            serialize_tool_output(
-                {
-                    "error": "tool_failed",
-                    **details,
-                }
+        message = serialize_tool_output({"error": "tool_failed", **details})
+        if mcp_result:
+            return _call_tool_result(
+                None,
+                trace_metadata=_failure_trace_metadata(error, failure),
+                error_message=message,
             )
-        ) from None
+        raise RuntimeError(message) from None
     # This is the server boundary: redact arbitrary backend/parser failures before
     # MCP serializes them into consumer-visible tool errors.
     except Exception as error:  # noqa: BLE001
@@ -948,13 +1047,24 @@ async def _read_webpage_with_fallback(settings: MCPServerSettings, url: str) -> 
                 snippets = await search(url)
             except ToolCallError:
                 raise error from None
+            provider_name = getattr(snippets, "provider", getattr(provider, "provider", None))
+            trace_metadata: dict[str, Any] = {
+                "attempt_count": getattr(snippets, "attempt_count", 1),
+                "fallback_used": True,
+            }
+            if provider_name in {"openai", "serper", "serpapi"}:
+                trace_metadata["provider"] = provider_name
+            circuit_open_count = getattr(snippets, "circuit_open_count", None)
+            if isinstance(circuit_open_count, int) and not isinstance(circuit_open_count, bool):
+                trace_metadata["circuit_open_count"] = circuit_open_count
             return _SearchFallbackResult(
                 {
                 "url": url,
                 "answer": str(snippets.get("answer") or ""),
                 "sources": snippets.get("sources") if isinstance(snippets.get("sources"), list) else [],
                 "fallback": "search",
-                }
+                },
+                trace_metadata,
             )
         if not str(result.get("text") or "").strip():
             raise WebpageError("empty_content", retryable=False, attempt_count=attempt)
@@ -987,35 +1097,44 @@ def build_server(settings: MCPServerSettings) -> MCPServer:
                 else settings.backend.web_search(query)
             ),
             web_result=True,
+            mcp_result=True,
         )
 
     @server.tool()
     async def read_webpage(url: str) -> dict[str, Any]:
         """Read public HTTP(S) page text with redirects, timeout, and size limits."""
-        return await _safe_tool_call(settings, _read_webpage_with_fallback(settings, url))
+        return await _safe_tool_call(
+            settings, _read_webpage_with_fallback(settings, url), mcp_result=True
+        )
 
     @server.tool()
     async def execute_python(instruction: str, paths: list[str] | None = None) -> dict[str, Any]:
         """Run a Python analysis instruction in hosted OpenAI Code Interpreter."""
         return await _safe_tool_call(
-            settings, settings.backend.execute_python(instruction, paths or [])
+            settings, settings.backend.execute_python(instruction, paths or []), mcp_result=True
         )
 
     @server.tool()
     async def read_attachment(path: str) -> dict[str, Any]:
         """Extract text and metadata from an attachment registered for this task."""
-        return await _safe_tool_call(settings, lambda: settings.attachment_reader.read(path))
+        return await _safe_tool_call(
+            settings, lambda: settings.attachment_reader.read(path), mcp_result=True
+        )
 
     @server.tool()
     async def transcribe_audio(path: str) -> dict[str, Any]:
         """Transcribe a registered audio attachment with hosted speech recognition."""
-        return await _safe_tool_call(settings, settings.backend.transcribe_audio(path))
+        return await _safe_tool_call(
+            settings, settings.backend.transcribe_audio(path), mcp_result=True
+        )
 
     @server.tool()
     async def submit_answer(answer: str, evidence_ids: list[str]) -> dict[str, Any]:
         """Return the concise terminal answer and evidence references."""
         return await _safe_tool_call(
-            settings, lambda: {"answer": answer.strip(), "evidence_ids": evidence_ids}
+            settings,
+            lambda: {"answer": answer.strip(), "evidence_ids": evidence_ids},
+            mcp_result=True,
         )
 
     return server

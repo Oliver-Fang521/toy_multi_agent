@@ -162,6 +162,40 @@ def test_langfuse_adapter_sanitizes_metadata_and_records_usage() -> None:
     )
 
 
+def test_trace_decision_metadata_rejects_content_bearing_or_unbounded_values() -> None:
+    client = _FakeClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+    )
+    trace = observability.start_task(
+        "task-safe-decisions",
+        level=1,
+        model="test-model",
+        reasoning_effort="max",
+        run_index=0,
+        evaluation_mode="test",
+    )
+    span = trace.span(
+        "mcp-tool",
+        {
+            "provider": "https://private.test/provider",
+            "category": "classified body",
+            "retryable": True,
+            "attempt_count": 10_000_000,
+            "http_status": 999,
+            "circuit_open_count": -1,
+            "fallback_attempted": True,
+        },
+    )
+    span.end(status="error")
+    trace.close()
+
+    metadata = client.observations[-1].kwargs["metadata"]
+    assert metadata == {"retryable": True, "fallback_attempted": True}
+    assert "private.test" not in repr(client.observations)
+    assert "classified" not in repr(client.observations)
+
+
 def test_langfuse_adapter_records_only_safe_structural_io() -> None:
     client = _FakeClient()
     config = ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk")

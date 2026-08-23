@@ -59,7 +59,10 @@ _PUBLIC_TOOL_ARGUMENT_KEYS = {
 _PUBLIC_TOOL_NORMAL_RESULT_SHAPES = {
     "web_search": frozenset({frozenset({"answer", "sources"})}),
     "read_webpage": frozenset(
-        {frozenset({"url", "status_code", "content_type", "text", "truncated"})}
+        {
+            frozenset({"url", "status_code", "content_type", "text", "truncated"}),
+            frozenset({"url", "answer", "sources", "fallback"}),
+        }
     ),
     "execute_python": frozenset({frozenset({"output_text", "outputs"})}),
     "read_attachment": frozenset(

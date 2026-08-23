@@ -32,6 +32,22 @@ _PUBLIC_TOOLS = frozenset(
 )
 _MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
 _ATTACHMENT_READ_CHUNK_BYTES = 1024 * 1024
+_SAFE_FAILURE_CATEGORIES = frozenset(
+    {
+        "tool_error",
+        "search_unavailable",
+        "timeout",
+        "transport",
+        "http_status",
+        "parse_failure",
+        "empty_content",
+        "policy_rejection",
+        "provider_error",
+    }
+)
+_SAFE_SEARCH_PROVIDERS = frozenset({"openai", "serper", "serpapi"})
+_MAX_TRACE_DECISION_COUNT = 1_000_000
+_TRACE_META_KEY = "gaia.trace"
 
 
 class ToolExecutionError(ToolCallError):
@@ -40,6 +56,12 @@ class ToolExecutionError(ToolCallError):
 
 class AttachmentPolicyError(ValueError):
     pass
+
+
+class _ObservedToolResult(dict[str, Any]):
+    def __init__(self, payload: dict[str, Any], trace_metadata: dict[str, Any]) -> None:
+        super().__init__(payload)
+        self.trace_metadata = trace_metadata
 
 
 class MCPToolClient:
@@ -140,16 +162,22 @@ class MCPToolClient:
             result = await self._call_impl(name, arguments)
         except Exception as error:
             if span is not None:
+                metadata: dict[str, Any] = {"error_type": type(error).__name__}
+                metadata.update(_safe_tool_failure_trace(error))
                 span.end(
                     status="error",
-                    metadata={"error_type": type(error).__name__},
+                    metadata=metadata,
                     output={"result_key_count": 0, "result_keys": []},
                 )
             raise
         if span is not None:
+            metadata = {"result_key_count": len(result)}
+            metadata.update(getattr(result, "trace_metadata", {}))
+            if result.get("fallback") == "search":
+                metadata["fallback_used"] = True
             span.end(
                 status="ok",
-                metadata={"result_key_count": len(result)},
+                metadata=metadata,
                 output={
                     "result_key_count": len(result),
                     "result_keys": sorted(result),
@@ -176,14 +204,31 @@ class MCPToolClient:
         # redacted ToolExecutor error instead of leaking implementation exceptions.
         except Exception as error:  # noqa: BLE001
             raise ToolExecutionError(self._redact(str(error))) from None
+        trace_metadata = _safe_mcp_trace_metadata(getattr(result, "meta", None))
         if result.is_error:
             message = "\n".join(
                 content.text for content in result.content if getattr(content, "type", None) == "text"
             )
             safe = _safe_failure_payload(message)
             if safe is not None:
+                safe.update(
+                    {
+                        key: value
+                        for key, value in trace_metadata.items()
+                        if key in {"circuit_open_count", "fallback_attempted"}
+                    }
+                )
                 raise _tool_execution_error(name, **safe)
+            if _is_tool_failure_envelope(message):
+                raise ToolExecutionError(f"tool failed: {name}")
             if name == "read_webpage" and (classified := _webpage_failure_payload(message)):
+                classified.update(
+                    {
+                        key: value
+                        for key, value in trace_metadata.items()
+                        if key in {"circuit_open_count", "fallback_attempted"}
+                    }
+                )
                 raise _tool_execution_error(name, **classified)
             raise ToolExecutionError(self._redact(message or f"tool failed: {name}"))
         output = result.structured_content
@@ -195,7 +240,7 @@ class MCPToolClient:
             usage = _validated_usage(raw_usage)
             async with self._usage_lock:
                 self._usage = _add_usage(self._usage, usage)
-        return self._redact_value(output)
+        return _ObservedToolResult(self._redact_value(output), trace_metadata)
 
     async def read_attachment_bytes(self, path: Path | str) -> bytes:
         """Read one registered attachment under a bounded, task-scoped policy."""
@@ -366,20 +411,37 @@ def _safe_failure_payload(message: str) -> dict[str, Any] | None:
     http_status = value.get("http_status")
     if (
         not isinstance(category, str)
+        or category not in _SAFE_FAILURE_CATEGORIES
         or not isinstance(value["retryable"], bool)
-        or provider is not None and not isinstance(provider, str)
-        or not isinstance(attempt_count, int)
-        or attempt_count < 1
-        or http_status is not None and not isinstance(http_status, int)
+        or provider is not None
+        and (not isinstance(provider, str) or provider not in _SAFE_SEARCH_PROVIDERS)
+        or not _safe_count(attempt_count, minimum=1)
+        or http_status is not None
+        and (not isinstance(http_status, int) or isinstance(http_status, bool) or not 100 <= http_status <= 599)
     ):
         return None
-    return {
+    safe = {
         "category": category,
         "retryable": value["retryable"],
         "provider": provider,
         "attempt_count": attempt_count,
         "http_status": http_status,
     }
+    circuit_open_count = value.get("circuit_open_count")
+    if _safe_count(circuit_open_count, minimum=0):
+        safe["circuit_open_count"] = circuit_open_count
+    fallback_attempted = value.get("fallback_attempted")
+    if isinstance(fallback_attempted, bool):
+        safe["fallback_attempted"] = fallback_attempted
+    return safe
+
+
+def _is_tool_failure_envelope(message: str) -> bool:
+    try:
+        value = json.loads(message[message.find("{") :])
+    except (TypeError, ValueError):
+        return False
+    return isinstance(value, dict) and value.get("error") == "tool_failed"
 
 
 def _tool_execution_error(
@@ -390,6 +452,8 @@ def _tool_execution_error(
     provider: str | None,
     attempt_count: int,
     http_status: int | None = None,
+    circuit_open_count: int | None = None,
+    fallback_attempted: bool | None = None,
 ) -> ToolExecutionError:
     error = ToolExecutionError(f"tool failed: {name}")
     error.category = category
@@ -397,7 +461,83 @@ def _tool_execution_error(
     error.provider = provider
     error.attempt_count = attempt_count
     error.http_status = http_status
+    if circuit_open_count is not None:
+        error.circuit_open_count = circuit_open_count
+    if fallback_attempted is not None:
+        error.fallback_attempted = fallback_attempted
     return error
+
+
+def _safe_count(value: Any, *, minimum: int) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum <= value <= _MAX_TRACE_DECISION_COUNT
+    )
+
+
+def _safe_tool_failure_trace(error: Exception) -> dict[str, Any]:
+    """Copy only validated control-flow facts from a typed tool failure."""
+
+    safe: dict[str, Any] = {}
+    provider = getattr(error, "provider", None)
+    if isinstance(provider, str) and provider in _SAFE_SEARCH_PROVIDERS:
+        safe["provider"] = provider
+    category = getattr(error, "category", None)
+    if isinstance(category, str) and category in _SAFE_FAILURE_CATEGORIES:
+        safe["category"] = category
+    retryable = getattr(error, "retryable", None)
+    if isinstance(retryable, bool):
+        safe["retryable"] = retryable
+    attempt_count = getattr(error, "attempt_count", None)
+    if _safe_count(attempt_count, minimum=1):
+        safe["attempt_count"] = attempt_count
+    http_status = getattr(error, "http_status", None)
+    if (
+        isinstance(http_status, int)
+        and not isinstance(http_status, bool)
+        and 100 <= http_status <= 599
+    ):
+        safe["http_status"] = http_status
+    circuit_open_count = getattr(error, "circuit_open_count", None)
+    if _safe_count(circuit_open_count, minimum=0):
+        safe["circuit_open_count"] = circuit_open_count
+    fallback_attempted = getattr(error, "fallback_attempted", None)
+    if isinstance(fallback_attempted, bool):
+        safe["fallback_attempted"] = fallback_attempted
+    return safe
+
+
+def _safe_mcp_trace_metadata(meta: Any) -> dict[str, Any]:
+    if not isinstance(meta, dict) or not isinstance(meta.get(_TRACE_META_KEY), dict):
+        return {}
+    value = meta[_TRACE_META_KEY]
+    safe: dict[str, Any] = {}
+    provider = value.get("provider")
+    if isinstance(provider, str) and provider in _SAFE_SEARCH_PROVIDERS:
+        safe["provider"] = provider
+    category = value.get("category")
+    if isinstance(category, str) and category in _SAFE_FAILURE_CATEGORIES:
+        safe["category"] = category
+    retryable = value.get("retryable")
+    if isinstance(retryable, bool):
+        safe["retryable"] = retryable
+    for key, minimum in (("attempt_count", 1), ("circuit_open_count", 0)):
+        item = value.get(key)
+        if _safe_count(item, minimum=minimum):
+            safe[key] = item
+    http_status = value.get("http_status")
+    if (
+        isinstance(http_status, int)
+        and not isinstance(http_status, bool)
+        and 100 <= http_status <= 599
+    ):
+        safe["http_status"] = http_status
+    for key in ("fallback_attempted", "fallback_used"):
+        item = value.get(key)
+        if isinstance(item, bool):
+            safe[key] = item
+    return safe
 
 
 def _webpage_failure_payload(message: str) -> dict[str, Any] | None:

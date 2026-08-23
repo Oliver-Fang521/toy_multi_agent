@@ -38,13 +38,38 @@ class SearchProviderError(ToolCallError):
 
 
 class SearchUnavailableError(ToolCallError):
-    def __init__(self, attempt_count: int) -> None:
+    def __init__(
+        self,
+        attempt_count: int,
+        *,
+        circuit_open_count: int = 0,
+        fallback_attempted: bool = False,
+    ) -> None:
         super().__init__("search_unavailable")
         self.provider = None
         self.category = "search_unavailable"
         self.retryable = True
         self.http_status = None
         self.attempt_count = max(1, attempt_count)
+        self.circuit_open_count = max(0, circuit_open_count)
+        self.fallback_attempted = fallback_attempted
+
+
+class SearchProviderResult(dict[str, Any]):
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        provider: str,
+        attempt_count: int,
+        circuit_open_count: int,
+        fallback_used: bool,
+    ) -> None:
+        super().__init__(payload)
+        self.provider = provider
+        self.attempt_count = attempt_count
+        self.circuit_open_count = circuit_open_count
+        self.fallback_used = fallback_used
 
 
 def _source(entry: Any) -> dict[str, str | None] | None:
@@ -215,17 +240,22 @@ class SearchProviderChain:
 
     async def search(self, query: str) -> dict[str, Any]:
         total_attempts = 0
-        for provider in self._providers:
+        circuit_open_count = 0
+        fallback_attempted = False
+        for provider_index, provider in enumerate(self._providers):
             circuit = self._circuits[provider.provider]
             if circuit.open_until > self._clock():
+                circuit_open_count += 1
                 continue
+            if provider_index > 0:
+                fallback_attempted = True
             for attempt in range(1, self._retry_policy.max_attempts + 1):
                 total_attempts += 1
                 try:
                     result = await provider.search(query)
                 except SearchProviderError as error:
                     if not error.retryable:
-                        raise
+                        break
                     if attempt < self._retry_policy.max_attempts:
                         await asyncio.sleep(retry_delay(self._retry_policy, attempt, lambda: 0.0))
                         continue
@@ -236,5 +266,15 @@ class SearchProviderChain:
                 else:
                     circuit.failures = 0
                     circuit.open_until = 0.0
-                    return result
-        raise SearchUnavailableError(total_attempts)
+                    return SearchProviderResult(
+                        result,
+                        provider=provider.provider,
+                        attempt_count=total_attempts,
+                        circuit_open_count=circuit_open_count,
+                        fallback_used=provider_index > 0,
+                    )
+        raise SearchUnavailableError(
+            total_attempts,
+            circuit_open_count=circuit_open_count,
+            fallback_attempted=fallback_attempted,
+        )

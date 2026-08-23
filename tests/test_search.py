@@ -10,6 +10,7 @@ from gaia_agent.reliability import RetryPolicy
 from gaia_agent.search import (
     SearchProviderChain,
     SearchProviderError,
+    SearchUnavailableError,
     SerpAPISearchProvider,
     SerperSearchProvider,
 )
@@ -132,6 +133,10 @@ async def test_search_chain_falls_back_in_order_after_bounded_transient_retries(
     result = await chain.search("question")
 
     assert result == {"answer": "fallback", "sources": []}
+    assert result.provider == "serper"
+    assert result.attempt_count == 3
+    assert result.circuit_open_count == 0
+    assert result.fallback_used is True
     assert openai.queries == ["question", "question"]
     assert serper.queries == ["question"]
     assert serpapi.queries == []
@@ -189,18 +194,56 @@ async def test_search_chain_waits_with_bounded_backoff_before_retrying_transient
 
 
 @pytest.mark.asyncio
-async def test_search_chain_stops_on_nonretryable_provider_failure() -> None:
+@pytest.mark.parametrize(
+    ("category", "http_status"),
+    [
+        ("http_status", 401),
+        ("parse_failure", None),
+        ("empty_content", None),
+    ],
+)
+async def test_search_chain_falls_through_nonretryable_provider_local_failures_without_circuit(
+    category: str, http_status: int | None
+) -> None:
     openai = _ScriptedProvider(
-        "openai", [SearchProviderError(provider="openai", category="parse_failure", retryable=False)]
+        "openai",
+        [
+            SearchProviderError(
+                provider="openai",
+                category=category,
+                retryable=False,
+                http_status=http_status,
+            )
+        ],
     )
-    serper = _ScriptedProvider("serper", [{"answer": "must not run", "sources": []}])
+    serper = _ScriptedProvider("serper", [{"answer": "healthy fallback", "sources": []}])
     chain = SearchProviderChain([openai, serper], RetryPolicy(max_attempts=2), clock=lambda: 0.0)
 
-    with pytest.raises(SearchProviderError, match="parse_failure"):
+    result = await chain.search("question")
+
+    assert result == {"answer": "healthy fallback", "sources": []}
+    assert openai.queries == ["question"]
+    assert serper.queries == ["question"]
+    assert chain._circuits["openai"].failures == 0
+
+
+@pytest.mark.asyncio
+async def test_search_chain_raises_one_safe_unavailable_error_after_all_provider_local_failures() -> None:
+    providers = [
+        _ScriptedProvider(
+            provider,
+            [SearchProviderError(provider=provider, category="empty_content", retryable=False)],
+        )
+        for provider in ("openai", "serper", "serpapi")
+    ]
+    chain = SearchProviderChain(providers, RetryPolicy(max_attempts=3), clock=lambda: 0.0)
+
+    with pytest.raises(SearchUnavailableError) as caught:
         await chain.search("question")
 
-    assert openai.queries == ["question"]
-    assert serper.queries == []
+    assert caught.value.attempt_count == 3
+    assert [provider.queries for provider in providers] == [["question"], ["question"], ["question"]]
+    assert all(chain._circuits[provider.provider].failures == 0 for provider in providers)
 
 
 @pytest.mark.asyncio
@@ -214,3 +257,28 @@ async def test_search_chain_propagates_unclassified_provider_errors_without_open
 
     assert serper.queries == []
     assert chain._circuits["openai"].failures == 0
+
+
+@pytest.mark.asyncio
+async def test_search_unavailable_reports_bounded_circuit_and_fallback_decisions() -> None:
+    openai = _ScriptedProvider("openai", [_transient("openai"), _transient("openai")])
+    serper = _ScriptedProvider(
+        "serper",
+        [
+            SearchProviderError(provider="serper", category="empty_content", retryable=False)
+            for _ in range(3)
+        ],
+    )
+    chain = SearchProviderChain(
+        [openai, serper], RetryPolicy(max_attempts=1), clock=lambda: 0.0
+    )
+
+    for query in ("first", "second"):
+        with pytest.raises(SearchUnavailableError):
+            await chain.search(query)
+    with pytest.raises(SearchUnavailableError) as caught:
+        await chain.search("third")
+
+    assert caught.value.attempt_count == 1
+    assert caught.value.circuit_open_count == 1
+    assert caught.value.fallback_attempted is True

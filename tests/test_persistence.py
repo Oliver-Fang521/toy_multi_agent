@@ -372,6 +372,30 @@ def test_real_task_six_tool_audit_shapes_persist_only_key_names(tmp_path, predic
     assert "gated question" not in audit
 
 
+def test_read_webpage_search_fallback_audit_shape_is_public_and_allowlisted(
+    tmp_path, prediction
+) -> None:
+    store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
+
+    store.append_audit(
+        prediction.task_id,
+        AuditEvent(
+            sequence=1,
+            event_type="tool_call_completed",
+            timestamp=datetime(2026, 8, 17, tzinfo=UTC),
+            payload={
+                "tool": "read_webpage",
+                "call_number": 1,
+                "argument_keys": ["url"],
+                "result_keys": ["answer", "fallback", "sources", "url"],
+            },
+        ),
+    )
+
+    audit = (store.task_directory(prediction.task_id) / "audit.jsonl").read_text()
+    assert '"result_keys":["answer","fallback","sources","url"]' in audit
+
+
 def test_recoverable_tool_failure_audit_is_public_and_integrity_safe(
     tmp_path, prediction
 ) -> None:

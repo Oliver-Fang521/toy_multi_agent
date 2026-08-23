@@ -355,6 +355,56 @@ async def test_evaluation_runner_persists_context_pressure_at_configured_one_meb
     ] * 3
 
 
+@pytest.mark.asyncio
+async def test_evaluation_runner_persists_read_webpage_search_fallback_audit(
+    tmp_path: Path,
+) -> None:
+    class _FallbackAuditOrchestrator:
+        def __init__(self, task: GaiaTask) -> None:
+            self._task = task
+            self.audit_events = (
+                AuditEvent(
+                    sequence=1,
+                    event_type="tool_call_completed",
+                    timestamp=datetime(2026, 8, 17, tzinfo=UTC),
+                    payload={
+                        "tool": "read_webpage",
+                        "call_number": 1,
+                        "argument_keys": ["url"],
+                        "result_keys": ["answer", "fallback", "sources", "url"],
+                    },
+                ),
+            )
+
+        async def run(self, task: GaiaTask) -> TaskPrediction:
+            return TaskPrediction(
+                task_id=task.task_id,
+                level=task.level,
+                answer=task.final_answer,
+                critic_verdict="approve",
+            )
+
+    tasks, revision = _fixture_tasks()
+    output_dir = tmp_path / "webpage-fallback-audit"
+    runner = EvaluationRunner(
+        config=_config(output_dir),
+        dataset_loader=lambda _config: (tasks, revision),
+        orchestrator_factory=_FallbackAuditOrchestrator,
+    )
+
+    await runner.run()
+
+    assert verify_run_directory(output_dir).total == 3
+    persisted_result_keys = [
+        json.loads(line)["payload"]["result_keys"]
+        for audit_path in (output_dir / "tasks").rglob("audit.jsonl")
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert persisted_result_keys == [
+        ["answer", "fallback", "sources", "url"],
+    ] * 3
+
+
 def test_build_runner_rejects_dataset_only_injection_before_default_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

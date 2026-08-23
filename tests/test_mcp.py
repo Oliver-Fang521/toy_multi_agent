@@ -30,6 +30,7 @@ from gaia_agent.mcp_server import (
 )
 from gaia_agent.models import Usage
 from gaia_agent.observability import Observability, ObservabilityConfig
+from gaia_agent.search import SearchUnavailableError
 
 
 @pytest.fixture
@@ -242,6 +243,11 @@ async def test_read_webpage_returns_bounded_search_snippets_after_transient_fail
         "sources": [{"url": "https://source.test", "title": "Source"}],
         "fallback": "search",
     }
+    assert result.meta["gaia.trace"] == {
+        "provider": "serper",
+        "attempt_count": 1,
+        "fallback_used": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -266,7 +272,7 @@ async def test_read_webpage_bounds_and_redacts_oversized_search_fallback(
                 "sources": [
                     {
                         "url": f"https://source-{index}.test/article",
-                        "title": secret + "title" * 200,
+                        "title": secret + "title" * 5_000,
                     }
                     for index in range(20)
                 ],
@@ -281,12 +287,14 @@ async def test_read_webpage_bounds_and_redacts_oversized_search_fallback(
         hf_token="",
         search_provider=SearchFallback(),
     )
+    long_url = "https://example.test/" + "path" * 8_000
     async with Client(build_server(settings)) as client:
-        tool_result = await client.call_tool("read_webpage", {"url": "https://example.test/article"})
+        tool_result = await client.call_tool("read_webpage", {"url": long_url})
 
     assert tool_result.is_error is False
     assert isinstance(tool_result.structured_content, dict)
     result = dict(tool_result.structured_content)
+    assert set(result) == {"url", "answer", "sources", "fallback"}
     assert result["fallback"] == "search"
     assert "answer" in result
     assert len(result["sources"]) <= mcp_server.MAX_WEB_SEARCH_SOURCES
@@ -558,6 +566,228 @@ async def test_mcp_client_records_tool_shape_without_arguments_or_results(
 
 
 @pytest.mark.asyncio
+async def test_mcp_failure_span_records_only_bounded_structured_failure_metadata(
+    tmp_path: Path, run_config: RunConfig
+) -> None:
+    secret = "sk-private-trace-secret"
+
+    class FailingClient:
+        async def call_tool(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                is_error=True,
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "error": "tool_failed",
+                                "category": "http_status",
+                                "retryable": True,
+                                "provider": "serper",
+                                "attempt_count": 3,
+                                "http_status": 503,
+                                "circuit_open_count": 2,
+                                "fallback_attempted": True,
+                                "raw": f"{secret} https://private.test body=classified",
+                            }
+                        ),
+                    )
+                ],
+            )
+
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "task-1",
+        level=1,
+        model="test-model",
+        reasoning_effort="max",
+        run_index=0,
+        evaluation_mode="test",
+    )
+    client = MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        allowed={"web_search"},
+        observability=observability,
+    )
+    client._client = FailingClient()
+
+    with pytest.raises(ToolExecutionError):
+        await client.call("web_search", {"query": f"secret query {secret}"})
+    trace.close()
+
+    span = trace_client.observations[-1]
+    assert span.updates[-1]["metadata"] == {
+        "error_type": "ToolExecutionError",
+        "provider": "serper",
+        "category": "http_status",
+        "retryable": True,
+        "attempt_count": 3,
+        "http_status": 503,
+        "circuit_open_count": 2,
+        "fallback_attempted": True,
+        "status": "error",
+    }
+    assert span.updates[-1]["output"] == {"result_key_count": 0, "result_keys": []}
+    assert secret not in repr(span.kwargs)
+    assert secret not in repr(span.updates)
+    assert "private.test" not in repr(span.updates)
+    assert "classified" not in repr(span.updates)
+
+
+@pytest.mark.asyncio
+async def test_mcp_success_span_records_fallback_decision_without_result_content(
+    tmp_path: Path, run_config: RunConfig
+) -> None:
+    secret = "private fallback answer"
+
+    class FallbackClient:
+        async def call_tool(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                is_error=False,
+                content=[],
+                structured_content={
+                    "url": "https://private.test/article",
+                    "answer": secret,
+                    "sources": [{"url": "https://private.test/source", "title": secret}],
+                    "fallback": "search",
+                },
+            )
+
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "task-1",
+        level=1,
+        model="test-model",
+        reasoning_effort="max",
+        run_index=0,
+        evaluation_mode="test",
+    )
+    client = MCPToolClient(
+        task_root=tmp_path,
+        config=run_config,
+        allowed={"read_webpage"},
+        observability=observability,
+    )
+    client._client = FallbackClient()
+
+    result = await client.call("read_webpage", {"url": "https://private.test/article"})
+    trace.close()
+
+    assert result["answer"] == secret
+    span = trace_client.observations[-1]
+    assert span.updates[-1]["metadata"] == {
+        "result_key_count": 4,
+        "fallback_used": True,
+        "status": "ok",
+    }
+    assert span.updates[-1]["output"] == {
+        "result_key_count": 4,
+        "result_keys": ["answer", "fallback", "sources", "url"],
+    }
+    assert secret not in repr(span.kwargs)
+    assert secret not in repr(span.updates)
+    assert "private.test" not in repr(span.updates)
+
+
+@pytest.mark.asyncio
+async def test_mcp_success_span_records_private_search_routing_metadata(
+    tmp_path: Path, run_config: RunConfig
+) -> None:
+    class SearchClient:
+        async def call_tool(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                is_error=False,
+                content=[],
+                meta={
+                    "gaia.trace": {
+                        "provider": "serper",
+                        "attempt_count": 3,
+                        "circuit_open_count": 1,
+                        "fallback_used": True,
+                    }
+                },
+                structured_content={"answer": "private answer", "sources": []},
+            )
+
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "task-1", level=1, model="test-model", reasoning_effort="max", run_index=0,
+        evaluation_mode="test",
+    )
+    client = MCPToolClient(
+        task_root=tmp_path, config=run_config, allowed={"web_search"}, observability=observability
+    )
+    client._client = SearchClient()
+
+    result = await client.call("web_search", {"query": "private question"})
+    trace.close()
+
+    assert result == {"answer": "private answer", "sources": []}
+    assert trace_client.observations[-1].updates[-1]["metadata"] == {
+        "result_key_count": 2,
+        "provider": "serper",
+        "attempt_count": 3,
+        "circuit_open_count": 1,
+        "fallback_used": True,
+        "status": "ok",
+    }
+    assert "private answer" not in repr(trace_client.observations[-1].updates)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_provider", ["https://private.test/provider", ["serper"]]
+)
+async def test_mcp_malformed_failure_metadata_fails_closed_without_raw_text(
+    tmp_path: Path, run_config: RunConfig, invalid_provider: Any
+) -> None:
+    class MalformedFailureClient:
+        async def call_tool(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
+            return SimpleNamespace(
+                is_error=True,
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "error": "tool_failed",
+                                "category": "http_status",
+                                "retryable": True,
+                                "provider": invalid_provider,
+                                "attempt_count": 1,
+                                "http_status": 503,
+                                "raw": "classified body",
+                            }
+                        ),
+                    )
+                ],
+            )
+
+    client = MCPToolClient(task_root=tmp_path, config=run_config, allowed={"web_search"})
+    client._client = MalformedFailureClient()
+
+    with pytest.raises(ToolExecutionError) as caught:
+        await client.call("web_search", {"query": "private query"})
+
+    assert str(caught.value) == "tool failed: web_search"
+    assert "private.test" not in str(caught.value)
+    assert "classified" not in str(caught.value)
+
+
+@pytest.mark.asyncio
 async def test_execute_python_accepts_instruction_without_attachments(
     tmp_path: Path, fake_backend_env: None, run_config: RunConfig
 ) -> None:
@@ -776,6 +1006,42 @@ async def test_safe_tool_call_preserves_trusted_usage_outside_payload_redaction(
             "total_tokens": 18,
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_call_serializes_only_safe_search_decisions(tmp_path: Path) -> None:
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=SimpleNamespace(),
+        backend=SimpleNamespace(),
+        api_key="openai-test-secret",
+        hf_token="hf-test-secret",
+    )
+    failure = SearchUnavailableError(
+        3,
+        circuit_open_count=1,
+        fallback_attempted=True,
+    )
+    failure.raw_response = "openai-test-secret https://private.test classified body"
+
+    async def fail() -> dict[str, Any]:
+        raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        await mcp_server._safe_tool_call(settings, fail())
+
+    payload = json.loads(str(caught.value))
+    assert payload == {
+        "error": "tool_failed",
+        "provider": None,
+        "category": "search_unavailable",
+        "retryable": True,
+        "attempt_count": 3,
+    }
+    assert "openai-test-secret" not in str(caught.value)
+    assert "private.test" not in str(caught.value)
+    assert "classified" not in str(caught.value)
 
 
 @pytest.mark.asyncio
