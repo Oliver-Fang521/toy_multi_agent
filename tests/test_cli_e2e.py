@@ -1915,6 +1915,98 @@ async def test_real_cancelled_resume_refreshes_authenticated_usage_before_rerais
 
 
 @pytest.mark.asyncio
+async def test_real_cancelled_resume_refreshes_before_slow_tool_teardown(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(_verify_checkpoint(usage_tokens=7))
+    critic_started = asyncio.Event()
+    teardown_started = asyncio.Event()
+    teardown_finished = asyncio.Event()
+
+    class UsageToolThenBlockingCritic:
+        last_usage = Usage()
+
+        async def verify(
+            self,
+            active_task: GaiaTask,
+            candidate: str | None,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> CriticDecision:
+            await tools.call("web_search", {"query": "known logical call"})
+            self.last_usage = Usage(input_tokens=5, total_tokens=5)
+            critic_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class SlowExitTools(_RunnerTools):
+        async def __aexit__(self, *_: object) -> None:
+            teardown_started.set()
+            try:
+                await asyncio.sleep(0.05)
+            finally:
+                teardown_finished.set()
+
+    orchestrator = Orchestrator(
+        planner=_NeverPlanner(),
+        specialists={SpecialistName.LOOKUP: _NeverSpecialist()},
+        critic=UsageToolThenBlockingCritic(),
+        tool_client_factory=lambda _task: SlowExitTools([]),
+        config=_config(
+            tmp_path,
+            timeout_seconds=0.20,
+            planner_timeout_seconds=0.04,
+            specialist_timeout_seconds=0.12,
+            critic_timeout_seconds=0.04,
+        ),
+        notebook=notebook,
+    )
+    runner = EvaluationRunner(
+        config=_config(
+            tmp_path,
+            timeout_seconds=0.03,
+            planner_timeout_seconds=0.006,
+            specialist_timeout_seconds=0.018,
+            critic_timeout_seconds=0.006,
+        ),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=lambda _task, _vote_namespace: orchestrator,
+    )
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+    immediate_checkpoint = notebook.load_stage_checkpoint()
+
+    assert critic_started.is_set()
+    assert teardown_started.is_set()
+    assert teardown_finished.is_set() is False
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert result.prediction.usage == Usage(input_tokens=12, total_tokens=12)
+    assert immediate_checkpoint is not None
+    assert immediate_checkpoint.usage == Usage(input_tokens=12, total_tokens=12)
+    assert immediate_checkpoint.logical_tool_calls == 3
+    assert immediate_checkpoint.stage_logical_tool_calls == StageToolCallCounts(
+        specialist=2,
+        critic=1,
+    )
+
+    await asyncio.wait_for(teardown_finished.wait(), timeout=0.10)
+    await asyncio.sleep(0)
+    final_checkpoint = notebook.load_stage_checkpoint()
+    assert final_checkpoint is not None
+    assert final_checkpoint.usage == immediate_checkpoint.usage
+    assert final_checkpoint.logical_tool_calls == 3
+    assert final_checkpoint.stage_logical_tool_calls == (
+        immediate_checkpoint.stage_logical_tool_calls
+    )
+
+
+@pytest.mark.asyncio
 async def test_runner_critic_budget_exhaustion_at_verify_is_terminal(
     tmp_path: Path,
 ) -> None:
@@ -2306,6 +2398,7 @@ async def test_runner_cancellation_during_production_factory_is_observed_and_clo
     assert len(created_deadlines) == 1
     assert created_deadlines[0].closed is True
     assert diagnostics["tracked"] == 1
+    assert diagnostics["reserved"] == 0
     factory_release.set()
     assert await asyncio.to_thread(factory_finished.wait, 0.10) is True
     for _ in range(10):
@@ -2633,6 +2726,86 @@ async def test_detached_attempt_registry_is_bounded_and_cleans_up(
     assert diagnostics["capacity"] == 1
     assert diagnostics["overflow_count"] >= 1
     assert diagnostics_fn()["tracked"] == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_cleanup_cancellation_never_orphans_reserved_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_module, "_CANCELLATION_CLEANUP_SECONDS", 1.0)
+    monkeypatch.setattr(runner_module, "_DETACHED_ATTEMPTS", set())
+    monkeypatch.setattr(runner_module, "_DETACHED_ATTEMPT_RESERVATIONS", 0)
+    loop = asyncio.get_running_loop()
+    reservations_before: list[int] = []
+    ownership_during_cleanup: list[tuple[int, int]] = []
+    production_exception_calls: list[int] = []
+
+    class RecordingTask(asyncio.Task[None]):
+        def __init__(self, coroutine: Any) -> None:
+            super().__init__(coroutine, loop=loop)
+            self.exception_calls = 0
+
+        def exception(self) -> BaseException | None:
+            self.exception_calls += 1
+            return super().exception()
+
+    for _ in range(3):
+        child_started = asyncio.Event()
+        child_cancelled = asyncio.Event()
+        child_release = asyncio.Event()
+
+        async def child(
+            started: asyncio.Event = child_started,
+            cancelled: asyncio.Event = child_cancelled,
+            release: asyncio.Event = child_release,
+        ) -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+                raise RuntimeError("late cleanup failure")
+
+        attempt = RecordingTask(child())
+        await child_started.wait()
+        reservations_before.append(
+            runner_module._detached_attempt_diagnostics()["reserved"]
+        )
+        assert runner_module._reserve_detached_attempt() is True
+        cleanup = asyncio.create_task(
+            runner_module._cancel_and_observe(attempt)
+        )
+        await child_cancelled.wait()
+
+        cleanup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        diagnostics = runner_module._detached_attempt_diagnostics()
+        ownership_during_cleanup.append(
+            (diagnostics["reserved"], diagnostics["tracked"])
+        )
+
+        child_release.set()
+        for _ in range(10):
+            if attempt.done():
+                break
+            await asyncio.sleep(0)
+        assert attempt.done() is True
+        for _ in range(10):
+            if runner_module._detached_attempt_diagnostics()["tracked"] == 0:
+                break
+            await asyncio.sleep(0)
+        production_exception_calls.append(attempt.exception_calls)
+        if attempt.exception_calls == 0:
+            attempt.exception()
+
+    final_diagnostics = runner_module._detached_attempt_diagnostics()
+    assert reservations_before == [0, 0, 0]
+    assert ownership_during_cleanup == [(0, 1), (0, 1), (0, 1)]
+    assert production_exception_calls == [1, 1, 1]
+    assert final_diagnostics["reserved"] == 0
+    assert final_diagnostics["tracked"] == 0
 
 
 @pytest.mark.asyncio

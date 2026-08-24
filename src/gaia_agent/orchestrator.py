@@ -438,10 +438,12 @@ class Orchestrator:
         execution_task = task.model_copy(update={"final_answer": ""})
         budgeted_tools: _BudgetedToolClient | None = None
         raw_tools: Any | None = None
+        raw_tool_usage_collected = False
         prediction: TaskPrediction | None = None
         category: TerminalErrorCategory | None = None
         provider_exhaustion: ProviderTransientExhaustedError | None = None
         cancellation: asyncio.CancelledError | None = None
+        cancellation_checkpoint_refreshed = False
         budgets = self._stage_budgets(started)
         stage_runtime = _StageRuntime()
         try:
@@ -456,13 +458,28 @@ class Orchestrator:
                             audit=self._audit,
                             notebook=self._notebook,
                         )
-                        prediction = await self._execute(
-                            state,
-                            execution_task,
-                            budgeted_tools,
-                            budgets,
-                            stage_runtime,
-                        )
+                        try:
+                            prediction = await self._execute(
+                                state,
+                                execution_task,
+                                budgeted_tools,
+                                budgets,
+                                stage_runtime,
+                            )
+                        except asyncio.CancelledError:
+                            state.usage = _add_usage(
+                                state.usage,
+                                getattr(raw_tools, "usage", Usage()),
+                            )
+                            raw_tool_usage_collected = True
+                            self.tool_call_count = budgeted_tools.call_count
+                            self.step_count = state.step_count
+                            self._refresh_checkpoint_accounting(
+                                state,
+                                budgeted_tools,
+                            )
+                            cancellation_checkpoint_refreshed = True
+                            raise
             except TimeoutError as error:
                 active_stage = stage_runtime.active
                 if active_stage is not None:
@@ -507,7 +524,7 @@ class Orchestrator:
         except Exception:  # noqa: BLE001 - task isolation requires a terminal result
             category = TerminalErrorCategory.RETRY_EXHAUSTED
         finally:
-            if raw_tools is not None:
+            if raw_tools is not None and not raw_tool_usage_collected:
                 state.usage = _add_usage(
                     state.usage,
                     getattr(raw_tools, "usage", Usage()),
@@ -516,7 +533,8 @@ class Orchestrator:
             self.tool_call_count = budgeted_tools.call_count
         self.step_count = state.step_count
         if cancellation is not None:
-            self._refresh_checkpoint_accounting(state, budgeted_tools)
+            if not cancellation_checkpoint_refreshed:
+                self._refresh_checkpoint_accounting(state, budgeted_tools)
             raise cancellation
         if prediction is not None:
             return prediction.model_copy(

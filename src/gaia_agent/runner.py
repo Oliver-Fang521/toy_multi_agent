@@ -692,7 +692,7 @@ async def _run_orchestrator_with_deadline(
         done, _ = await asyncio.wait({attempt}, timeout=remaining_seconds)
     except asyncio.CancelledError:
         invocation_deadline.close()
-        await _cancel_and_observe(attempt, reservation=True)
+        await _cancel_and_observe(attempt)
         raise
     if attempt in done:
         _release_detached_attempt_reservation()
@@ -702,28 +702,17 @@ async def _run_orchestrator_with_deadline(
             raise TimeoutError from error
 
     invocation_deadline.close()
-    await _cancel_and_observe(attempt, reservation=True)
+    await _cancel_and_observe(attempt)
     raise TimeoutError
 
 
-async def _cancel_and_observe(
-    attempt: asyncio.Task[Any],
-    *,
-    reservation: bool,
-) -> None:
+async def _cancel_and_observe(attempt: asyncio.Task[Any]) -> None:
+    _observe_detached_attempt(attempt)
     attempt.cancel()
-    done, _ = await asyncio.wait(
+    await asyncio.wait(
         {attempt},
         timeout=_CANCELLATION_CLEANUP_SECONDS,
     )
-    if attempt in done:
-        if reservation:
-            _release_detached_attempt_reservation()
-        _consume_detached_attempt(attempt)
-    else:
-        if reservation:
-            _track_detached_attempt(attempt)
-        attempt.add_done_callback(_consume_detached_attempt)
 
 
 def _observe_detached_attempt(attempt: asyncio.Task[Any]) -> None:

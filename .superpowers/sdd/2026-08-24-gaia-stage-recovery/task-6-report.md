@@ -613,3 +613,115 @@ done
 ```
 
 Final read-only re-review: **no Critical or Important findings; Ready: Yes.**
+
+---
+
+## Fix round 3 — pre-teardown accounting and cancellation-safe ownership
+
+### RED evidence
+
+Both controller findings were reproduced against `5085272` before production changes:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_real_cancelled_resume_refreshes_before_slow_tool_teardown \
+  tests/test_cli_e2e.py::test_repeated_cleanup_cancellation_never_orphans_reserved_attempts
+FF                                                                       [100%]
+```
+
+The real restored Orchestrator returned while its 50 ms tool-context teardown was still running,
+but immediate final/checkpoint usage was still 7 instead of 12. The repeated cleanup probe showed
+reservation poisoning exactly as `[0, 1, 2]` before three successive attempts instead of returning
+to `[0, 0, 0]`; its children also lacked the exception-consuming done callback.
+
+### GREEN evidence
+
+Focused controller regressions:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_real_cancelled_resume_refreshes_before_slow_tool_teardown \
+  tests/test_cli_e2e.py::test_repeated_cleanup_cancellation_never_orphans_reserved_attempts
+..                                                                       [100%]
+```
+
+Expanded recovery/deadline slice, including all round-two and round-three regressions:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_real_cancelled_resume_refreshes_authenticated_usage_before_reraise \
+  tests/test_cli_e2e.py::test_real_cancelled_resume_refreshes_before_slow_tool_teardown \
+  tests/test_cli_e2e.py::test_runner_legacy_sync_factory_stays_on_caller_event_loop \
+  tests/test_cli_e2e.py::test_runner_production_offloaded_factory_stays_inside_vote_deadline \
+  tests/test_cli_e2e.py::test_runner_cancellation_during_production_factory_is_observed_and_closes_guard \
+  tests/test_cli_e2e.py::test_slow_production_factories_share_bounded_detached_capacity \
+  tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_tool_call_after_vote_deadline \
+  tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_provider_call_after_vote_deadline \
+  tests/test_cli_e2e.py::test_detached_attempt_registry_is_bounded_and_cleans_up \
+  tests/test_cli_e2e.py::test_repeated_cleanup_cancellation_never_orphans_reserved_attempts
+...........                                                              [100%]
+```
+
+Impacted suites and fresh full suite:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py tests/test_orchestrator.py \
+  tests/test_openai_provider.py tests/test_deepseek_provider.py
+........................................................................ [ 36%]
+........................................................................ [ 72%]
+......................................................                   [100%]
+
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+........................................................................ [ 11%]
+........................................................................ [ 22%]
+........................................................................ [ 34%]
+........................................................................ [ 45%]
+........................................................................ [ 56%]
+........................................................................ [ 68%]
+........................................................................ [ 79%]
+........................................................................ [ 90%]
+.........................................................                [100%]
+```
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check src tests
+All checks passed!
+
+git diff --check
+# no output
+```
+
+### Behavior added in fix round 3
+
+- Cancellation propagated by the active provider/graph is now caught inside the tool-context body.
+  Completed provider usage, raw tool usage, global logical calls, and per-stage logical calls are
+  persisted to the prior authenticated semantic checkpoint before `__aexit__` begins. Cancellation
+  is immediately re-raised so normal resource teardown still owns its lifecycle.
+- Raw tool usage is marked collected on that early path, and the later cancellation boundary knows
+  the accounting checkpoint was already refreshed. Slow teardown therefore cannot delay accounting,
+  and eventual completion neither repeats the refresh nor double-charges usage.
+- `_cancel_and_observe` transfers its existing reservation into strong tracked ownership and installs
+  the exception-consuming done callback synchronously before calling `cancel()` or awaiting cleanup.
+  A second cancellation can abort only the optional bounded wait; it cannot strand a reserved slot
+  or orphan the child outcome.
+- The deterministic ownership test repeats the second-cancellation race three times. Each cycle
+  observes reserved/tracked `0/1` while the child is pending, then `0/0` after its late exception is
+  consumed. The separate production-factory cancellation test continues to prove its non-awaiting
+  ownership-transfer path also moves reserved `1` to tracked `1`.
+
+### Fix-round files and concerns
+
+- `src/gaia_agent/orchestrator.py`: pre-teardown cancellation accounting and single-collection/
+  single-refresh guards.
+- `src/gaia_agent/runner.py`: ownership-first bounded cancellation cleanup.
+- `tests/test_cli_e2e.py`: real slow-`__aexit__` accounting and repeated second-cancellation ownership
+  regressions, plus the production-factory reserved-state assertion.
+
+No new model, provider, public audit, Langfuse, secret, prompt, candidate, evidence, or URL behavior
+was introduced. The existing documented Python limit remains: arbitrary cancellation-suppressing
+code cannot be forcibly terminated, but every admitted task stays within bounded tracked ownership
+and cannot begin new guarded provider/tool work after deadline.
+
+Final independent read-only review found no Critical or Important findings and returned
+**Ready: Yes**. Its focused cancellation slice passed 3/3; Ruff and `git diff --check` were clean.
