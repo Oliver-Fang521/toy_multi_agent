@@ -24,6 +24,7 @@ from gaia_agent.models import (
 from gaia_agent.research_notebook import (
     NotebookEntry,
     ResearchNotebook,
+    _open_directory,
     select_evidence_cards,
 )
 
@@ -255,6 +256,12 @@ def test_notebook_rejects_oversized_trust_anchor(tmp_path: Path) -> None:
 def test_notebook_rejects_task_ids_that_escape_its_root(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="task_id"):
         ResearchNotebook(tmp_path / "private", "../outside")
+
+
+@pytest.mark.parametrize("task_id", [".", ".."])
+def test_notebook_rejects_navigation_task_ids(tmp_path: Path, task_id: str) -> None:
+    with pytest.raises(ValueError, match="task_id"):
+        ResearchNotebook(tmp_path / "private", task_id)
 
 
 def test_notebook_rejects_oversized_entries_without_writing_them(tmp_path: Path) -> None:
@@ -848,6 +855,70 @@ def test_stage_checkpoint_write_cannot_follow_a_swapped_intermediate_ancestor(
         staticmethod(original_assert),
     )
     assert notebook.load_stage_checkpoint() == checkpoint
+
+
+def test_stage_checkpoint_root_dotdot_cannot_be_relocated_to_an_outside_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    moving = parent / "moving"
+    moving.mkdir(parents=True)
+    notebook = ResearchNotebook(
+        moving / ".." / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    assert notebook.root == parent / "private"
+    checkpoint = _stage_checkpoint()
+    redirected = checkpoint.model_copy(
+        update={"candidate": "redirected", "candidate_origins": {1: "redirected"}}
+    )
+    notebook.save_stage_checkpoint(redirected)
+    redirected_payload = (
+        notebook.root / "task-1" / ".stage-checkpoint.json"
+    ).read_bytes()
+    notebook.save_stage_checkpoint(checkpoint)
+    outside_parent = tmp_path / "outside-parent"
+    outside_task = outside_parent / "private" / "task-1"
+    outside_task.mkdir(mode=0o700, parents=True)
+    outside_checkpoint = outside_task / ".stage-checkpoint.json"
+    outside_checkpoint.write_bytes(redirected_payload)
+    outside_checkpoint.chmod(0o600)
+    real_open = os.open
+    relocated = False
+
+    def relocate_before_dotdot(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal relocated
+        if path == ".." and not relocated:
+            relocated = True
+            moving.rename(outside_parent / "moving")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", relocate_before_dotdot)
+
+    assert notebook.load_stage_checkpoint() == checkpoint
+    assert not relocated
+
+
+def test_checkpoint_directory_walker_rejects_navigation_components(
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "child"
+    child.mkdir()
+    descriptor = -1
+    try:
+        with pytest.raises(ValueError, match="navigation"):
+            descriptor = _open_directory(child / "..")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _notebook_entry(tool: str, result: dict[str, object], signature: str) -> NotebookEntry:

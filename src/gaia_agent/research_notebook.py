@@ -211,13 +211,14 @@ class ResearchNotebook:
         *,
         run_generation: str = "standalone",
     ) -> None:
+        normalized_root = _lexical_absolute(root)
         if max_entry_bytes < 1:
             raise ValueError("max_entry_bytes must be positive")
         if not _is_contained_task_id(task_id):
             raise ValueError("task_id must be a single path component")
         if not run_generation or len(run_generation.encode("utf-8")) > 512:
             raise ValueError("run_generation must be non-empty and bounded")
-        self.root = Path(root)
+        self.root = normalized_root
         self.task_id = task_id
         self.max_entry_bytes = max_entry_bytes
         self._create_private_directory(self.root)
@@ -404,11 +405,21 @@ class ResearchNotebook:
 
 def _is_contained_task_id(task_id: str) -> bool:
     path = Path(task_id)
-    return bool(task_id) and path.name == task_id and "/" not in task_id and "\\" not in task_id
+    return (
+        bool(task_id)
+        and task_id not in {".", ".."}
+        and path.name == task_id
+        and "/" not in task_id
+        and "\\" not in task_id
+    )
+
+
+def _lexical_absolute(path: Path | str) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
 
 
 def _reject_symlink_components(path: Path) -> None:
-    absolute = path.absolute()
+    absolute = _lexical_absolute(path)
     current = Path(absolute.anchor)
     for component in absolute.parts[1:]:
         current /= component
@@ -417,7 +428,10 @@ def _reject_symlink_components(path: Path) -> None:
 
 
 def _open_directory(path: Path) -> int:
-    absolute = path.absolute()
+    raw_components = os.fspath(path).split(os.sep)
+    if any(component in {".", ".."} for component in raw_components):
+        raise ValueError("notebook storage path contains a navigation component")
+    absolute = _lexical_absolute(path)
     descriptor = os.open(absolute.anchor, _directory_open_flags())
     try:
         _assert_open_directory(descriptor)
@@ -575,7 +589,7 @@ def _signature(tool: str, arguments: Mapping[str, Any]) -> str:
 
 
 def _notebook_scope(root: Path) -> str:
-    return hashlib.sha256(str(root.absolute()).encode("utf-8")).hexdigest()
+    return hashlib.sha256(str(_lexical_absolute(root)).encode("utf-8")).hexdigest()
 
 
 def _entry_body(
