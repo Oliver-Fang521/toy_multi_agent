@@ -282,6 +282,29 @@ class SearchProviderChain:
     def _can_wait(self, deadline: float | None, delay: float) -> bool:
         return deadline is None or deadline - self._clock() > delay
 
+    async def _search_with_deadline(
+        self,
+        provider: SearchProvider,
+        query: str,
+        deadline: float | None,
+    ) -> dict[str, Any]:
+        if deadline is None:
+            return await provider.search(query)
+        remaining_seconds = deadline - self._clock()
+        if remaining_seconds <= 0:
+            raise SearchDeadlineExceeded
+        timeout = asyncio.timeout(remaining_seconds)
+        try:
+            async with timeout:
+                result = await provider.search(query)
+        except TimeoutError:
+            if timeout.expired():
+                raise SearchDeadlineExceeded from None
+            raise
+        if timeout.expired():
+            raise SearchDeadlineExceeded
+        return result
+
     async def search(self, query: str) -> dict[str, Any]:
         deadline = (
             None
@@ -305,7 +328,7 @@ class SearchProviderChain:
                     raise SearchDeadlineExceeded
                 total_attempts += 1
                 try:
-                    result = await provider.search(query)
+                    result = await self._search_with_deadline(provider, query, deadline)
                 except SearchProviderError as error:
                     if not error.retryable:
                         circuit.failures = 0

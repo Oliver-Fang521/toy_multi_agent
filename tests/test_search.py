@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -211,6 +213,78 @@ async def test_search_chain_does_not_start_fallback_after_deadline() -> None:
         await chain.search("question")
 
     assert serper.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_chain_cancels_an_inflight_provider_at_operation_deadline() -> None:
+    class SlowProvider:
+        provider = "openai"
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        async def search(self, query: str) -> dict[str, Any]:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    provider = SlowProvider()
+    chain = SearchProviderChain(
+        [provider],
+        RetryPolicy(max_attempts=1),
+        clock=time.monotonic,
+        operation_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(search_module.SearchDeadlineExceeded):
+        await asyncio.wait_for(chain.search("question"), timeout=0.1)
+
+    assert provider.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_search_chain_cancels_fallback_within_remaining_operation_time() -> None:
+    class SlowOpenAI:
+        provider = "openai"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            await asyncio.sleep(0.02)
+            raise SearchProviderError(
+                provider=self.provider,
+                category="timeout",
+                retryable=False,
+            )
+
+    class SlowSerper:
+        provider = "serper"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.cancelled = False
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    serper = SlowSerper()
+    chain = SearchProviderChain(
+        [SlowOpenAI(), serper],
+        RetryPolicy(max_attempts=1),
+        clock=time.monotonic,
+        operation_timeout_seconds=0.05,
+    )
+
+    with pytest.raises(search_module.SearchDeadlineExceeded):
+        await asyncio.wait_for(chain.search("question"), timeout=0.15)
+
+    assert serper.calls == 1
+    assert serper.cancelled is True
 
 
 @pytest.mark.asyncio
