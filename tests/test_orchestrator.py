@@ -2193,6 +2193,69 @@ async def test_specialist_timeout_routes_prior_validated_state_to_critic() -> No
 
 
 @pytest.mark.asyncio
+async def test_specialist_tool_exhaustion_with_prior_state_remains_terminal() -> None:
+    calls: list[str] = []
+    computation = FakeSpecialist(
+        SpecialistName.COMPUTATION,
+        calls,
+        [
+            _result(
+                SpecialistName.COMPUTATION,
+                (_evidence("calculation-1", "computation"),),
+                "42",
+            )
+        ],
+    )
+    lookup = FakeSpecialist(
+        SpecialistName.LOOKUP,
+        calls,
+        [],
+        tool_calls=[
+            ("web_search", {"query": "first"}),
+            ("web_search", {"query": "second"}),
+        ],
+    )
+    critic = FakeCritic(
+        calls,
+        [_decision("approve", ("evidence-0001",))],
+    )
+    tools = FakeTools(calls)
+    orchestrator = Orchestrator(
+        planner=FakePlanner(
+            calls,
+            _plan(SpecialistName.COMPUTATION, SpecialistName.LOOKUP),
+        ),
+        specialists={
+            SpecialistName.COMPUTATION: computation,
+            SpecialistName.LOOKUP: lookup,
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(tools),
+        config=_config(
+            max_tool_calls=4,
+            specialist_max_tool_calls=1,
+            critic_max_tool_calls=2,
+        ),
+    )
+
+    prediction = await orchestrator.run(_task(question="Compute the answer"))
+
+    assert calls == ["planner", "computation", "lookup", "web_search"]
+    assert critic.candidates == []
+    assert tools.call_arguments == [("web_search", {"query": "first"})]
+    assert prediction.answer is None
+    assert prediction.error_category == TerminalErrorCategory.TOOL_BUDGET_EXHAUSTED
+    budget_events = [
+        event
+        for event in orchestrator.audit_events
+        if event.event_type == "stage_budget_exhausted"
+    ]
+    assert len(budget_events) == 1
+    assert budget_events[0].payload["stage"] == "specialist"
+    assert budget_events[0].payload["reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
 async def test_derived_default_critic_deadline_emits_typed_budget_audit() -> None:
     calls: list[str] = []
 

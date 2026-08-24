@@ -598,7 +598,7 @@ class Orchestrator:
                 stage_runtime=graph_state["stage_runtime"],
             )
         except StageBudgetExceeded as error:
-            if state.candidate is None or not state.evidence:
+            if error.reason != "time" or state.candidate is None or not state.evidence:
                 raise
             self._audit_stage_budget_exhausted(
                 error,
