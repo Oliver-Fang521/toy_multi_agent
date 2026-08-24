@@ -128,6 +128,8 @@ class StageCheckpoint(FrozenModel):
 
     @model_validator(mode="after")
     def validate_resume_invariants(self) -> "StageCheckpoint":
+        if not self.plan.steps:
+            raise ValueError("checkpoint plan must contain at least one step")
         evidence_ids = tuple(item.evidence_id for item in self.evidence)
         expected_ids = tuple(
             f"evidence-{index:04d}" for index in range(1, len(self.evidence) + 1)
@@ -171,7 +173,9 @@ class StageCheckpoint(FrozenModel):
             not self.candidate.strip() or "\n" in self.candidate
         ):
             raise ValueError("checkpoint candidate must use the concise GAIA format")
-        if self.next_step_index > len(self.plan.steps):
+        if self.cursor == "act" and self.next_step_index >= len(self.plan.steps):
+            raise ValueError("checkpoint act cursor requires an executable next step")
+        if self.cursor != "act" and self.next_step_index > len(self.plan.steps):
             raise ValueError("checkpoint next step exceeds the plan")
         if self.logical_tool_calls != self.stage_logical_tool_calls.total:
             raise ValueError("checkpoint logical tool counters do not reconcile")
@@ -212,12 +216,14 @@ class StageCheckpoint(FrozenModel):
                 raise ValueError("checkpoint non-revision has a corrected answer")
         if self.cursor in {"correct", "submit"} and self.decision is None:
             raise ValueError("checkpoint cursor requires a critic decision")
-        if (
-            self.cursor == "submit"
-            and self.decision is not None
-            and self.decision.verdict != "approve"
+        if self.cursor == "submit" and (
+            self.candidate is None
+            or not self.evidence
+            or self.decision is None
+            or self.decision.verdict != "approve"
+            or not self.decision.checked_evidence_ids
         ):
-            raise ValueError("checkpoint submit cursor requires approval")
+            raise ValueError("checkpoint submit cursor requires checked evidence and approval")
         if (
             self.cursor == "correct"
             and self.decision is not None

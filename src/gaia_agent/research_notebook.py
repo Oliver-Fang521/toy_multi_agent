@@ -284,22 +284,30 @@ class ResearchNotebook:
         )
         if len(payload) > self.max_entry_bytes:
             raise ValueError("stage checkpoint exceeds max_entry_bytes")
-        self._assert_private_directory(self.root)
-        self._assert_private_directory(self._task_root)
-        path = self._stage_checkpoint_path()
-        if path.is_symlink():
-            raise ValueError("stage checkpoint must not be a symlink")
-        self._atomic_write(path, payload)
+        task_directory = self._open_private_task_directory()
+        try:
+            if _is_symlink_entry(task_directory, _STAGE_CHECKPOINT_FILENAME):
+                raise ValueError("stage checkpoint must not be a symlink")
+            _atomic_write_entry(
+                task_directory,
+                _STAGE_CHECKPOINT_FILENAME,
+                payload,
+            )
+        finally:
+            os.close(task_directory)
 
     def load_stage_checkpoint(self) -> StageCheckpoint | None:
         try:
-            self._assert_private_directory(self.root)
-            self._assert_private_directory(self._task_root)
-            payload = _read_bounded_entry(
-                self._stage_checkpoint_path(),
-                self.max_entry_bytes,
-                required_mode=0o600,
-            )
+            task_directory = self._open_private_task_directory()
+            try:
+                payload = _read_bounded_entry_at(
+                    task_directory,
+                    _STAGE_CHECKPOINT_FILENAME,
+                    self.max_entry_bytes,
+                    required_mode=0o600,
+                )
+            finally:
+                os.close(task_directory)
             if payload is None:
                 return None
             return _parse_stage_checkpoint(
@@ -310,6 +318,24 @@ class ResearchNotebook:
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    def _open_private_task_directory(self) -> int:
+        self._assert_private_directory(self.root)
+        self._assert_private_directory(self._task_root)
+        root_directory = _open_directory(self.root)
+        try:
+            task_directory = os.open(
+                self.task_id,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_directory,
+            )
+        finally:
+            os.close(root_directory)
+        opened_state = os.fstat(task_directory)
+        if not stat.S_ISDIR(opened_state.st_mode):
+            os.close(task_directory)
+            raise ValueError("notebook task storage path must be a directory")
+        return task_directory
 
     @staticmethod
     def _create_private_directory(path: Path) -> None:
@@ -388,6 +414,99 @@ def _reject_symlink_components(path: Path) -> None:
         current /= component
         if current.is_symlink():
             raise ValueError("notebook storage must not traverse symlinks")
+
+
+def _open_directory(path: Path) -> int:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    opened_state = os.fstat(descriptor)
+    if not stat.S_ISDIR(opened_state.st_mode):
+        os.close(descriptor)
+        raise ValueError("notebook storage path must be a directory")
+    return descriptor
+
+
+def _is_symlink_entry(directory: int, filename: str) -> bool:
+    try:
+        entry_state = os.stat(filename, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(entry_state.st_mode)
+
+
+def _read_bounded_entry_at(
+    directory: int,
+    filename: str,
+    max_entry_bytes: int,
+    *,
+    required_mode: int | None = None,
+) -> bytes | None:
+    try:
+        initial_state = os.stat(filename, dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(initial_state.st_mode) or initial_state.st_size > max_entry_bytes:
+            return None
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=directory,
+        )
+    except OSError:
+        return None
+    try:
+        opened_state = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_state.st_mode) or opened_state.st_size > max_entry_bytes:
+            return None
+        if required_mode is not None and stat.S_IMODE(opened_state.st_mode) != required_mode:
+            return None
+        payload = os.read(descriptor, max_entry_bytes + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    return payload if len(payload) <= max_entry_bytes else None
+
+
+def _atomic_write_entry(directory: int, filename: str, payload: bytes) -> None:
+    descriptor = -1
+    temporary_name = ""
+    for _ in range(16):
+        temporary_name = f".entry-{secrets.token_hex(16)}"
+        try:
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory,
+            )
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise FileExistsError("could not allocate a private checkpoint temporary file")
+    try:
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
 
 
 def _read_bounded_entry(

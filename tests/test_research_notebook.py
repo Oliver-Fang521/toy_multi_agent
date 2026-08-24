@@ -411,6 +411,116 @@ def test_stage_checkpoint_preserves_a_validated_critic_decision(tmp_path: Path) 
     assert notebook.load_stage_checkpoint().decision == decision  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize("keep_evidence", [False, True], ids=["no-evidence", "unchecked"])
+def test_submit_checkpoint_requires_checked_known_evidence(keep_evidence: bool) -> None:
+    checkpoint = _stage_checkpoint()
+    payload = checkpoint.model_dump(mode="python")
+    payload.update(
+        {
+            "cursor": "submit",
+            "critic_verdict": "approve",
+            "decision": CriticDecision(
+                verdict="approve",
+                feedback="unsafe approval",
+                checked_evidence_ids=(),
+            ),
+        }
+    )
+    if not keep_evidence:
+        payload.update(
+            {
+                "evidence": (),
+                "evidence_origins": {},
+                "raw_evidence_id_digests": (),
+            }
+        )
+
+    with pytest.raises(ValueError, match="submit.*evidence"):
+        StageCheckpoint.model_validate(payload)
+
+
+def test_stage_checkpoint_requires_a_nonempty_plan() -> None:
+    checkpoint = _stage_checkpoint()
+    payload = checkpoint.model_dump(mode="python")
+    payload["plan"] = checkpoint.plan.model_copy(update={"steps": ()})
+    payload["next_step_index"] = 0
+
+    with pytest.raises(ValueError, match="plan"):
+        StageCheckpoint.model_validate(payload)
+
+
+def test_act_checkpoint_requires_an_executable_next_step() -> None:
+    checkpoint = _stage_checkpoint()
+    payload = checkpoint.model_dump(mode="python")
+    payload.update({"cursor": "act", "next_step_index": len(checkpoint.plan.steps)})
+
+    with pytest.raises(ValueError, match="act.*next step"):
+        StageCheckpoint.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("cursor", "decision"),
+    [
+        pytest.param("evidence_repair", None, id="evidence-repair"),
+        pytest.param("verify", None, id="verify"),
+        pytest.param(
+            "correct",
+            CriticDecision(
+                verdict="revise",
+                feedback="revise",
+                checked_evidence_ids=("evidence-0001",),
+                corrected_answer="corrected",
+            ),
+            id="correct",
+        ),
+        pytest.param(
+            "submit",
+            CriticDecision(
+                verdict="approve",
+                feedback="approve",
+                checked_evidence_ids=("evidence-0001",),
+            ),
+            id="submit",
+        ),
+    ],
+)
+def test_non_act_checkpoint_allows_a_valid_early_index(
+    cursor: str,
+    decision: CriticDecision | None,
+) -> None:
+    checkpoint = _stage_checkpoint()
+    payload = checkpoint.model_dump(mode="python")
+    payload.update(
+        {
+            "cursor": cursor,
+            "next_step_index": 0,
+            "critic_verdict": "not_run" if decision is None else decision.verdict,
+            "decision": decision,
+        }
+    )
+
+    assert StageCheckpoint.model_validate(payload).next_step_index == 0
+
+
+def test_submit_checkpoint_rejects_unknown_checked_evidence() -> None:
+    checkpoint = _stage_checkpoint()
+    payload = checkpoint.model_dump(mode="python")
+    payload.update(
+        {
+            "cursor": "submit",
+            "critic_verdict": "approve",
+            "decision": CriticDecision(
+                verdict="approve",
+                feedback="unsafe approval",
+                checked_evidence_ids=("evidence-9999",),
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="invalid evidence"):
+        StageCheckpoint.model_validate(payload)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -542,6 +652,102 @@ def test_stage_checkpoint_with_nonprivate_mode_fails_closed(tmp_path: Path) -> N
     path.chmod(0o644)
 
     assert notebook.load_stage_checkpoint() is None
+
+
+def test_stage_checkpoint_read_cannot_follow_a_swapped_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    checkpoint = _stage_checkpoint()
+    notebook.save_stage_checkpoint(checkpoint)
+    task_root = notebook.root / "task-1"
+    detached = notebook.root / "task-1.detached"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    outside_checkpoint = outside / ".stage-checkpoint.json"
+    outside_checkpoint.write_bytes((task_root / ".stage-checkpoint.json").read_bytes())
+    outside_checkpoint.chmod(0o600)
+    original_assert = ResearchNotebook._assert_private_directory
+    swapped = False
+
+    def swap_after_validation(path: Path) -> None:
+        nonlocal swapped
+        original_assert(path)
+        if path == task_root and not swapped:
+            swapped = True
+            task_root.rename(detached)
+            task_root.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(
+        ResearchNotebook,
+        "_assert_private_directory",
+        staticmethod(swap_after_validation),
+    )
+
+    assert notebook.load_stage_checkpoint() is None
+
+    task_root.unlink()
+    detached.rename(task_root)
+    monkeypatch.setattr(
+        ResearchNotebook,
+        "_assert_private_directory",
+        staticmethod(original_assert),
+    )
+    assert notebook.load_stage_checkpoint() == checkpoint
+
+
+def test_stage_checkpoint_write_cannot_follow_a_swapped_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    checkpoint = _stage_checkpoint()
+    notebook.save_stage_checkpoint(checkpoint)
+    replacement = checkpoint.model_copy(
+        update={"candidate": "replacement", "candidate_origins": {1: "replacement"}}
+    )
+    task_root = notebook.root / "task-1"
+    detached = notebook.root / "task-1.detached"
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    original_assert = ResearchNotebook._assert_private_directory
+    swapped = False
+
+    def swap_after_validation(path: Path) -> None:
+        nonlocal swapped
+        original_assert(path)
+        if path == task_root and not swapped:
+            swapped = True
+            task_root.rename(detached)
+            task_root.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(
+        ResearchNotebook,
+        "_assert_private_directory",
+        staticmethod(swap_after_validation),
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        notebook.save_stage_checkpoint(replacement)
+
+    assert not (outside / ".stage-checkpoint.json").exists()
+    task_root.unlink()
+    detached.rename(task_root)
+    monkeypatch.setattr(
+        ResearchNotebook,
+        "_assert_private_directory",
+        staticmethod(original_assert),
+    )
+    assert notebook.load_stage_checkpoint() == checkpoint
 
 
 def _notebook_entry(tool: str, result: dict[str, object], signature: str) -> NotebookEntry:
