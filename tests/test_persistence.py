@@ -15,6 +15,7 @@ from gaia_agent.models import (
     TerminalErrorCategory,
     Usage,
 )
+from gaia_agent.observability import TaskTraceOutcome
 from gaia_agent.persistence import PublicNote, RunManifest, RunStore
 
 
@@ -257,6 +258,38 @@ def test_manifest_forbids_unknown_fields_in_public_artifacts() -> None:
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         RunManifest.model_validate(payload)
+
+
+@pytest.mark.parametrize("private_field", ["candidate", "checkpoint", "evidence"])
+def test_public_typed_artifacts_reject_private_checkpoint_fields(
+    private_field: str,
+    prediction: TaskPrediction,
+) -> None:
+    manifest_payload = manifest_for(["task-1"]).model_dump(mode="json")
+    prediction_payload = prediction.model_dump(mode="json")
+    note_payload = {"category": "checkpoint_skipped", "count": 1}
+    for payload in (manifest_payload, prediction_payload, note_payload):
+        payload[private_field] = "private checkpoint content"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        RunManifest.model_validate(manifest_payload)
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        TaskPrediction.model_validate(prediction_payload)
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        PublicNote.model_validate(note_payload)
+
+
+def test_langfuse_safe_output_has_no_private_checkpoint_fields() -> None:
+    output = TaskTraceOutcome(
+        answer_present=True,
+        evidence_count=1,
+        critic_verdict="approve",
+        error_category=None,
+        correct=False,
+        checkpoint_restored=True,
+    ).as_output()
+
+    assert {"candidate", "checkpoint", "evidence"}.isdisjoint(output)
 
 
 def test_prediction_level_must_match_manifest_on_append_resume_and_integrity(tmp_path, prediction) -> None:

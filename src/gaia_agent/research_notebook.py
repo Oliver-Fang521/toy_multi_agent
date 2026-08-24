@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from gaia_agent.models import StageCheckpoint
+
 _MAX_CARD_TITLE_CHARS = 256
 _MAX_CARD_DOMAIN_CHARS = 255
 _MAX_CARD_EXCERPT_CHARS = 1_536
@@ -27,6 +29,9 @@ _TRUST_ANCHOR_CONTRACT = "gaia.research-notebook.trust-anchor"
 _TRUST_ANCHOR_FILENAME = ".trust-anchor"
 _MAX_TRUST_ANCHOR_BYTES = 4_096
 _HMAC_KEY_BYTES = 32
+_STAGE_CHECKPOINT_CONTRACT = "gaia.stage-checkpoint"
+_STAGE_CHECKPOINT_SCHEMA_VERSION = 1
+_STAGE_CHECKPOINT_FILENAME = ".stage-checkpoint.json"
 _ENTRY_BODY_KEYS = frozenset(
     {
         "schema_version",
@@ -40,6 +45,16 @@ _ENTRY_BODY_KEYS = frozenset(
     }
 )
 _ENTRY_KEYS = _ENTRY_BODY_KEYS | {"integrity_hmac_sha256"}
+_STAGE_CHECKPOINT_BODY_KEYS = frozenset(
+    {
+        "schema_version",
+        "contract",
+        "notebook_scope",
+        "task_id",
+        "checkpoint",
+    }
+)
+_STAGE_CHECKPOINT_KEYS = _STAGE_CHECKPOINT_BODY_KEYS | {"integrity_hmac_sha256"}
 
 
 @dataclass(frozen=True)
@@ -257,6 +272,45 @@ class ResearchNotebook:
         self._assert_private_directory(self._task_root)
         self._atomic_write(self._entry_path(signature), payload)
 
+    def save_stage_checkpoint(self, checkpoint: StageCheckpoint) -> None:
+        if not isinstance(checkpoint, StageCheckpoint):
+            raise TypeError("stage checkpoint must be a StageCheckpoint")
+        validated = StageCheckpoint.model_validate_json(checkpoint.model_dump_json())
+        payload = _encode_stage_checkpoint(
+            validated,
+            integrity_key=self._integrity_key,
+            notebook_scope=_notebook_scope(self.root),
+            task_id=self.task_id,
+        )
+        if len(payload) > self.max_entry_bytes:
+            raise ValueError("stage checkpoint exceeds max_entry_bytes")
+        self._assert_private_directory(self.root)
+        self._assert_private_directory(self._task_root)
+        path = self._stage_checkpoint_path()
+        if path.is_symlink():
+            raise ValueError("stage checkpoint must not be a symlink")
+        self._atomic_write(path, payload)
+
+    def load_stage_checkpoint(self) -> StageCheckpoint | None:
+        try:
+            self._assert_private_directory(self.root)
+            self._assert_private_directory(self._task_root)
+            payload = _read_bounded_entry(
+                self._stage_checkpoint_path(),
+                self.max_entry_bytes,
+                required_mode=0o600,
+            )
+            if payload is None:
+                return None
+            return _parse_stage_checkpoint(
+                json.loads(payload),
+                integrity_key=self._integrity_key,
+                expected_notebook_scope=_notebook_scope(self.root),
+                expected_task_id=self.task_id,
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     @staticmethod
     def _create_private_directory(path: Path) -> None:
         _reject_symlink_components(path)
@@ -272,6 +326,9 @@ class ResearchNotebook:
 
     def _entry_path(self, signature: str) -> Path:
         return self._task_root / f"{signature}.json"
+
+    def _stage_checkpoint_path(self) -> Path:
+        return self._task_root / _STAGE_CHECKPOINT_FILENAME
 
     def _load_or_rotate_trust_anchor(self, run_generation: str) -> bytes:
         path = self.root / _TRUST_ANCHOR_FILENAME
@@ -422,6 +479,86 @@ def _encode_entry(
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _encode_stage_checkpoint(
+    checkpoint: StageCheckpoint,
+    *,
+    integrity_key: bytes,
+    notebook_scope: str,
+    task_id: str,
+) -> bytes:
+    body = {
+        "schema_version": _STAGE_CHECKPOINT_SCHEMA_VERSION,
+        "contract": _STAGE_CHECKPOINT_CONTRACT,
+        "notebook_scope": notebook_scope,
+        "task_id": task_id,
+        "checkpoint": checkpoint.model_dump(mode="json"),
+    }
+    return json.dumps(
+        {
+            **body,
+            "integrity_hmac_sha256": _integrity_digest(body, integrity_key),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _parse_stage_checkpoint(
+    value: object,
+    *,
+    integrity_key: bytes,
+    expected_notebook_scope: str,
+    expected_task_id: str,
+) -> StageCheckpoint:
+    if not isinstance(value, dict) or set(value) != _STAGE_CHECKPOINT_KEYS:
+        raise TypeError("stage checkpoint must be an exact object")
+    schema_version = value.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != _STAGE_CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise ValueError("stage checkpoint schema is not supported")
+    if value.get("contract") != _STAGE_CHECKPOINT_CONTRACT:
+        raise ValueError("stage checkpoint contract is not supported")
+    if value.get("notebook_scope") != expected_notebook_scope:
+        raise ValueError("stage checkpoint notebook scope does not match")
+    if value.get("task_id") != expected_task_id:
+        raise ValueError("stage checkpoint task scope does not match")
+    integrity_hmac_sha256 = value.get("integrity_hmac_sha256")
+    if not isinstance(integrity_hmac_sha256, str):
+        raise TypeError("stage checkpoint integrity field is invalid")
+    body = {key: value[key] for key in _STAGE_CHECKPOINT_BODY_KEYS}
+    if not hmac.compare_digest(
+        integrity_hmac_sha256,
+        _integrity_digest(body, integrity_key),
+    ):
+        raise ValueError("stage checkpoint failed integrity validation")
+    raw_checkpoint = value.get("checkpoint")
+    if not isinstance(raw_checkpoint, dict):
+        raise TypeError("stage checkpoint payload must be an object")
+    checkpoint = StageCheckpoint.model_validate(raw_checkpoint)
+    canonical_raw = json.dumps(
+        raw_checkpoint,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    canonical_validated = json.dumps(
+        checkpoint.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    if canonical_raw != canonical_validated:
+        raise ValueError("stage checkpoint payload is not exact")
+    return checkpoint
 
 
 def _parse_entry(

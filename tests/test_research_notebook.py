@@ -11,6 +11,16 @@ from pathlib import Path
 
 import pytest
 
+from gaia_agent.models import (
+    AgentPlan,
+    CriticDecision,
+    Evidence,
+    PlanStep,
+    SpecialistName,
+    StageCheckpoint,
+    StageToolCallCounts,
+    Usage,
+)
 from gaia_agent.research_notebook import (
     NotebookEntry,
     ResearchNotebook,
@@ -316,6 +326,222 @@ def test_notebook_treats_a_nonregular_entry_as_a_cache_miss(tmp_path: Path) -> N
     finally:
         writer.join()
         os.close(reader)
+
+
+def _stage_checkpoint(
+    *,
+    cursor: str = "verify",
+    candidate: str = "answer",
+    decision: CriticDecision | None = None,
+) -> StageCheckpoint:
+    raw_evidence_id = "provider-evidence-1"
+    return StageCheckpoint(
+        cursor=cursor,
+        plan=AgentPlan(
+            restatement="private restatement",
+            steps=(
+                PlanStep(
+                    specialist=SpecialistName.LOOKUP,
+                    instruction="private instruction",
+                ),
+            ),
+        ),
+        evidence=(
+            Evidence(
+                evidence_id="evidence-0001",
+                kind="source",
+                summary="private summary",
+                source_url="https://private.example/source",
+            ),
+        ),
+        evidence_origins={"evidence-0001": 1},
+        raw_evidence_id_digests=(
+            hashlib.sha256(raw_evidence_id.encode("utf-8")).hexdigest(),
+        ),
+        candidate_origins={1: candidate},
+        candidate=candidate,
+        usage=Usage(input_tokens=4, output_tokens=6, total_tokens=10),
+        step_count=1,
+        verify_count=0,
+        correction_count=0,
+        next_step_index=1,
+        soft_step_failures=0,
+        logical_tool_calls=2,
+        stage_logical_tool_calls=StageToolCallCounts(specialist=2),
+        critic_verdict="not_run" if decision is None else decision.verdict,
+        decision=decision,
+    )
+
+
+def test_stage_checkpoint_round_trip_is_private_authenticated_and_bounded(
+    tmp_path: Path,
+) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    checkpoint = _stage_checkpoint()
+
+    notebook.save_stage_checkpoint(checkpoint)
+
+    path = notebook.root / "task-1" / ".stage-checkpoint.json"
+    assert notebook.load_stage_checkpoint() == checkpoint
+    assert path.is_file()
+    assert path.stat().st_size <= notebook.max_entry_bytes
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_stage_checkpoint_preserves_a_validated_critic_decision(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    decision = CriticDecision(
+        verdict="approve",
+        feedback="private approval",
+        checked_evidence_ids=("evidence-0001",),
+    )
+    checkpoint = _stage_checkpoint(cursor="submit", decision=decision)
+
+    notebook.save_stage_checkpoint(checkpoint)
+
+    assert notebook.load_stage_checkpoint() == checkpoint
+    assert notebook.load_stage_checkpoint().decision == decision  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("contract", "gaia.stage-checkpoint.stale", id="contract"),
+        pytest.param("task_id", "task-2", id="task"),
+        pytest.param("unexpected", "field", id="unknown-key"),
+    ],
+)
+def test_stage_checkpoint_tampering_fails_closed(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(_stage_checkpoint())
+    path = notebook.root / "task-1" / ".stage-checkpoint.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload[field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert notebook.load_stage_checkpoint() is None
+
+
+def test_stage_checkpoint_nested_unknown_keys_fail_closed(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(_stage_checkpoint())
+    path = notebook.root / "task-1" / ".stage-checkpoint.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["checkpoint"]["evidence"][0]["private_extra"] = "not contracted"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert notebook.load_stage_checkpoint() is None
+
+
+def test_stage_checkpoint_from_wrong_run_generation_fails_closed(tmp_path: Path) -> None:
+    root = tmp_path / "private"
+    first = ResearchNotebook(root, "task-1", run_generation="run-1")
+    first.save_stage_checkpoint(_stage_checkpoint())
+
+    second = ResearchNotebook(root, "task-1", run_generation="run-2")
+
+    assert second.load_stage_checkpoint() is None
+
+
+def test_stage_checkpoint_from_another_notebook_fails_closed(tmp_path: Path) -> None:
+    first = ResearchNotebook(
+        tmp_path / "first.private",
+        "task-1",
+        run_generation="run-1",
+    )
+    first.save_stage_checkpoint(_stage_checkpoint())
+    second = ResearchNotebook(
+        tmp_path / "second.private",
+        "task-1",
+        run_generation="run-1",
+    )
+    source = first.root / "task-1" / ".stage-checkpoint.json"
+    destination = second.root / "task-1" / ".stage-checkpoint.json"
+    destination.write_bytes(source.read_bytes())
+    destination.chmod(0o600)
+
+    assert second.load_stage_checkpoint() is None
+
+
+def test_stage_checkpoint_symlink_fails_closed_without_reading_target(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    target = tmp_path / "outside.json"
+    target.write_text('{"candidate":"outside private value"}', encoding="utf-8")
+    path = notebook.root / "task-1" / ".stage-checkpoint.json"
+    path.symlink_to(target)
+
+    assert notebook.load_stage_checkpoint() is None
+    assert target.read_text(encoding="utf-8") == '{"candidate":"outside private value"}'
+
+
+def test_stage_checkpoint_oversized_payload_fails_closed(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        max_entry_bytes=1_024,
+        run_generation="run-1",
+    )
+    path = notebook.root / "task-1" / ".stage-checkpoint.json"
+    path.write_bytes(b"x" * 1_025)
+    path.chmod(0o600)
+
+    assert notebook.load_stage_checkpoint() is None
+
+
+def test_stage_checkpoint_oversized_save_keeps_last_atomic_checkpoint(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        max_entry_bytes=2_048,
+        run_generation="run-1",
+    )
+    checkpoint = _stage_checkpoint()
+    notebook.save_stage_checkpoint(checkpoint)
+    oversized = checkpoint.model_copy(
+        update={"candidate": "x" * 4_096, "candidate_origins": {1: "x" * 4_096}}
+    )
+
+    with pytest.raises(ValueError, match="max_entry_bytes"):
+        notebook.save_stage_checkpoint(oversized)
+
+    assert notebook.load_stage_checkpoint() == checkpoint
+
+
+def test_stage_checkpoint_with_nonprivate_mode_fails_closed(tmp_path: Path) -> None:
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(_stage_checkpoint())
+    path = notebook.root / "task-1" / ".stage-checkpoint.json"
+    path.chmod(0o644)
+
+    assert notebook.load_stage_checkpoint() is None
 
 
 def _notebook_entry(tool: str, result: dict[str, object], signature: str) -> NotebookEntry:

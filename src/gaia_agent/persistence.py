@@ -185,6 +185,8 @@ class _CheckpointState:
 class PublicNote(FrozenModel):
     """A deliberately small, non-textual per-task note record."""
 
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     category: Literal[
         "checkpoint_repaired",
         "checkpoint_skipped",
