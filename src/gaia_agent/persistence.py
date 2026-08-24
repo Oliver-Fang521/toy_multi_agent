@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -110,6 +111,7 @@ _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
         "context_budget_pressure",
         "plan_early_stop",
         "soft_step_failure",
+        "stage_budget_exhausted",
         "task_recovery",
     }
 )
@@ -142,6 +144,9 @@ _PUBLIC_AUDIT_EVENT_KEYS = {
     "context_budget_pressure": frozenset({"bytes", "item_count", "max_bytes"}),
     "plan_early_stop": frozenset({"completed_steps", "remaining_steps"}),
     "soft_step_failure": frozenset({"step_number", "code"}),
+    "stage_budget_exhausted": frozenset(
+        {"stage", "reason", "timeout_seconds", "max_calls", "logical_calls"}
+    ),
     "task_recovery": frozenset(
         {"attempt_number", "retry_reason", "retry_category", "recovery_succeeded"}
     ),
@@ -619,6 +624,8 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
             "completed_steps",
             "remaining_steps",
             "attempt_number",
+            "max_calls",
+            "logical_calls",
         }:
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000_000:
                 raise ValueError("audit counter must be a bounded integer")
@@ -632,6 +639,20 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
                 "schema",
             }:
                 raise ValueError("audit code is not allowlisted")
+        elif key == "stage":
+            if value not in {"planner", "specialist", "critic"}:
+                raise ValueError("audit stage is not allowlisted")
+        elif key == "reason":
+            if value not in {"time", "tool_calls"}:
+                raise ValueError("audit stage budget reason is not allowlisted")
+        elif key == "timeout_seconds":
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or not 0 < value <= 1_000_000
+            ):
+                raise ValueError("audit timeout must be a bounded number")
         elif key == "specialist":
             if value not in {item.value for item in SpecialistName}:
                 raise ValueError("audit specialist is not allowlisted")

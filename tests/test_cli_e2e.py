@@ -356,6 +356,61 @@ async def test_evaluation_runner_persists_context_pressure_at_configured_one_meb
 
 
 @pytest.mark.asyncio
+async def test_evaluation_runner_persists_safe_stage_budget_audit(
+    tmp_path: Path,
+) -> None:
+    class _StageBudgetAuditOrchestrator:
+        def __init__(self, task: GaiaTask) -> None:
+            self.audit_events = (
+                AuditEvent(
+                    sequence=1,
+                    event_type="stage_budget_exhausted",
+                    timestamp=datetime(2026, 8, 17, tzinfo=UTC),
+                    payload={
+                        "stage": "specialist",
+                        "reason": "time",
+                        "timeout_seconds": 70.0,
+                        "max_calls": 18,
+                        "logical_calls": 7,
+                    },
+                ),
+            )
+
+        async def run(self, task: GaiaTask) -> TaskPrediction:
+            return TaskPrediction(
+                task_id=task.task_id,
+                level=task.level,
+                error_category=TerminalErrorCategory.TIMEOUT,
+            )
+
+    tasks, revision = _fixture_tasks()
+    output_dir = tmp_path / "stage-budget-audit"
+    runner = EvaluationRunner(
+        config=_config(output_dir),
+        dataset_loader=lambda _config: (tasks, revision),
+        orchestrator_factory=_StageBudgetAuditOrchestrator,
+    )
+
+    await runner.run()
+
+    assert verify_run_directory(output_dir).total == 3
+    persisted_payloads = [
+        json.loads(line)["payload"]
+        for audit_path in (output_dir / "tasks").rglob("audit.jsonl")
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert persisted_payloads == [
+        {
+            "stage": "specialist",
+            "reason": "time",
+            "timeout_seconds": 70.0,
+            "max_calls": 18,
+            "logical_calls": 7,
+        }
+    ] * 3
+
+
+@pytest.mark.asyncio
 async def test_evaluation_runner_persists_read_webpage_search_fallback_audit(
     tmp_path: Path,
 ) -> None:

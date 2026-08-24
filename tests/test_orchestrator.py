@@ -10,6 +10,7 @@ from typing import Any, Self
 
 import pytest
 
+import gaia_agent.orchestrator as orchestrator_module
 from gaia_agent.agents import StageProtocolError, StageValidationCode
 from gaia_agent.config import RunConfig
 from gaia_agent.mcp_client import AttachmentPolicyError, MCPToolClient, ToolExecutionError
@@ -77,6 +78,7 @@ class FakeSpecialist:
         tool_calls: list[tuple[str, dict[str, Any]]] | None = None,
         error: Exception | None = None,
         usage_on_error: Usage | None = None,
+        delay: float = 0,
     ) -> None:
         self.name = name
         self.calls = calls
@@ -84,6 +86,7 @@ class FakeSpecialist:
         self.tool_calls = tool_calls or []
         self.error = error
         self.usage_on_error = usage_on_error or Usage()
+        self.delay = delay
         self.last_usage = Usage()
         self.tasks: list[GaiaTask] = []
         self.prior_evidence: list[tuple[Evidence, ...]] = []
@@ -99,6 +102,8 @@ class FakeSpecialist:
         self.calls.append(self.name.value)
         self.tasks.append(task)
         self.prior_evidence.append(evidence)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         for name, arguments in self.tool_calls:
             await tools.call(name, arguments)
         if self.error is not None:
@@ -118,12 +123,14 @@ class FakeCritic:
         error: Exception | None = None,
         tool_calls: list[tuple[str, dict[str, Any]]] | None = None,
         usages: list[Usage] | None = None,
+        delay: float = 0,
     ) -> None:
         self.calls = calls
         self.decisions = deque(decisions)
         self.error = error
         self.tool_calls = tool_calls or []
         self.usages = deque(usages or [Usage() for _ in decisions])
+        self.delay = delay
         self.last_usage = Usage()
         self.tasks: list[GaiaTask] = []
         self.candidates: list[str | None] = []
@@ -141,6 +148,8 @@ class FakeCritic:
         self.tasks.append(task)
         self.candidates.append(candidate)
         self.evidence_seen.append(evidence)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.error is not None:
             raise self.error
         for name, arguments in self.tool_calls:
@@ -214,6 +223,117 @@ class FakeToolFactory:
 
 
 @pytest.mark.asyncio
+async def test_specialist_cannot_consume_reserved_critic_calls() -> None:
+    tools = FakeTools([])
+    client = _BudgetedToolClient(tools, max_calls=8, audit=lambda *_: None)
+    client.start_scope(
+        "act:lookup:1",
+        stage="specialist",
+        max_calls=6,
+        deadline=None,
+    )
+
+    for index in range(6):
+        await client.call("web_search", {"query": str(index)})
+
+    with pytest.raises(
+        orchestrator_module.StageBudgetExceeded,
+        match="specialist",
+    ) as raised:
+        await client.call("web_search", {"query": "extra"})
+
+    assert raised.value.reason == "tool_calls"
+    client.start_scope(
+        "verify:1",
+        stage="critic",
+        max_calls=2,
+        deadline=None,
+    )
+    await client.call("web_search", {"query": "verify"})
+    assert len(tools.call_arguments) == 7
+
+
+@pytest.mark.asyncio
+async def test_specialist_tool_budget_is_cumulative_across_scopes() -> None:
+    tools = FakeTools([])
+    client = _BudgetedToolClient(tools, max_calls=5, audit=lambda *_: None)
+    for scope, query in (("act:1", "first"), ("act:2", "second")):
+        client.start_scope(
+            scope,
+            stage="specialist",
+            max_calls=2,
+            deadline=None,
+        )
+        await client.call("web_search", {"query": query})
+
+    client.start_scope(
+        "act:3",
+        stage="specialist",
+        max_calls=2,
+        deadline=None,
+    )
+    with pytest.raises(orchestrator_module.StageBudgetExceeded) as raised:
+        await client.call("web_search", {"query": "third"})
+
+    assert raised.value.reason == "tool_calls"
+    assert len(tools.call_arguments) == 2
+
+
+@pytest.mark.asyncio
+async def test_stage_deadline_rejects_tool_call_before_backend_invocation() -> None:
+    tools = FakeTools([])
+    client = _BudgetedToolClient(tools, max_calls=8, audit=lambda *_: None)
+    client.start_scope(
+        "act:lookup:1",
+        stage="specialist",
+        max_calls=6,
+        deadline=asyncio.get_running_loop().time() - 1,
+    )
+
+    with pytest.raises(orchestrator_module.StageBudgetExceeded) as raised:
+        await client.call("web_search", {"query": "private query"})
+
+    assert (raised.value.stage, raised.value.reason) == ("specialist", "time")
+    assert tools.call_arguments == []
+    assert client.logical_call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stage_deadline_bounds_complete_underlying_mcp_await() -> None:
+    class BlockingTools:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        def __init__(self) -> None:
+            self.started = False
+            self.cancelled = False
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.started = True
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+    tools = BlockingTools()
+    client = _BudgetedToolClient(tools, max_calls=8, audit=lambda *_: None)
+    client.start_scope(
+        "act:lookup:1",
+        stage="specialist",
+        max_calls=6,
+        deadline=asyncio.get_running_loop().time() + 0.01,
+    )
+
+    with pytest.raises(orchestrator_module.StageBudgetExceeded) as raised:
+        await client.call("web_search", {"query": "private query"})
+
+    assert (raised.value.stage, raised.value.reason) == ("specialist", "time")
+    assert tools.started is True
+    assert tools.cancelled is True
+
+
+@pytest.mark.asyncio
 async def test_budgeted_tool_client_audits_recoverable_failure_without_message() -> None:
     secret = "sk-private-tool-failure"
 
@@ -267,9 +387,11 @@ async def test_budgeted_tool_client_allows_same_transcription_in_a_later_scope()
     client = _BudgetedToolClient(tools, max_calls=3, audit=lambda *_: None)
     arguments = {"path": "sample.mp3"}
 
-    client.start_scope("act:file:1")
+    client.start_scope(
+        "act:file:1", stage="specialist", max_calls=2, deadline=None
+    )
     await client.call("transcribe_audio", arguments)
-    client.start_scope("verify:1")
+    client.start_scope("verify:1", stage="critic", max_calls=1, deadline=None)
     await client.call("transcribe_audio", arguments)
 
     assert client.call_count == 2
@@ -300,7 +422,9 @@ async def test_budgeted_tool_client_reuses_one_audio_result_without_double_charg
         max_calls=3,
         audit=lambda event_type, payload: audit.append((event_type, payload)),
     )
-    client.start_scope("act:file:1")
+    client.start_scope(
+        "act:file:1", stage="specialist", max_calls=3, deadline=None
+    )
     arguments = {"path": "sample.mp3"}
 
     first = await client.call("transcribe_audio", arguments)
@@ -340,7 +464,9 @@ async def test_budgeted_tool_client_returns_a_safe_copy_of_cached_result() -> No
 
     backend = MutableTools()
     client = _BudgetedToolClient(backend, max_calls=3, audit=lambda *_: None)
-    client.start_scope("act:lookup:1")
+    client.start_scope(
+        "act:lookup:1", stage="specialist", max_calls=3, deadline=None
+    )
     arguments = {"query": "public query"}
 
     first = await client.call("web_search", arguments)
@@ -358,7 +484,7 @@ async def test_budgeted_tool_client_returns_a_safe_copy_of_cached_result() -> No
 async def test_budgeted_tool_client_checks_global_budget_before_cached_reuse() -> None:
     tools = FakeTools([])
     client = _BudgetedToolClient(tools, max_calls=1, audit=lambda *_: None)
-    client.start_scope("verify:1")
+    client.start_scope("verify:1", stage="critic", max_calls=1, deadline=None)
     arguments = {"query": "same query"}
     await client.call("web_search", arguments)
 
@@ -385,7 +511,9 @@ async def test_budgeted_tool_client_does_not_cache_failed_result() -> None:
 
     backend = RecoveringTools()
     client = _BudgetedToolClient(backend, max_calls=3, audit=lambda *_: None)
-    client.start_scope("act:file:1")
+    client.start_scope(
+        "act:file:1", stage="specialist", max_calls=3, deadline=None
+    )
     arguments = {"path": "sample.mp3"}
 
     with pytest.raises(ToolExecutionError):
@@ -423,7 +551,7 @@ async def test_budgeted_tool_client_restores_private_notebook_result_across_scop
         audit=lambda event_type, payload: audit.append((event_type, payload)),
         notebook=notebook,
     )
-    client.start_scope("verify:1")
+    client.start_scope("verify:1", stage="critic", max_calls=2, deadline=None)
 
     restored = await client.call("web_search", arguments)
 
@@ -443,6 +571,44 @@ async def test_budgeted_tool_client_restores_private_notebook_result_across_scop
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_restored_tool_call_counts_against_active_stage_allowance(
+    tmp_path: Path,
+) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    first_arguments = {"query": "private first query"}
+    second_arguments = {"query": "private second query"}
+    notebook.record("web_search", first_arguments, {"answer": "first"})
+    notebook.record("web_search", second_arguments, {"answer": "second"})
+
+    class UnusedBackend:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            self.calls += 1
+            raise AssertionError("restored calls must not execute the MCP backend")
+
+    backend = UnusedBackend()
+    client = _BudgetedToolClient(
+        backend,
+        max_calls=3,
+        audit=lambda *_: None,
+        notebook=notebook,
+    )
+    client.start_scope("verify:1", stage="critic", max_calls=1, deadline=None)
+
+    assert await client.call("web_search", first_arguments) == {"answer": "first"}
+    with pytest.raises(orchestrator_module.StageBudgetExceeded) as raised:
+        await client.call("web_search", second_arguments)
+
+    assert raised.value.reason == "tool_calls"
+    assert client.restored_call_count == 1
+    assert backend.calls == 0
 
 
 @pytest.mark.asyncio
@@ -1317,6 +1483,47 @@ async def test_submit_cannot_bypass_global_tool_call_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_specialist_tool_budget_exhaustion_maps_to_typed_terminal_result() -> None:
+    calls: list[str] = []
+    source = _evidence("source-1", "source")
+    lookup = FakeSpecialist(
+        SpecialistName.LOOKUP,
+        calls,
+        [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
+        tool_calls=[
+            ("web_search", {"query": "first"}),
+            ("web_search", {"query": "second"}),
+        ],
+    )
+    tools = FakeTools(calls)
+    orchestrator = _orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={SpecialistName.LOOKUP: lookup},
+        critic=FakeCritic(calls, []),
+        tools=tools,
+        config=_config(
+            max_tool_calls=4,
+            specialist_max_tool_calls=1,
+            critic_max_tool_calls=2,
+        ),
+    )
+
+    prediction = await orchestrator.run(_task())
+
+    assert prediction.answer is None
+    assert prediction.error_category == TerminalErrorCategory.TOOL_BUDGET_EXHAUSTED
+    assert tools.call_arguments == [("web_search", {"query": "first"})]
+    event = next(
+        event
+        for event in orchestrator.audit_events
+        if event.event_type == "stage_budget_exhausted"
+    )
+    assert event.payload["stage"] == "specialist"
+    assert event.payload["reason"] == "tool_calls"
+    assert event.payload["logical_calls"] == 1
+
+
+@pytest.mark.asyncio
 async def test_identical_tool_call_across_specialist_and_critic_scopes_is_allowed() -> None:
     calls: list[str] = []
     repeated = [("web_search", {"query": "same query"})]
@@ -1736,6 +1943,206 @@ async def test_single_deadline_covers_the_complete_state_machine() -> None:
 
     assert result.error_category == TerminalErrorCategory.TIMEOUT
     assert calls == ["planner"]
+
+
+@pytest.mark.asyncio
+async def test_planner_stage_timeout_stops_before_global_deadline() -> None:
+    calls: list[str] = []
+
+    class BlockingPlanner:
+        last_usage = Usage()
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        async def plan(self, task: GaiaTask) -> AgentPlan:
+            calls.append("planner")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+    planner = BlockingPlanner()
+    orchestrator = Orchestrator(
+        planner=planner,
+        specialists={},
+        critic=FakeCritic(calls, []),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(
+            timeout_seconds=0.30,
+            planner_timeout_seconds=0.03,
+            specialist_timeout_seconds=0.04,
+            critic_timeout_seconds=0.05,
+        ),
+    )
+
+    prediction = await orchestrator.run(_task())
+
+    assert planner.cancelled is True
+    assert calls == ["planner"]
+    assert prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert prediction.duration_seconds < 0.20
+    budget_event = next(
+        event
+        for event in orchestrator.audit_events
+        if event.event_type == "stage_budget_exhausted"
+    )
+    assert budget_event.payload["stage"] == "planner"
+    assert budget_event.payload["reason"] == "time"
+
+
+@pytest.mark.asyncio
+async def test_specialist_stage_timeout_stops_before_global_deadline() -> None:
+    private_marker = "private-specialist-timeout-marker"
+    calls: list[str] = []
+
+    class BlockingSpecialist:
+        last_usage = Usage()
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        async def run(
+            self,
+            task: GaiaTask,
+            step: PlanStep,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> AgentResult:
+            calls.append("lookup")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            raise AssertionError(private_marker)
+
+    specialist = BlockingSpecialist()
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={SpecialistName.LOOKUP: specialist},
+        critic=FakeCritic(calls, []),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(
+            timeout_seconds=0.30,
+            planner_timeout_seconds=0.02,
+            specialist_timeout_seconds=0.04,
+            critic_timeout_seconds=0.05,
+        ),
+    )
+
+    prediction = await orchestrator.run(_task())
+
+    assert specialist.cancelled is True
+    assert calls == ["planner", "lookup"]
+    assert prediction.answer is None
+    assert prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert prediction.duration_seconds < 0.20
+    budget_event = next(
+        event
+        for event in orchestrator.audit_events
+        if event.event_type == "stage_budget_exhausted"
+    )
+    assert budget_event.payload == {
+        "stage": "specialist",
+        "reason": "time",
+        "timeout_seconds": 0.04,
+        "max_calls": 18,
+        "logical_calls": 0,
+    }
+    assert private_marker not in repr(orchestrator.audit_events)
+
+
+@pytest.mark.asyncio
+async def test_critic_stage_timeout_does_not_submit_unverified_answer() -> None:
+    calls: list[str] = []
+
+    class BlockingCritic:
+        last_usage = Usage()
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        async def verify(
+            self,
+            task: GaiaTask,
+            candidate: str | None,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> CriticDecision:
+            calls.append("critic")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+    critic = BlockingCritic()
+    source = _evidence("source-1", "source")
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
+            )
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(
+            timeout_seconds=0.30,
+            planner_timeout_seconds=0.02,
+            specialist_timeout_seconds=0.04,
+            critic_timeout_seconds=0.05,
+        ),
+    )
+
+    prediction = await orchestrator.run(_task())
+
+    assert critic.cancelled is True
+    assert calls == ["planner", "lookup", "critic"]
+    assert prediction.answer is None
+    assert prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert prediction.duration_seconds < 0.20
+
+
+@pytest.mark.asyncio
+async def test_specialist_completion_preserves_reserved_critic_deadline() -> None:
+    calls: list[str] = []
+    source = _evidence("source-1", "source")
+    orchestrator = _orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
+                delay=0.05,
+            )
+        },
+        critic=FakeCritic(
+            calls,
+            [_decision("approve", ("evidence-0001",))],
+            delay=0.06,
+        ),
+        tools=FakeTools(calls),
+        config=_config(
+            timeout_seconds=0.25,
+            planner_timeout_seconds=0.02,
+            specialist_timeout_seconds=0.07,
+            critic_timeout_seconds=0.11,
+        ),
+    )
+
+    prediction = await orchestrator.run(_task())
+
+    assert prediction.answer == "Marie Curie"
+    assert calls == ["planner", "lookup", "critic", "submit_answer"]
+    assert prediction.duration_seconds < 0.25
 
 
 @pytest.mark.asyncio
