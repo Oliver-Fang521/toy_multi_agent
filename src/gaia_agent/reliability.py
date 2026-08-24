@@ -1,4 +1,6 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 
 TRANSIENT_PROVIDER_ERROR_NAMES = frozenset(
@@ -9,6 +11,51 @@ TRANSIENT_PROVIDER_ERROR_NAMES = frozenset(
         "InternalServerError",
     }
 )
+
+
+class InvocationDeadlineExceeded(TimeoutError):
+    """A new external invocation was attempted after the vote closed."""
+
+
+class InvocationDeadline:
+    """Shared absolute vote boundary retained by detached orchestration tasks."""
+
+    def __init__(self, deadline: float, clock: Callable[[], float]) -> None:
+        self.deadline = deadline
+        self._clock = clock
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
+
+    def ensure_open(self) -> None:
+        if self._closed or self._clock() >= self.deadline:
+            raise InvocationDeadlineExceeded("vote invocation deadline exhausted")
+
+
+_CURRENT_INVOCATION_DEADLINE: ContextVar[InvocationDeadline | None] = ContextVar(
+    "gaia_invocation_deadline",
+    default=None,
+)
+
+
+@contextmanager
+def invocation_deadline_scope(
+    deadline: InvocationDeadline | None,
+) -> Iterator[None]:
+    token: Token[InvocationDeadline | None] = _CURRENT_INVOCATION_DEADLINE.set(
+        deadline
+    )
+    try:
+        yield
+    finally:
+        _CURRENT_INVOCATION_DEADLINE.reset(token)
+
+
+def ensure_current_invocation_allowed() -> None:
+    deadline = _CURRENT_INVOCATION_DEADLINE.get()
+    if deadline is not None:
+        deadline.ensure_open()
 
 
 class ProviderTransientExhaustedError(RuntimeError):

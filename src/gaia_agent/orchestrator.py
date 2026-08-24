@@ -37,7 +37,12 @@ from gaia_agent.models import (
 )
 from gaia_agent.observability import Observability, TaskTrace
 from gaia_agent.providers import ToolCallError, ToolSpec
-from gaia_agent.reliability import ProviderTransientExhaustedError
+from gaia_agent.reliability import (
+    InvocationDeadline,
+    ProviderTransientExhaustedError,
+    ensure_current_invocation_allowed,
+    invocation_deadline_scope,
+)
 from gaia_agent.research_notebook import ResearchNotebook
 from gaia_agent.scoring import parse_number_with_status
 
@@ -199,6 +204,7 @@ class _BudgetedToolClient:
         return tuple(self._client.tool_specs)
 
     async def read_attachment_bytes(self, path: Path | str) -> bytes:
+        ensure_current_invocation_allowed()
         return await self._client.read_attachment_bytes(path)
 
     def start_scope(
@@ -253,6 +259,7 @@ class _BudgetedToolClient:
         )
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        ensure_current_invocation_allowed()
         signature = json.dumps(
             {"name": name, "arguments": arguments},
             sort_keys=True,
@@ -398,13 +405,27 @@ class Orchestrator:
         self.correction_count = 0
         self.step_count = 0
         self.tool_call_count = 0
+        self._invocation_deadline: InvocationDeadline | None = None
         self._graph = self._build_graph()
 
     @property
     def audit_events(self) -> tuple[AuditEvent, ...]:
         return tuple(self._audit_events)
 
+    def set_invocation_deadline(self, deadline: InvocationDeadline) -> None:
+        self._invocation_deadline = deadline
+
+    def authenticated_checkpoint_usage(self) -> Usage | None:
+        if self._notebook is None:
+            return None
+        checkpoint = self._notebook.load_stage_checkpoint()
+        return checkpoint.usage if checkpoint is not None else None
+
     async def run(self, task: GaiaTask) -> TaskPrediction:
+        with invocation_deadline_scope(self._invocation_deadline):
+            return await self._run(task)
+
+    async def _run(self, task: GaiaTask) -> TaskPrediction:
         loop = asyncio.get_running_loop()
         started = loop.time()
         global_deadline = started + self._config.timeout_seconds
@@ -420,11 +441,13 @@ class Orchestrator:
         prediction: TaskPrediction | None = None
         category: TerminalErrorCategory | None = None
         provider_exhaustion: ProviderTransientExhaustedError | None = None
+        cancellation: asyncio.CancelledError | None = None
         budgets = self._stage_budgets(started)
         stage_runtime = _StageRuntime()
         try:
             try:
                 async with asyncio.timeout_at(global_deadline):
+                    ensure_current_invocation_allowed()
                     async with self._tool_client_factory(execution_task) as active_tools:
                         raw_tools = active_tools
                         budgeted_tools = _BudgetedToolClient(
@@ -447,6 +470,8 @@ class Orchestrator:
                     if stage_deadline is not None and loop.time() >= stage_deadline:
                         raise StageBudgetExceeded(active_stage, "time") from error
                 raise
+        except asyncio.CancelledError as error:
+            cancellation = error
         except ProviderTransientExhaustedError as error:
             category = TerminalErrorCategory.RETRY_EXHAUSTED
             provider_exhaustion = error
@@ -490,6 +515,9 @@ class Orchestrator:
         if budgeted_tools is not None:
             self.tool_call_count = budgeted_tools.call_count
         self.step_count = state.step_count
+        if cancellation is not None:
+            self._refresh_checkpoint_accounting(state, budgeted_tools)
+            raise cancellation
         if prediction is not None:
             return prediction.model_copy(
                 update={

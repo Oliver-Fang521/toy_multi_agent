@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from inspect import signature
 from pathlib import Path
+from threading import Lock
 from typing import Any, Literal, Protocol
 
 from openai import AsyncOpenAI
@@ -44,8 +45,20 @@ from gaia_agent.models import (
 from gaia_agent.observability import Observability, ObservabilityConfig, TaskTraceOutcome
 from gaia_agent.orchestrator import Orchestrator, choose_majority
 from gaia_agent.persistence import RunManifest, RunStore
-from gaia_agent.providers import DeepSeekProvider, ModelProvider, OpenAIProvider
-from gaia_agent.reliability import RetryPolicy, transient_provider_error_category
+from gaia_agent.providers import (
+    DeepSeekProvider,
+    ModelProvider,
+    ModelRequest,
+    ModelResponse,
+    OpenAIProvider,
+    ToolExecutor,
+)
+from gaia_agent.reliability import (
+    InvocationDeadline,
+    RetryPolicy,
+    ensure_current_invocation_allowed,
+    transient_provider_error_category,
+)
 from gaia_agent.reporting import (
     EvaluationSummary,
     LevelMetrics,
@@ -97,7 +110,11 @@ _MAX_AGENT_TOOL_CALLS = 6
 _RECOVERY_BACKOFF_SECONDS = 0.05
 _EARLY_TRANSIENT_RATIO = 0.5
 _CANCELLATION_CLEANUP_SECONDS = 0.005
+_MAX_DETACHED_ATTEMPTS = 64
 _DETACHED_ATTEMPTS: set[asyncio.Task[Any]] = set()
+_DETACHED_ATTEMPT_RESERVATIONS = 0
+_DETACHED_ATTEMPT_OVERFLOW_COUNT = 0
+_DETACHED_ATTEMPT_LOCK = Lock()
 _PRIVATE_RUNTIME_AUDIT_EVENT_TYPES = frozenset(
     {
         "checkpoint_restored",
@@ -148,6 +165,22 @@ class ProviderRuntime:
     fake_mcp_backend: bool = False
 
 
+class _DeadlineGuardedProvider:
+    """Reject provider operations that begin after the bound vote closes."""
+
+    def __init__(self, provider: ModelProvider) -> None:
+        self._provider = provider
+        self.supports_vision = bool(getattr(provider, "supports_vision", False))
+
+    async def complete(
+        self,
+        request: ModelRequest,
+        executor: ToolExecutor | None = None,
+    ) -> ModelResponse:
+        ensure_current_invocation_allowed()
+        return await self._provider.complete(request, executor)
+
+
 @dataclass(frozen=True)
 class _TaskRun:
     prediction: TaskPrediction
@@ -170,6 +203,7 @@ class EvaluationRunner:
         observability: Observability | None = None,
         run_opened: RunOpened | None = None,
         clock: Clock = time.monotonic,
+        offload_orchestrator_factory: bool = False,
     ) -> None:
         self._config = config
         self._dataset_loader = dataset_loader
@@ -183,6 +217,7 @@ class EvaluationRunner:
         self._observability = observability or Observability()
         self._run_opened = run_opened
         self._clock = clock
+        self._offload_orchestrator_factory = offload_orchestrator_factory
         self._last_flush_ok: bool | None = None
 
     @property
@@ -355,6 +390,27 @@ class EvaluationRunner:
     ) -> _TaskRun:
         vote_started = self._clock()
         vote_deadline = vote_started + self._config.timeout_seconds
+        invocation_deadline = InvocationDeadline(vote_deadline, self._clock)
+        try:
+            return await self._run_vote_with_invocation_deadline(
+                task,
+                vote_namespace=vote_namespace,
+                vote_started=vote_started,
+                vote_deadline=vote_deadline,
+                invocation_deadline=invocation_deadline,
+            )
+        finally:
+            invocation_deadline.close()
+
+    async def _run_vote_with_invocation_deadline(
+        self,
+        task: GaiaTask,
+        *,
+        vote_namespace: str,
+        vote_started: float,
+        vote_deadline: float,
+        invocation_deadline: InvocationDeadline,
+    ) -> _TaskRun:
         audit_events: list[AuditEvent] = []
         first_plan: AgentPlan | None = None
         prior_predictions: list[TaskPrediction] = []
@@ -363,6 +419,7 @@ class EvaluationRunner:
         provider_attempt_count = 0
         recovery_attempted = False
         checkpoint_restored_this_attempt = False
+        authenticated_usage_this_attempt: Usage | None = None
         for attempt in range(2):
             remaining_seconds = vote_deadline - self._clock()
             if remaining_seconds <= 0:
@@ -377,6 +434,10 @@ class EvaluationRunner:
                     vote_namespace,
                     remaining_seconds,
                 )
+                _set_orchestrator_invocation_deadline(
+                    orchestrator,
+                    invocation_deadline,
+                )
                 remaining_seconds = vote_deadline - self._clock()
                 if remaining_seconds <= 0:
                     raise TimeoutError
@@ -384,6 +445,7 @@ class EvaluationRunner:
                     orchestrator,
                     task,
                     remaining_seconds,
+                    invocation_deadline,
                 )
                 _validate_prediction_identity(prediction, task)
             except Exception as error:  # noqa: BLE001 - task isolation boundary
@@ -414,6 +476,9 @@ class EvaluationRunner:
                 first_plan = first_plan or _plan_from_audit(events)
             checkpoint_restored_this_attempt = any(
                 event.event_type == "checkpoint_restored" for event in events
+            )
+            authenticated_usage_this_attempt = _authenticated_checkpoint_usage(
+                orchestrator
             )
             provider_attempt_count += prediction.provider_attempt_count
             if self._clock() >= vote_deadline and prediction.error_category is None:
@@ -487,7 +552,11 @@ class EvaluationRunner:
             prediction = prediction.model_copy(
                 update={
                     "usage": (
-                        _cumulative_recovery_usage(prior_predictions, prediction)
+                        _cumulative_recovery_usage(
+                            prior_predictions,
+                            prediction,
+                            authenticated_usage_this_attempt,
+                        )
                         if checkpoint_restored_this_attempt
                         else _sum_usage([*prior_predictions, prediction])
                     ),
@@ -503,7 +572,11 @@ class EvaluationRunner:
         prediction = prediction.model_copy(
             update={
                 "usage": (
-                    _cumulative_recovery_usage(prior_predictions, prediction)
+                    _cumulative_recovery_usage(
+                        prior_predictions,
+                        prediction,
+                        authenticated_usage_this_attempt,
+                    )
                     if checkpoint_restored_this_attempt
                     else _sum_usage([*prior_predictions, prediction])
                 ),
@@ -534,16 +607,29 @@ class EvaluationRunner:
         vote_namespace: str,
         remaining_seconds: float,
     ) -> TaskOrchestrator:
-        creation = asyncio.create_task(
-            asyncio.to_thread(self._make_orchestrator, task, vote_namespace)
-        )
-        done, _ = await asyncio.wait({creation}, timeout=remaining_seconds)
+        if not self._offload_orchestrator_factory:
+            return self._make_orchestrator(task, vote_namespace)
+        if not _reserve_detached_attempt():
+            raise TimeoutError
+        try:
+            creation = asyncio.create_task(
+                asyncio.to_thread(self._make_orchestrator, task, vote_namespace)
+            )
+        except BaseException:
+            _release_detached_attempt_reservation()
+            raise
+        try:
+            done, _ = await asyncio.wait({creation}, timeout=remaining_seconds)
+        except asyncio.CancelledError:
+            _observe_detached_attempt(creation)
+            raise
         if creation in done:
+            _release_detached_attempt_reservation()
             try:
                 return creation.result()
             except asyncio.CancelledError as error:
                 raise TimeoutError from error
-        await _cancel_and_observe(creation)
+        _observe_detached_attempt(creation)
         raise TimeoutError
 
     def _minimum_recovery_seconds(self) -> float:
@@ -565,44 +651,138 @@ def _accepts_vote_namespace(factory: OrchestratorFactory) -> bool:
     return True
 
 
+def _set_orchestrator_invocation_deadline(
+    orchestrator: TaskOrchestrator,
+    deadline: InvocationDeadline,
+) -> None:
+    setter = getattr(orchestrator, "set_invocation_deadline", None)
+    if callable(setter):
+        setter(deadline)
+
+
+def _authenticated_checkpoint_usage(
+    orchestrator: TaskOrchestrator | None,
+) -> Usage | None:
+    if orchestrator is None:
+        return None
+    loader = getattr(orchestrator, "authenticated_checkpoint_usage", None)
+    if not callable(loader):
+        return None
+    try:
+        usage = loader()
+    except (OSError, TypeError, ValueError):
+        return None
+    return usage if isinstance(usage, Usage) else None
+
+
 async def _run_orchestrator_with_deadline(
     orchestrator: TaskOrchestrator,
     task: GaiaTask,
     remaining_seconds: float,
+    invocation_deadline: InvocationDeadline,
 ) -> TaskPrediction:
-    attempt = asyncio.create_task(orchestrator.run(task))
-    done, _ = await asyncio.wait({attempt}, timeout=remaining_seconds)
+    if not _reserve_detached_attempt():
+        raise TimeoutError
+    try:
+        attempt = asyncio.create_task(orchestrator.run(task))
+    except BaseException:
+        _release_detached_attempt_reservation()
+        raise
+    try:
+        done, _ = await asyncio.wait({attempt}, timeout=remaining_seconds)
+    except asyncio.CancelledError:
+        invocation_deadline.close()
+        await _cancel_and_observe(attempt, reservation=True)
+        raise
     if attempt in done:
+        _release_detached_attempt_reservation()
         try:
             return attempt.result()
         except asyncio.CancelledError as error:
             raise TimeoutError from error
 
-    await _cancel_and_observe(attempt)
+    invocation_deadline.close()
+    await _cancel_and_observe(attempt, reservation=True)
     raise TimeoutError
 
 
-async def _cancel_and_observe(attempt: asyncio.Task[Any]) -> None:
+async def _cancel_and_observe(
+    attempt: asyncio.Task[Any],
+    *,
+    reservation: bool,
+) -> None:
     attempt.cancel()
     done, _ = await asyncio.wait(
         {attempt},
         timeout=_CANCELLATION_CLEANUP_SECONDS,
     )
     if attempt in done:
+        if reservation:
+            _release_detached_attempt_reservation()
         _consume_detached_attempt(attempt)
     else:
-        _DETACHED_ATTEMPTS.add(attempt)
+        if reservation:
+            _track_detached_attempt(attempt)
         attempt.add_done_callback(_consume_detached_attempt)
 
 
+def _observe_detached_attempt(attempt: asyncio.Task[Any]) -> None:
+    _track_detached_attempt(attempt)
+    attempt.add_done_callback(_consume_detached_attempt)
+
+
 def _consume_detached_attempt(attempt: asyncio.Task[Any]) -> None:
-    _DETACHED_ATTEMPTS.discard(attempt)
+    with _DETACHED_ATTEMPT_LOCK:
+        _DETACHED_ATTEMPTS.discard(attempt)
     if attempt.cancelled():
         return
     try:
         attempt.exception()
     except asyncio.CancelledError:
         pass
+
+
+def _reserve_detached_attempt() -> bool:
+    global _DETACHED_ATTEMPT_OVERFLOW_COUNT
+    global _DETACHED_ATTEMPT_RESERVATIONS
+    with _DETACHED_ATTEMPT_LOCK:
+        if (
+            len(_DETACHED_ATTEMPTS) + _DETACHED_ATTEMPT_RESERVATIONS
+            >= _MAX_DETACHED_ATTEMPTS
+        ):
+            _DETACHED_ATTEMPT_OVERFLOW_COUNT += 1
+            return False
+        _DETACHED_ATTEMPT_RESERVATIONS += 1
+        return True
+
+
+def _release_detached_attempt_reservation() -> None:
+    global _DETACHED_ATTEMPT_RESERVATIONS
+    with _DETACHED_ATTEMPT_LOCK:
+        _DETACHED_ATTEMPT_RESERVATIONS = max(
+            0,
+            _DETACHED_ATTEMPT_RESERVATIONS - 1,
+        )
+
+
+def _track_detached_attempt(attempt: asyncio.Task[Any]) -> None:
+    global _DETACHED_ATTEMPT_RESERVATIONS
+    with _DETACHED_ATTEMPT_LOCK:
+        _DETACHED_ATTEMPT_RESERVATIONS = max(
+            0,
+            _DETACHED_ATTEMPT_RESERVATIONS - 1,
+        )
+        _DETACHED_ATTEMPTS.add(attempt)
+
+
+def _detached_attempt_diagnostics() -> dict[str, int]:
+    with _DETACHED_ATTEMPT_LOCK:
+        return {
+            "tracked": len(_DETACHED_ATTEMPTS),
+            "reserved": _DETACHED_ATTEMPT_RESERVATIONS,
+            "capacity": _MAX_DETACHED_ATTEMPTS,
+            "overflow_count": _DETACHED_ATTEMPT_OVERFLOW_COUNT,
+        }
 
 
 def validate_config(config: RunConfig) -> None:
@@ -712,7 +892,7 @@ def build_runner(
         raise ValueError("provider_name must be a bounded public identifier")
     if runtime.fake_mcp_backend and runtime.evaluation_mode != "test":
         raise ValueError("fake MCP backend requires an injected test runtime")
-    provider = runtime.provider
+    provider = _DeadlineGuardedProvider(runtime.provider)
     agent_tool_calls = min(config.max_tool_calls, _MAX_AGENT_TOOL_CALLS)
     planner = PlannerAgent(
         provider,
@@ -801,6 +981,7 @@ def build_runner(
         evaluation_mode=runtime.evaluation_mode,
         observability=observability,
         run_opened=bind_notebook_generation,
+        offload_orchestrator_factory=(runtime.evaluation_mode == "production"),
     )
 
 
@@ -1154,16 +1335,31 @@ def _sum_usage(predictions: Sequence[TaskPrediction]) -> Usage:
 def _cumulative_recovery_usage(
     prior_predictions: Sequence[TaskPrediction],
     prediction: TaskPrediction,
+    authenticated_usage: Usage | None = None,
 ) -> Usage:
     prior = _sum_usage(prior_predictions)
+    authenticated = authenticated_usage or Usage()
     return Usage(
-        input_tokens=max(prior.input_tokens, prediction.usage.input_tokens),
-        output_tokens=max(prior.output_tokens, prediction.usage.output_tokens),
+        input_tokens=max(
+            prior.input_tokens,
+            prediction.usage.input_tokens,
+            authenticated.input_tokens,
+        ),
+        output_tokens=max(
+            prior.output_tokens,
+            prediction.usage.output_tokens,
+            authenticated.output_tokens,
+        ),
         reasoning_tokens=max(
             prior.reasoning_tokens,
             prediction.usage.reasoning_tokens,
+            authenticated.reasoning_tokens,
         ),
-        total_tokens=max(prior.total_tokens, prediction.usage.total_tokens),
+        total_tokens=max(
+            prior.total_tokens,
+            prediction.usage.total_tokens,
+            authenticated.total_tokens,
+        ),
     )
 
 

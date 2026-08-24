@@ -1,0 +1,615 @@
+# Task 6 Report — Stable LangGraph Resume and Bounded Vote Recovery
+
+## Status
+
+Complete. Task 6 restores authenticated `StageCheckpoint` state into LangGraph at the
+persisted stable cursor, saves each stable transition before downstream work, invokes notebook-only
+evidence repair exactly at `evidence_repair`, restores logical budgets and cumulative usage, and
+replaces unconditional two-attempt replay with one vote-wide deadline.
+
+## RED evidence
+
+Checkpoint entry routing, stable saves, digest restoration, and counter hydration:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_orchestrator.py -k 'checkpoint and (restore or stable)' -q
+FFF.FFF                                                                  [100%]
+6 failed
+```
+
+The corrupt-checkpoint fallback passed; all six resume/save tests failed because the graph still
+started at Planner and never wrote stable-transition checkpoints.
+
+One-shot evidence repair and trusted evidence-ID assignment:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_orchestrator.py::test_evidence_repair_checkpoint_links_once_through_trusted_id_assignment -q
+F                                                                        [100%]
+```
+
+The candidate reached Critic without linked evidence because the composed Task 5 linker had no graph
+node.
+
+Vote-wide deadline and retry gates:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_cli_e2e.py -k 'early_transient or late_transient or near_deadline or vote_deadline or checkpoint_transient' -q
+FFFF
+```
+
+Four fake-clock tests failed on the absent `clock` interface. The real blocking recovery test then
+remained live beyond 30 seconds and was interrupted, directly reproducing the missing vote-wide
+deadline.
+
+Recovery accounting:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_orchestrator.py::test_failed_critic_refreshes_checkpoint_counters_without_partial_decision tests/test_cli_e2e.py::test_runner_checkpoint_transient_resumes_once_with_remaining_vote_budget -q
+FF                                                                       [100%]
+```
+
+The checkpoint retained zero Critic calls after one completed logical call, and runner reported 13
+tokens instead of the restored cumulative 8.
+
+Task 3 terminal Specialist-timeout ruling:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_cli_e2e.py::test_runner_specialist_timeout_without_stable_candidate_is_terminal -q
+F                                                                        [100%]
+IndexError: pop from an empty deque
+```
+
+The empty deque proved runner incorrectly created a second orchestrator from a Planner-only `act`
+checkpoint after Specialist timed out without validated candidate/evidence.
+
+## GREEN evidence
+
+Focused graph checkpoint and evidence-repair slice:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_orchestrator.py -k 'checkpoint and (restore or stable or evidence_repair)' -q
+........                                                                 [100%]
+```
+
+Focused vote-wide recovery slice:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_cli_e2e.py -k 'early_transient or late_transient or near_deadline or vote_deadline or checkpoint_transient' -q
+.....                                                                    [100%]
+```
+
+Accounting and Task 3 terminal-route regressions:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_cli_e2e.py::test_runner_specialist_timeout_without_stable_candidate_is_terminal tests/test_cli_e2e.py::test_runner_checkpoint_transient_resumes_once_with_remaining_vote_budget tests/test_orchestrator.py::test_failed_critic_refreshes_checkpoint_counters_without_partial_decision -q
+...                                                                      [100%]
+```
+
+Required impacted suites:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_orchestrator.py tests/test_cli_e2e.py -q
+........................................................................ [ 55%]
+..........................................................               [100%]
+```
+
+Fresh full suite:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+........................................................................ [ 11%]
+........................................................................ [ 23%]
+........................................................................ [ 35%]
+........................................................................ [ 46%]
+........................................................................ [ 58%]
+........................................................................ [ 70%]
+........................................................................ [ 82%]
+........................................................................ [ 93%]
+.....................................                                    [100%]
+```
+
+Static and whitespace verification:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check src tests
+All checks passed!
+
+git diff --check
+# no output
+```
+
+## Behavior implemented
+
+- `START` now enters `restore`, which loads only the current `ResearchNotebook`'s authenticated
+  checkpoint. Missing, stale, tampered, or invalid checkpoint data routes to normal `plan`.
+- Restore hydrates plan, trusted typed evidence, lineage, candidate, usage, graph indices, correction
+  state, Critic decision, and global/per-stage logical call counters. Raw SHA-256 hex digests are
+  restored with `bytes.fromhex`, preserving duplicate raw-evidence detection.
+- Stable checkpoints are saved after valid Plan, each valid Specialist transition, evidence repair,
+  Critic decision, and correction, before the next provider/tool stage. Timed-out or malformed active
+  Specialist steps roll back their unvalidated step count before checkpointing prior stable state.
+- After a terminal stage failure, only accounting on the last stable checkpoint is refreshed. Its
+  cursor, plan, candidate, evidence, lineage, and decision are unchanged; no partial provider result
+  or partial tool result is checkpointed.
+- `evidence_repair` is a single graph node. It calls the linker at most once for that traversal, only
+  with authenticated bounded notebook cards, resolves selected hashes through the notebook, and feeds
+  typed `Evidence` through `_record_result` for trusted sequential IDs and digest lineage.
+- One vote deadline is computed before attempt 1. Each orchestrator await is capped by remaining vote
+  time. A no-checkpoint transient gets one fresh retry only in the first half of the envelope and with
+  a minimum recovery reserve. A transient with a stable checkpoint gets one resume only with that
+  reserve. A near-deadline result returns without another attempt.
+- A Specialist time exhaustion is terminal only when the authenticated checkpoint has no validated
+  candidate. A candidate without typed evidence routes to evidence repair/Critic. Specialist
+  tool-call exhaustion remains terminal. Critic exhaustion keeps the prior stable checkpoint and
+  never submits an unverified answer.
+- Restored predictions already carry cumulative checkpoint usage, so runner does not sum the first
+  prediction into them again. Provider-attempt and public recovery counters remain additive.
+- Runtime checkpoint/evidence-repair audit events stay in memory for recovery decisions but are not
+  persisted into the public audit allowlist; Task 7 owns the final safe observability expansion.
+
+## Files changed
+
+- `src/gaia_agent/orchestrator.py`
+  - Adds restore/evidence-repair graph nodes and stable-cursor routing.
+  - Adds checkpoint conversion, stable persistence, failure-accounting refresh, digest restoration,
+    and logical counter hydration.
+- `src/gaia_agent/runner.py`
+  - Adds an injectable monotonic clock, one vote deadline, early fresh-retry and checkpoint-resume
+    gates, terminal Specialist-timeout detection, cumulative restored-usage handling, and public audit
+    filtering for Task 6 runtime events.
+- `tests/test_orchestrator.py`
+  - Covers act/verify/submit restore, corrupt fallback, exact stable cursor order, digest bytes,
+    logical counters, failure accounting, and one-shot trusted evidence repair.
+- `tests/test_cli_e2e.py`
+  - Covers early and late no-checkpoint transients, near-deadline checkpoint behavior, checkpoint
+    resume, one vote deadline cancellation, cumulative usage, and terminal no-state Specialist
+    timeout.
+
+`src/gaia_agent/models.py` required no change: the current Task 4/earlier public contract already
+contains the complete private `StageCheckpoint` fields and the bounded public attempt/recovery/retry
+metadata consumed by Task 6. Removing or duplicating those fields would add contract churn without
+behavior.
+
+## Proposed rulings / cost if wrong
+
+- **Evidence repair uses half of the Critic time remaining at node entry.** It runs after Specialist
+  has produced a stable candidate and may be entered precisely because Specialist time is exhausted;
+  charging it to Specialist would make recovery impossible at that cursor. The half-window leaves a
+  deterministic Critic reserve. Cost if wrong: a slow linker that needed more than half of the
+  remaining Critic window fails closed and Critic receives the existing candidate/evidence.
+- **A useful retry requires more than `min(critic_timeout, 10% of vote_timeout)`, with a 1 ms floor;
+  no-checkpoint retry is “early” only in the first half of the vote.** The plan names
+  `minimum_recovery_seconds` and `is_early_transient` but does not specify values. This conservative
+  choice makes the 10-second near-deadline boundary deterministic and gives production recovery up to
+  a 30-second minimum reserve under the 300-second defaults. Cost if wrong: some recoveries with less
+  time could have succeeded, or a different benchmark-specific threshold may be preferable.
+- **Terminal failure may refresh accounting on the prior stable checkpoint.** Only cumulative usage
+  and logical counters change; stable graph content does not. This reconciles “no partial provider/tool
+  state” with “no budget reset.” Cost if wrong: the checkpoint file is rewritten after a failed stage
+  even though its stable cursor and semantic state are unchanged.
+
+## Privacy and composition review
+
+- No `.env`, secret, credential, prompt, question, candidate, URL, evidence excerpt, or raw provider
+  error was added to public results, public audits, or Langfuse metadata.
+- No production model or reasoning setting changed. Runner still composes all agents, including the
+  evidence linker, from the shared configured provider; production guards remain
+  `gpt-5.6-luna`/`reasoning_effort=max`.
+- Checkpoints are loaded only from `ResearchNotebook`; no Langfuse or public metadata reconstructs
+  private state.
+- Existing untracked `.superpowers/sdd-tools/` content was left untouched and excluded from the
+  commit.
+
+## Concerns / handoff
+
+- No open Task 6 blocker.
+- Task 7 can map the in-memory `checkpoint_saved`, `checkpoint_restored`, and evidence-repair events
+  into its bounded safe Langfuse summary fields without persisting their private checkpoint content.
+
+## Commit
+
+`124f483 feat: resume GAIA tasks from stable stages`
+
+---
+
+## Fix round 1 — adversarial recovery hardening
+
+### RED evidence
+
+The six findings were first encoded as focused regressions (the evidence-repair and Critic findings
+each include both of their typed failure variants):
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_runner_scopes_checkpoints_per_vote_but_reuses_scope_for_recovery \
+  tests/test_cli_e2e.py::test_runner_cancelled_restored_attempt_retains_prior_cumulative_usage \
+  tests/test_cli_e2e.py::test_runner_critic_budget_exhaustion_at_verify_is_terminal \
+  tests/test_cli_e2e.py::test_runner_critic_provider_retry_exhaustion_at_verify_is_terminal \
+  tests/test_cli_e2e.py::test_runner_specialist_timeout_with_checkpoint_candidate_resumes_from_act \
+  tests/test_cli_e2e.py::test_runner_deadline_does_not_wait_for_cancellation_suppression \
+  tests/test_cli_e2e.py::test_runner_deadline_starts_before_synchronous_factory_work \
+  tests/test_orchestrator.py::test_evidence_repair_transient_failure_is_charged_once_and_routes_to_critic \
+  tests/test_orchestrator.py::test_specialist_timeout_with_candidate_and_no_evidence_repairs_then_critic \
+  tests/test_orchestrator.py::test_failed_critic_refreshes_checkpoint_counters_without_partial_decision
+FFFFFFFFFF                                                               [100%]
+10 failed
+```
+
+The exact failures were:
+
+- runner called the factory with only `task`, so no vote-stable namespace existed and direct
+  namespaced `_run_vote` calls were unsupported;
+- evidence-linker transient failure escaped before Critic, candidate-only Specialist stability never
+  reached the linker, and Critic provider exhaustion emitted no stage-terminal marker;
+- the restored-cancel accounting path selected synthetic zero usage;
+- Critic-local timeout/retry exhaustion was eligible for checkpoint recovery;
+- `asyncio.timeout` waited through cancellation suppression, and factory drift still allowed the
+  expired orchestrator to run.
+
+### GREEN evidence
+
+Final focused adversarial slice:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_runner_scopes_checkpoints_per_vote_but_reuses_scope_for_recovery \
+  tests/test_cli_e2e.py::test_runner_cancelled_restored_attempt_retains_prior_cumulative_usage \
+  tests/test_cli_e2e.py::test_runner_critic_budget_exhaustion_at_verify_is_terminal \
+  tests/test_cli_e2e.py::test_runner_critic_provider_retry_exhaustion_at_verify_is_terminal \
+  tests/test_cli_e2e.py::test_runner_specialist_timeout_with_checkpoint_candidate_resumes_from_act \
+  tests/test_cli_e2e.py::test_runner_deadline_does_not_wait_for_cancellation_suppression \
+  tests/test_cli_e2e.py::test_runner_deadline_starts_before_synchronous_factory_work \
+  tests/test_orchestrator.py::test_evidence_repair_failure_is_charged_once_and_routes_to_critic \
+  tests/test_orchestrator.py::test_specialist_timeout_with_candidate_and_no_evidence_repairs_then_critic \
+  tests/test_orchestrator.py::test_failed_critic_refreshes_checkpoint_counters_without_partial_decision
+...........                                                              [100%]
+```
+
+Impacted suites:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/test_orchestrator.py tests/test_cli_e2e.py
+........................................................................ [ 51%]
+....................................................................     [100%]
+```
+
+Fresh full suite:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+........................................................................ [ 11%]
+........................................................................ [ 23%]
+........................................................................ [ 34%]
+........................................................................ [ 46%]
+........................................................................ [ 57%]
+........................................................................ [ 69%]
+........................................................................ [ 80%]
+........................................................................ [ 92%]
+...............................................                          [100%]
+```
+
+Static and whitespace verification:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check src tests
+All checks passed!
+
+git diff --check
+# no output
+```
+
+### Behavior added in fix round 1
+
+- Runner assigns deterministic private namespaces (`vote-0001`, `vote-0002`, …) per majority vote.
+  Every recovery attempt inside one vote reuses that namespace; different votes use distinct
+  `ResearchNotebook` roots while preserving the public GAIA `task_id`. Production notebook roots
+  reject non-internal namespace shapes. Legacy one-argument injected factories remain supported by
+  signature inspection; the production/internal interface receives `(task, vote_namespace)`.
+- Restored-attempt usage is component-wise bounded below by all prior attempt accounting. A canceled
+  resume with synthetic zero usage therefore retains the authenticated prior cumulative charge,
+  while a successful cumulative resume is not double-counted.
+- Evidence repair owns linker failures. It charges linker usage once, records only a safe private
+  failure category, saves the `verify` cursor, and routes directly to Critic. Linker time is capped at
+  half of the remaining Critic window so a timeout cannot consume the entire verification reserve.
+- A validated candidate is the stable Specialist-timeout criterion even when typed evidence is
+  absent. Checkpoint runtime events expose only `candidate_present`; no candidate text enters public
+  audit or Langfuse. Candidate-only state routes through authenticated evidence repair when eligible,
+  then Critic, while Specialist logical-call exhaustion remains terminal.
+- Critic stage time exhaustion and typed provider retry exhaustion at `verify` are terminal to runner
+  recovery. Critic provider exhaustion emits a private safe stage marker; raw outer transient
+  exceptions remain governed by the existing transient recovery policy.
+- Factory creation runs off-loop in a child task under the vote's existing absolute deadline; late
+  factory completion cannot start an orchestrator. Each orchestration attempt then runs in its own
+  child task. At either deadline, the child is canceled, observed for a bounded 5 ms cleanup window,
+  then safely detached with a callback that consumes its eventual outcome. Cancellation suppression
+  and synchronous factory work therefore cannot hold the vote open.
+
+### Fix-round files
+
+- `src/gaia_agent/runner.py`: vote namespaces/private roots, compatible factory dispatch, bounded
+  child attempts, terminal checkpoint policy, and cumulative usage floor.
+- `src/gaia_agent/orchestrator.py`: candidate-presence checkpoint metadata, candidate-only timeout
+  routing, contained evidence repair, reserved repair time, and Critic retry terminal marker.
+- `tests/test_cli_e2e.py`: cross-vote isolation, restored cancellation accounting, runner terminal
+  gates, hard deadline/cancellation suppression, factory drift, and production notebook-root tests.
+- `tests/test_orchestrator.py`: linker transient/time containment, candidate-only evidence repair, and
+  Critic retry-marker regressions.
+
+### Fix-round proposed ruling / cost if wrong
+
+- **Evidence repair receives half of the Critic time remaining when the node starts.** This leaves a
+  deterministic verification reserve while keeping both operations inside the original Critic/vote
+  deadlines. Cost if wrong: a slow linker that could have succeeded using more than half of the
+  remaining Critic window now fails closed and sends the existing candidate/evidence to Critic.
+
+### Fix-round concerns
+
+- No open blocker. Detached cancellation-suppressing attempts retain a strong reference only until
+  their done callback consumes the result/exception; the runner never accepts their late prediction.
+- Python cannot stop already-running synchronous worker code. A timed-out factory's asyncio wrapper
+  is canceled and observed, its eventual return value is ignored, and it can never launch the
+  orchestrator; the worker itself may finish its bounded synchronous cleanup after runner returns.
+- All new checkpoint/linker/retry events remain private runtime events. Task 7 still owns final safe
+  observability expansion.
+
+### Review-fix RED/GREEN evidence
+
+Independent review found that the first implementation counted synchronous factory time but still
+ran the factory on the event loop. The strengthened real-clock test made that envelope failure RED:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q tests/test_cli_e2e.py::test_runner_deadline_starts_before_synchronous_factory_work
+F                                                                        [100%]
+assert 0.08555841608904302 < 0.06
+1 failed
+```
+
+After moving factory creation into the bounded worker phase, both hard-deadline variants were GREEN:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_runner_deadline_starts_before_synchronous_factory_work \
+  tests/test_cli_e2e.py::test_runner_deadline_does_not_wait_for_cancellation_suppression
+..                                                                       [100%]
+```
+
+Read-only re-review result:
+
+```text
+Critical/Important issues: none remaining.
+Ready: Yes.
+```
+
+Fix-round commit: `616d8fd853c8fbaabe86da7d9359e5c013859d58 fix: harden GAIA stage recovery boundaries`
+
+---
+
+## Fix round 2 — cancellation accounting and invocation boundary
+
+### RED evidence
+
+All three Important findings were encoded before production changes. The factory-compatibility
+case is parameterized across both supported legacy arities, and the invocation-boundary finding is
+split across real tool/provider paths plus bounded-registry cleanup:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_real_cancelled_resume_refreshes_authenticated_usage_before_reraise \
+  tests/test_cli_e2e.py::test_runner_legacy_sync_factory_stays_on_caller_event_loop \
+  tests/test_cli_e2e.py::test_runner_production_offloaded_factory_stays_inside_vote_deadline \
+  tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_tool_call_after_vote_deadline \
+  tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_provider_call_after_vote_deadline \
+  tests/test_cli_e2e.py::test_detached_attempt_registry_is_bounded_and_cleans_up
+FFFFFFF                                                                  [100%]
+7 failed
+```
+
+The exact failures established that:
+
+- a restored 7-token checkpoint stayed at 7 after Critic had finalized another known 5 tokens;
+- both legacy factory arities ran in a worker without a running event loop;
+- no explicit production offload mode existed;
+- cancellation-suppressing real orchestration could begin one provider call and one tool call after
+  the runner had returned; and
+- a second detached attempt started after the test reduced registry capacity to one.
+
+### GREEN evidence
+
+Final focused round-two slice:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_real_cancelled_resume_refreshes_authenticated_usage_before_reraise \
+  tests/test_cli_e2e.py::test_runner_legacy_sync_factory_stays_on_caller_event_loop \
+  tests/test_cli_e2e.py::test_runner_production_offloaded_factory_stays_inside_vote_deadline \
+  tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_tool_call_after_vote_deadline \
+  tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_provider_call_after_vote_deadline \
+  tests/test_cli_e2e.py::test_detached_attempt_registry_is_bounded_and_cleans_up
+.......                                                                  [100%]
+```
+
+Required impacted suites:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py tests/test_orchestrator.py \
+  tests/test_openai_provider.py tests/test_deepseek_provider.py
+........................................................................ [ 37%]
+........................................................................ [ 74%]
+..................................................                       [100%]
+```
+
+Fresh full suite:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+........................................................................ [ 11%]
+........................................................................ [ 22%]
+........................................................................ [ 34%]
+........................................................................ [ 45%]
+........................................................................ [ 57%]
+........................................................................ [ 68%]
+........................................................................ [ 80%]
+........................................................................ [ 91%]
+.....................................................                    [100%]
+```
+
+Static and whitespace verification:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check src tests
+All checks passed!
+
+git diff --check
+# no output
+```
+
+### Behavior added in fix round 2
+
+- `Orchestrator.run` now treats `CancelledError` as control flow: stage/provider `finally` blocks
+  first add known usage, the authenticated checkpoint receives accounting-only usage and logical
+  counter refresh, then cancellation is re-raised. Stable cursor and semantic checkpoint content are
+  unchanged. Runner reloads that authenticated cumulative usage after bounded cancellation and uses
+  a component-wise floor, producing exactly 12 rather than synthetic 7 or double-charged 19 in the
+  real restored-Critic probe.
+- Runner creates one mutable absolute invocation deadline per vote and attaches it to every real
+  Orchestrator attempt. The deadline is closed before timeout cancellation. Context propagation makes
+  that same closed guard visible even to detached cancellation-suppressing control flow.
+- New provider completions, every OpenAI/DeepSeek SDK retry attempt, MCP tool calls, and attachment
+  reads check the guard immediately before external invocation. A detached task may finish internal
+  cleanup, but cannot begin new provider/tool cost after the vote boundary.
+- Detached orchestration starts require a capacity reservation. At most 64 running/detached attempts
+  are globally retained; capacity exhaustion fails closed without starting another coroutine. Late
+  tasks remain strongly referenced, their result/exception is consumed, and the callback removes
+  them on completion. A bounded diagnostic exposes tracked/reserved/overflow counts without private
+  task data.
+- Legacy synchronous one- and two-argument factories execute on the caller event loop, preserving
+  loop-affine behavior. Production composition explicitly opts into worker offload, so its internal
+  synchronous notebook/orchestrator construction remains inside the absolute vote envelope and a
+  late factory result can never start `Orchestrator.run`.
+
+### Fix-round files
+
+- `src/gaia_agent/orchestrator.py`: cancellation accounting refresh, authenticated usage accessor,
+  invocation-deadline scope, and tool/attachment boundary checks.
+- `src/gaia_agent/reliability.py`: shared absolute invocation guard and task-local propagation.
+- `src/gaia_agent/runner.py`: authenticated cancellation accounting floor, provider guard,
+  production-only factory offload, and bounded detached-attempt registry.
+- `src/gaia_agent/providers/openai.py` and `src/gaia_agent/providers/deepseek.py`: reject each new SDK
+  retry attempt after the vote deadline.
+- `tests/test_cli_e2e.py`: real cancellation accounting, legacy loop affinity, production slow-factory
+  deadline, post-deadline provider/tool rejection, and registry bound/cleanup regressions.
+
+### Fix-round compatibility ruling / cost if wrong
+
+- **Legacy injected synchronous factories retain caller-loop execution; only production composition
+  opts into worker offload.** This preserves the existing one-/two-argument injection contract and
+  permits loop-affine setup such as `asyncio.get_running_loop()`. Cost if wrong: an untrusted legacy
+  synchronous factory can still block its caller beyond the configured vote deadline. This is the
+  explicit compatibility limitation requested by the review; production construction remains
+  bounded.
+
+### Fix-round concerns and fundamental limit
+
+- No open blocker. Python cannot forcibly terminate an arbitrary coroutine that suppresses
+  cancellation, nor prevent arbitrary non-agent side effects already written into that coroutine.
+  The enforceable production boundary is therefore external cost initiation: after deadline, no new
+  GAIA provider call, provider retry, MCP tool call, or attachment read may begin. In-flight bounded
+  operations still receive cancellation/stage deadlines, and lingering internal cleanup is observed
+  under bounded registry capacity.
+- A timed-out production factory's underlying worker may complete synchronous construction after the
+  runner returns, but its returned Orchestrator is discarded and never run. Legacy sync factory
+  blocking remains the documented compatibility tradeoff above.
+- Deadline and registry diagnostics contain only counts/timing state. No model change, secret,
+  prompt, question, candidate, evidence, URL, raw provider error, public audit expansion, or Langfuse
+  metadata expansion was introduced.
+
+### Review-fix RED/GREEN evidence
+
+Read-only adversarial review found that production factory wrappers were not yet part of bounded
+detached observation. External cancellation could also leave the vote guard open. Both cases were
+converted to regressions before the review fix:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_runner_cancellation_during_production_factory_is_observed_and_closes_guard \
+  tests/test_cli_e2e.py::test_slow_production_factories_share_bounded_detached_capacity
+FF                                                                       [100%]
+
+assert created_deadlines[0].closed is True
+assert factory_calls == 1
+2 failed
+```
+
+After adding an outer vote `finally` and reserving/tracking offloaded production factory wrappers
+without canceling away their underlying thread lifetime:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_runner_cancellation_during_production_factory_is_observed_and_closes_guard \
+  tests/test_cli_e2e.py::test_slow_production_factories_share_bounded_detached_capacity
+..                                                                       [100%]
+```
+
+Final expanded focused slice, including all original round-two and review regressions:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_real_cancelled_resume_refreshes_authenticated_usage_before_reraise \
+  tests/test_cli_e2e.py::test_runner_legacy_sync_factory_stays_on_caller_event_loop \
+  tests/test_cli_e2e.py::test_runner_production_offloaded_factory_stays_inside_vote_deadline \
+  tests/test_cli_e2e.py::test_runner_cancellation_during_production_factory_is_observed_and_closes_guard \
+  tests/test_cli_e2e.py::test_slow_production_factories_share_bounded_detached_capacity \
+  tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_tool_call_after_vote_deadline \
+  tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_provider_call_after_vote_deadline \
+  tests/test_cli_e2e.py::test_detached_attempt_registry_is_bounded_and_cleans_up
+.........                                                                [100%]
+```
+
+The shared capacity now covers both orchestration attempts and offloaded production construction.
+Factory timeout/cancellation leaves the worker wrapper strongly observed until the underlying thread
+finishes, and late construction results are consumed without ever starting the Orchestrator. An
+outer `finally` closes the absolute invocation boundary on every normal, exceptional, and caller-
+cancellation exit from `_run_vote`.
+
+Post-review impacted suites and full-suite verification:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py tests/test_orchestrator.py \
+  tests/test_openai_provider.py tests/test_deepseek_provider.py
+........................................................................ [ 36%]
+........................................................................ [ 73%]
+....................................................                     [100%]
+
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+........................................................................ [ 11%]
+........................................................................ [ 22%]
+........................................................................ [ 34%]
+........................................................................ [ 45%]
+........................................................................ [ 57%]
+........................................................................ [ 68%]
+........................................................................ [ 79%]
+........................................................................ [ 91%]
+.......................................................                  [100%]
+```
+
+Final review also reproduced a test-only scheduling race: the 20 ms boundary cases constructed a
+real LangGraph inside the timed factory, so a loaded suite could expire before Critic entered. The
+Orchestrators are now preconstructed, each test asserts a Critic-start handshake, and the runner
+envelope is 50 ms while cancellation is still suppressed for 20 ms before the forbidden call.
+
+```text
+for run in 1 2 3 4 5; do
+  UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+    tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_tool_call_after_vote_deadline \
+    tests/test_cli_e2e.py::test_real_detached_orchestrator_cannot_start_provider_call_after_vote_deadline
+done
+..                                                                       [100%]
+..                                                                       [100%]
+..                                                                       [100%]
+..                                                                       [100%]
+..                                                                       [100%]
+```
+
+Final read-only re-review: **no Critical or Important findings; Ready: Yes.**

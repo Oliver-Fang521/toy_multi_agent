@@ -21,6 +21,7 @@ from gaia_agent.providers.base import (
 from gaia_agent.reliability import (
     ProviderTransientExhaustedError,
     RetryPolicy,
+    ensure_current_invocation_allowed,
     is_transient_provider_error,
     retry_delay,
     transient_provider_error_category,
@@ -302,6 +303,7 @@ class OpenAIProvider:
     async def _create_with_retry(self, **kwargs: Any) -> Any:
         for attempt in range(1, self._retry_policy.max_attempts + 1):
             try:
+                ensure_current_invocation_allowed()
                 retry_metadata = _CURRENT_RETRY_METADATA.get()
                 if retry_metadata is not None:
                     retry_metadata.attempt_count += 1
