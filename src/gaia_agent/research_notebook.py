@@ -326,7 +326,7 @@ class ResearchNotebook:
         try:
             task_directory = os.open(
                 self.task_id,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                _directory_open_flags(),
                 dir_fd=root_directory,
             )
         finally:
@@ -417,15 +417,42 @@ def _reject_symlink_components(path: Path) -> None:
 
 
 def _open_directory(path: Path) -> int:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
-    opened_state = os.fstat(descriptor)
-    if not stat.S_ISDIR(opened_state.st_mode):
+    absolute = path.absolute()
+    descriptor = os.open(absolute.anchor, _directory_open_flags())
+    try:
+        _assert_open_directory(descriptor)
+        for component in absolute.parts[1:]:
+            next_descriptor = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=descriptor,
+            )
+            try:
+                _assert_open_directory(next_descriptor)
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            previous_descriptor = descriptor
+            descriptor = next_descriptor
+            os.close(previous_descriptor)
+        return descriptor
+    except BaseException:
         os.close(descriptor)
+        raise
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _assert_open_directory(descriptor: int) -> None:
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
         raise ValueError("notebook storage path must be a directory")
-    return descriptor
 
 
 def _is_symlink_entry(directory: int, filename: str) -> bool:

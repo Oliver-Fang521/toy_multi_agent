@@ -750,6 +750,106 @@ def test_stage_checkpoint_write_cannot_follow_a_swapped_parent_directory(
     assert notebook.load_stage_checkpoint() == checkpoint
 
 
+def test_stage_checkpoint_read_cannot_follow_a_swapped_intermediate_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ancestor = tmp_path / "ancestor"
+    notebook = ResearchNotebook(
+        ancestor / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    checkpoint = _stage_checkpoint()
+    notebook.save_stage_checkpoint(checkpoint)
+    task_root = notebook.root / "task-1"
+    detached = tmp_path / "ancestor.detached"
+    outside_ancestor = tmp_path / "outside-ancestor"
+    outside_task = outside_ancestor / "private" / "task-1"
+    outside_task.mkdir(mode=0o700, parents=True)
+    outside_checkpoint = outside_task / ".stage-checkpoint.json"
+    outside_checkpoint.write_bytes((task_root / ".stage-checkpoint.json").read_bytes())
+    outside_checkpoint.chmod(0o600)
+    original_assert = ResearchNotebook._assert_private_directory
+    swapped = False
+
+    def swap_after_validation(path: Path) -> None:
+        nonlocal swapped
+        original_assert(path)
+        if path == task_root and not swapped:
+            swapped = True
+            ancestor.rename(detached)
+            ancestor.symlink_to(outside_ancestor, target_is_directory=True)
+
+    monkeypatch.setattr(
+        ResearchNotebook,
+        "_assert_private_directory",
+        staticmethod(swap_after_validation),
+    )
+
+    assert notebook.load_stage_checkpoint() is None
+
+    ancestor.unlink()
+    detached.rename(ancestor)
+    monkeypatch.setattr(
+        ResearchNotebook,
+        "_assert_private_directory",
+        staticmethod(original_assert),
+    )
+    assert notebook.load_stage_checkpoint() == checkpoint
+
+
+def test_stage_checkpoint_write_cannot_follow_a_swapped_intermediate_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ancestor = tmp_path / "ancestor"
+    notebook = ResearchNotebook(
+        ancestor / "private",
+        "task-1",
+        run_generation="run-1",
+    )
+    checkpoint = _stage_checkpoint()
+    notebook.save_stage_checkpoint(checkpoint)
+    replacement = checkpoint.model_copy(
+        update={"candidate": "replacement", "candidate_origins": {1: "replacement"}}
+    )
+    task_root = notebook.root / "task-1"
+    detached = tmp_path / "ancestor.detached"
+    outside_ancestor = tmp_path / "outside-ancestor"
+    outside_task = outside_ancestor / "private" / "task-1"
+    outside_task.mkdir(mode=0o700, parents=True)
+    original_assert = ResearchNotebook._assert_private_directory
+    swapped = False
+
+    def swap_after_validation(path: Path) -> None:
+        nonlocal swapped
+        original_assert(path)
+        if path == task_root and not swapped:
+            swapped = True
+            ancestor.rename(detached)
+            ancestor.symlink_to(outside_ancestor, target_is_directory=True)
+
+    monkeypatch.setattr(
+        ResearchNotebook,
+        "_assert_private_directory",
+        staticmethod(swap_after_validation),
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        notebook.save_stage_checkpoint(replacement)
+
+    assert not (outside_task / ".stage-checkpoint.json").exists()
+    ancestor.unlink()
+    detached.rename(ancestor)
+    monkeypatch.setattr(
+        ResearchNotebook,
+        "_assert_private_directory",
+        staticmethod(original_assert),
+    )
+    assert notebook.load_stage_checkpoint() == checkpoint
+
+
 def _notebook_entry(tool: str, result: dict[str, object], signature: str) -> NotebookEntry:
     return NotebookEntry(
         signature=signature,
