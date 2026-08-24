@@ -90,6 +90,23 @@ def test_resume_rejects_a_different_manifest(tmp_path) -> None:
         RunStore.open(tmp_path, manifest_for(["task-2"]))
 
 
+def test_manifest_allows_stage_budget_limits() -> None:
+    manifest = RunManifest.model_validate(
+        {
+            **manifest_for(["task-1"]).model_dump(),
+            "limits": {
+                "planner_timeout_seconds": 12.0,
+                "specialist_timeout_seconds": 70.0,
+                "critic_timeout_seconds": 18.0,
+                "specialist_max_tool_calls": 7,
+                "critic_max_tool_calls": 2,
+            },
+        }
+    )
+
+    assert manifest.limits["specialist_max_tool_calls"] == 7
+
+
 def test_duplicate_prediction_is_rejected(tmp_path, prediction) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
     store.append(prediction)

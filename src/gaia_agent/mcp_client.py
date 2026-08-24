@@ -405,6 +405,7 @@ class MCPToolClient:
             "GAIA_MODEL": self._config.model,
             "GAIA_REASONING_EFFORT": self._config.reasoning_effort,
             "GAIA_TIMEOUT_SECONDS": str(self._config.timeout_seconds),
+            "GAIA_SPECIALIST_TIMEOUT_SECONDS": str(self._config.specialist_timeout_seconds),
             "GAIA_PROVIDER_MAX_ATTEMPTS": str(self._config.provider_max_attempts),
             "GAIA_PROVIDER_BACKOFF_BASE": str(self._config.provider_backoff_base),
             "GAIA_SEARCH_CIRCUIT_COOLDOWN": str(self._config.search_circuit_cooldown),

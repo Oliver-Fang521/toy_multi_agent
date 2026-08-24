@@ -21,6 +21,11 @@ class RunConfig(BaseModel):
     max_steps: int = 8
     max_tool_calls: int = 24
     timeout_seconds: float = 300.0
+    planner_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    specialist_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    critic_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    specialist_max_tool_calls: int = Field(ge=0)
+    critic_max_tool_calls: int = Field(ge=0)
     votes: int = 1
     output_dir: Path = Path("results/gaia-15-seed42")
     resume: bool = False
@@ -35,6 +40,23 @@ class RunConfig(BaseModel):
     langfuse_output_cost_per_million: Decimal | None = Field(
         default=None, ge=0, le=Decimal(1_000_000), allow_inf_nan=False
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_stage_budgets(cls, values: object) -> object:
+        if not isinstance(values, dict):
+            return values
+        values = values.copy()
+        timeout = float(values.get("timeout_seconds", 300.0))
+        values.setdefault("planner_timeout_seconds", timeout * 0.10)
+        values.setdefault("specialist_timeout_seconds", timeout * 0.70)
+        values.setdefault("critic_timeout_seconds", timeout * 0.20)
+
+        calls = int(values.get("max_tool_calls", 24))
+        critic_calls = 0 if calls == 1 else max(1, calls // 4)
+        values.setdefault("specialist_max_tool_calls", calls - critic_calls)
+        values.setdefault("critic_max_tool_calls", critic_calls)
+        return values
 
     @field_validator("langfuse_input_cost_per_million", "langfuse_output_cost_per_million")
     @classmethod
@@ -51,6 +73,15 @@ class RunConfig(BaseModel):
             raise ValueError("sample_size must be at least 3 and divisible by 3")
         if self.votes < 1 or self.votes % 2 == 0:
             raise ValueError("votes must be a positive odd integer")
+        if (
+            self.planner_timeout_seconds
+            + self.specialist_timeout_seconds
+            + self.critic_timeout_seconds
+            > self.timeout_seconds
+        ):
+            raise ValueError("stage timeout budgets must fit within timeout_seconds")
+        if self.specialist_max_tool_calls + self.critic_max_tool_calls > self.max_tool_calls:
+            raise ValueError("stage tool budgets must fit within max_tool_calls")
         return self
 
     @classmethod
@@ -83,5 +114,14 @@ class RunConfig(BaseModel):
                 "LANGFUSE_OUTPUT_COST_PER_MILLION"
             ),
         }
+        for field_name, environment_name in (
+            ("planner_timeout_seconds", "GAIA_PLANNER_TIMEOUT_SECONDS"),
+            ("specialist_timeout_seconds", "GAIA_SPECIALIST_TIMEOUT_SECONDS"),
+            ("critic_timeout_seconds", "GAIA_CRITIC_TIMEOUT_SECONDS"),
+            ("specialist_max_tool_calls", "GAIA_SPECIALIST_MAX_TOOL_CALLS"),
+            ("critic_max_tool_calls", "GAIA_CRITIC_MAX_TOOL_CALLS"),
+        ):
+            if value := os.environ.get(environment_name):
+                values[field_name] = value
         values.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(values)

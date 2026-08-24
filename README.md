@@ -62,6 +62,11 @@ environment variable, which overrides the built-in default.
 | `--max-steps` | `GAIA_MAX_STEPS` | `8` |
 | `--max-tool-calls` | `GAIA_MAX_TOOL_CALLS` | `24` |
 | `--timeout-seconds` | `GAIA_TIMEOUT_SECONDS` | `300` |
+| `--planner-timeout-seconds` | `GAIA_PLANNER_TIMEOUT_SECONDS` | 10% of `GAIA_TIMEOUT_SECONDS` |
+| `--specialist-timeout-seconds` | `GAIA_SPECIALIST_TIMEOUT_SECONDS` | 70% of `GAIA_TIMEOUT_SECONDS` |
+| `--critic-timeout-seconds` | `GAIA_CRITIC_TIMEOUT_SECONDS` | 20% of `GAIA_TIMEOUT_SECONDS` |
+| `--specialist-max-tool-calls` | `GAIA_SPECIALIST_MAX_TOOL_CALLS` | `GAIA_MAX_TOOL_CALLS` minus Critic reserve |
+| `--critic-max-tool-calls` | `GAIA_CRITIC_MAX_TOOL_CALLS` | one quarter of `GAIA_MAX_TOOL_CALLS` (minimum 1, or 0 when total is 1) |
 | `--votes` | `GAIA_VOTES` | `1` |
 | `--output-dir` | `GAIA_OUTPUT_DIR` | `results/gaia-15-seed42` |
 | `--resume` / `--no-resume` | `GAIA_RESUME` | `false` |
@@ -80,8 +85,10 @@ are omitted), so `--resume` rejects a run whose behavior-defining configuration 
 | `LANGFUSE_INPUT_COST_PER_MILLION` | unset | Optional non-negative finite input-token rate, capped at 1,000,000 |
 | `LANGFUSE_OUTPUT_COST_PER_MILLION` | unset | Optional non-negative finite output-token rate, capped at 1,000,000 |
 
-The primary provider is the OpenAI Responses adapter. Hosted web search is attempted first, then
-the configured Serper and SerpAPI fallbacks; each provider is retried within the configured budget
+Stage timeout budgets must be positive and total no more than the global timeout. Specialist and
+Critic tool budgets are non-negative and total no more than the global tool limit. The primary
+provider is the OpenAI Responses adapter. Hosted web search is attempted first, then Serper when
+`SERPER_API_KEY` is configured, followed by the optional SerpAPI fallback; each provider is retried within the configured budget
 and opens a short circuit after repeated failures. The model adapter retries recoverable connection,
 timeout, rate-limit, and internal-server errors in place; structured stage responses get one local
 schema/semantic repair; attachment-ineligible visual routes normalize before dispatch; and the

@@ -25,6 +25,54 @@ def test_run_config_defaults_to_luna_max_in_direct_and_environment_construction(
     assert (from_env.model, from_env.reasoning_effort) == ("gpt-5.6-luna", "max")
 
 
+def test_stage_budgets_are_derived_from_global_limits() -> None:
+    config = RunConfig(
+        openai_api_key="sk-test",
+        hf_token="hf-test",
+        timeout_seconds=300,
+        max_tool_calls=24,
+    )
+
+    assert (
+        config.planner_timeout_seconds,
+        config.specialist_timeout_seconds,
+        config.critic_timeout_seconds,
+    ) == (30.0, 210.0, 60.0)
+    assert (config.specialist_max_tool_calls, config.critic_max_tool_calls) == (18, 6)
+
+
+def test_stage_budgets_must_fit_global_limits() -> None:
+    with pytest.raises(ValidationError):
+        RunConfig.model_validate(
+            {
+                "openai_api_key": "sk-test",
+                "hf_token": "hf-test",
+                "timeout_seconds": 300,
+                "planner_timeout_seconds": 30,
+                "specialist_timeout_seconds": 240,
+                "critic_timeout_seconds": 60,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"planner_timeout_seconds": 0},
+        {"specialist_timeout_seconds": 0},
+        {"critic_timeout_seconds": 0},
+        {"specialist_max_tool_calls": -1},
+        {"critic_max_tool_calls": -1},
+        {"max_tool_calls": 3, "specialist_max_tool_calls": 3, "critic_max_tool_calls": 1},
+    ],
+)
+def test_stage_budget_values_are_bounded(values: dict[str, int]) -> None:
+    with pytest.raises(ValidationError):
+        RunConfig.model_validate(
+            {"openai_api_key": "sk-test", "hf_token": "hf-test", **values}
+        )
+
+
 def test_run_config_redacts_secrets() -> None:
     config = RunConfig(openai_api_key="sk-secret", hf_token="hf_secret")
     assert "sk-secret" not in repr(config)

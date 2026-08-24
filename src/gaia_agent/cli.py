@@ -26,6 +26,15 @@ def evaluate(
     max_steps: Annotated[int | None, typer.Option("--max-steps")] = None,
     max_tool_calls: Annotated[int | None, typer.Option("--max-tool-calls")] = None,
     timeout_seconds: Annotated[float | None, typer.Option("--timeout-seconds")] = None,
+    planner_timeout_seconds: Annotated[float | None, typer.Option("--planner-timeout-seconds")] = None,
+    specialist_timeout_seconds: Annotated[
+        float | None, typer.Option("--specialist-timeout-seconds")
+    ] = None,
+    critic_timeout_seconds: Annotated[float | None, typer.Option("--critic-timeout-seconds")] = None,
+    specialist_max_tool_calls: Annotated[
+        int | None, typer.Option("--specialist-max-tool-calls")
+    ] = None,
+    critic_max_tool_calls: Annotated[int | None, typer.Option("--critic-max-tool-calls")] = None,
     output_dir: Annotated[Path | None, typer.Option("--output-dir")] = None,
     resume: Annotated[bool | None, typer.Option("--resume/--no-resume")] = None,
 ) -> None:
@@ -48,6 +57,11 @@ def evaluate(
             max_steps=max_steps,
             max_tool_calls=max_tool_calls,
             timeout_seconds=timeout_seconds,
+            planner_timeout_seconds=planner_timeout_seconds,
+            specialist_timeout_seconds=specialist_timeout_seconds,
+            critic_timeout_seconds=critic_timeout_seconds,
+            specialist_max_tool_calls=specialist_max_tool_calls,
+            critic_max_tool_calls=critic_max_tool_calls,
             output_dir=output_dir,
             resume=resume,
         )

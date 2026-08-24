@@ -58,6 +58,21 @@ def test_mcp_server_env_propagates_openai_base_url(
     assert client._minimal_server_env()["OPENAI_BASE_URL"] == "https://api.deepseek.com"
 
 
+def test_mcp_server_env_propagates_specialist_search_budget(tmp_path: Path) -> None:
+    config = RunConfig(
+        openai_api_key="openai-test-secret",
+        hf_token="hf-test-secret",
+        sample_size=3,
+        timeout_seconds=100,
+        specialist_timeout_seconds=70,
+        output_dir=tmp_path / "results",
+    )
+
+    env = MCPToolClient(task_root=tmp_path, config=config)._minimal_server_env()
+
+    assert env["GAIA_SPECIALIST_TIMEOUT_SECONDS"] == "70.0"
+
+
 @pytest.mark.asyncio
 async def test_settings_chain_classifies_transient_openai_failure_and_uses_serper_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2624,13 +2639,19 @@ async def test_build_server_exposes_exact_public_tool_plane(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
-    ("global_timeout", "expected_webpage_timeout", "expected_hosted_web_timeout"),
-    [(300.0, 20.0, 60.0), (12.5, 12.5, 12.5)],
+    (
+        "global_timeout",
+        "specialist_timeout",
+        "expected_webpage_timeout",
+        "expected_hosted_web_timeout",
+    ),
+    [(300.0, 210.0, 20.0, 60.0), (12.5, 8.75, 12.5, 8.75)],
 )
 def test_settings_caps_direct_webpage_timeout_without_shortening_hosted_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     global_timeout: float,
+    specialist_timeout: float,
     expected_webpage_timeout: float,
     expected_hosted_web_timeout: float,
 ) -> None:
@@ -2641,6 +2662,7 @@ def test_settings_caps_direct_webpage_timeout_without_shortening_hosted_tools(
     monkeypatch.setenv("GAIA_TASK_ROOT", str(tmp_path))
     monkeypatch.setenv("GAIA_ATTACHMENTS", "[]")
     monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", str(global_timeout))
+    monkeypatch.setenv("GAIA_SPECIALIST_TIMEOUT_SECONDS", str(specialist_timeout))
     monkeypatch.delenv("GAIA_MCP_FAKE_BACKEND", raising=False)
     monkeypatch.setattr(mcp_server, "HTTPWebReader", CapturingWebReader)
     monkeypatch.setattr(
@@ -2655,6 +2677,8 @@ def test_settings_caps_direct_webpage_timeout_without_shortening_hosted_tools(
     assert isinstance(settings.backend, HostedOpenAIBackend)
     assert settings.backend._timeout_seconds == global_timeout
     assert settings.backend._web_search_timeout_seconds == expected_hosted_web_timeout
+    assert isinstance(settings.search_provider, SearchProviderChain)
+    assert settings.search_provider._operation_timeout_seconds == specialist_timeout
 
 
 def test_fake_settings_caps_direct_webpage_timeout(

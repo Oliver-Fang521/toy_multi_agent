@@ -1155,6 +1155,9 @@ def _settings_from_env() -> MCPServerSettings:
     serper_api_key = os.environ.get("SERPER_API_KEY", "")
     serpapi_api_key = os.environ.get("SERPAPI_API_KEY", "")
     timeout_seconds = float(os.environ.get("GAIA_TIMEOUT_SECONDS", "300"))
+    specialist_timeout_seconds = float(
+        os.environ.get("GAIA_SPECIALIST_TIMEOUT_SECONDS", str(timeout_seconds))
+    )
     provider_retry_policy = RetryPolicy(
         max_attempts=int(os.environ.get("GAIA_PROVIDER_MAX_ATTEMPTS", "4")),
         base_delay_seconds=float(os.environ.get("GAIA_PROVIDER_BACKOFF_BASE", "0.5")),
@@ -1163,7 +1166,7 @@ def _settings_from_env() -> MCPServerSettings:
     fake_backend = os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1"
     fallback_provider_count = int(bool(serper_api_key)) + int(bool(serpapi_api_key))
     hosted_web_search_timeout_seconds = min(
-        timeout_seconds / (fallback_provider_count + 1),
+        specialist_timeout_seconds / (fallback_provider_count + 1),
         MAX_HOSTED_WEB_SEARCH_TIMEOUT_SECONDS,
     )
     if fake_backend:
@@ -1186,13 +1189,17 @@ def _settings_from_env() -> MCPServerSettings:
         if serper_api_key:
             search_providers.append(
                 SerperSearchProvider(
-                    serper_api_key, search_client, timeout_seconds=min(timeout_seconds, 20.0)
+                    serper_api_key,
+                    search_client,
+                    timeout_seconds=min(specialist_timeout_seconds, 20.0),
                 )
             )
         if serpapi_api_key:
             search_providers.append(
                 SerpAPISearchProvider(
-                    serpapi_api_key, search_client, timeout_seconds=min(timeout_seconds, 20.0)
+                    serpapi_api_key,
+                    search_client,
+                    timeout_seconds=min(specialist_timeout_seconds, 20.0),
                 )
             )
         search_provider = SearchProviderChain(
@@ -1200,7 +1207,7 @@ def _settings_from_env() -> MCPServerSettings:
             provider_retry_policy,
             time.monotonic,
             circuit_cooldown_seconds=search_circuit_cooldown,
-            operation_timeout_seconds=timeout_seconds,
+            operation_timeout_seconds=specialist_timeout_seconds,
         )
     return MCPServerSettings(
         task_root=task_root,

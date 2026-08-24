@@ -682,7 +682,7 @@ def test_new_run_at_same_path_rotates_private_notebook_generation(tmp_path: Path
     assert '"event_type":"tool_call_restored"' not in second_audit
 
 
-def test_manifest_persists_reliability_limits_for_safe_resume(tmp_path: Path) -> None:
+def test_manifest_persists_stage_budgets_for_safe_resume(tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     tasks, revision = _fixture_tasks()
     runner = build_runner(
@@ -693,6 +693,11 @@ def test_manifest_persists_reliability_limits_for_safe_resume(tmp_path: Path) ->
             private_notebook_max_bytes=80_000,
             stage_context_max_bytes=32_768,
             search_circuit_cooldown=90.0,
+            planner_timeout_seconds=12,
+            specialist_timeout_seconds=70,
+            critic_timeout_seconds=18,
+            specialist_max_tool_calls=7,
+            critic_max_tool_calls=2,
             langfuse_input_cost_per_million="0.25",
             langfuse_output_cost_per_million="1.50",
         ),
@@ -718,6 +723,11 @@ def test_manifest_persists_reliability_limits_for_safe_resume(tmp_path: Path) ->
         "private_notebook_max_bytes": 80_000,
         "stage_context_max_bytes": 32_768,
         "search_circuit_cooldown": 90.0,
+        "planner_timeout_seconds": 12.0,
+        "specialist_timeout_seconds": 70.0,
+        "critic_timeout_seconds": 18.0,
+        "specialist_max_tool_calls": 7,
+        "critic_max_tool_calls": 2,
         "langfuse_input_cost_per_million": "0.25",
         "langfuse_output_cost_per_million": "1.50",
     }
@@ -791,6 +801,11 @@ def test_cli_uses_run_config_environment_when_options_are_absent(
     monkeypatch.setenv("GAIA_MAX_STEPS", "3")
     monkeypatch.setenv("GAIA_MAX_TOOL_CALLS", "7")
     monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("GAIA_PLANNER_TIMEOUT_SECONDS", "1.25")
+    monkeypatch.setenv("GAIA_SPECIALIST_TIMEOUT_SECONDS", "8.75")
+    monkeypatch.setenv("GAIA_CRITIC_TIMEOUT_SECONDS", "2.5")
+    monkeypatch.setenv("GAIA_SPECIALIST_MAX_TOOL_CALLS", "5")
+    monkeypatch.setenv("GAIA_CRITIC_MAX_TOOL_CALLS", "2")
     monkeypatch.setenv("GAIA_VOTES", "3")
     monkeypatch.setenv("GAIA_OUTPUT_DIR", str(tmp_path / "env-run"))
     monkeypatch.setenv("GAIA_RESUME", "true")
@@ -809,6 +824,11 @@ def test_cli_uses_run_config_environment_when_options_are_absent(
     assert config.max_steps == 3
     assert config.max_tool_calls == 7
     assert config.timeout_seconds == 12.5
+    assert config.planner_timeout_seconds == 1.25
+    assert config.specialist_timeout_seconds == 8.75
+    assert config.critic_timeout_seconds == 2.5
+    assert config.specialist_max_tool_calls == 5
+    assert config.critic_max_tool_calls == 2
     assert config.votes == 3
     assert config.output_dir == tmp_path / "env-run"
     assert config.resume is True
@@ -824,6 +844,11 @@ def test_explicit_cli_options_override_run_config_environment(
     monkeypatch.setenv("GAIA_MAX_STEPS", "2")
     monkeypatch.setenv("GAIA_MAX_TOOL_CALLS", "3")
     monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", "4")
+    monkeypatch.setenv("GAIA_PLANNER_TIMEOUT_SECONDS", "0.4")
+    monkeypatch.setenv("GAIA_SPECIALIST_TIMEOUT_SECONDS", "2.8")
+    monkeypatch.setenv("GAIA_CRITIC_TIMEOUT_SECONDS", "0.8")
+    monkeypatch.setenv("GAIA_SPECIALIST_MAX_TOOL_CALLS", "2")
+    monkeypatch.setenv("GAIA_CRITIC_MAX_TOOL_CALLS", "1")
     monkeypatch.setenv("GAIA_VOTES", "1")
     captured: list[RunConfig] = []
     _inject_capturing_runner(monkeypatch, captured)
@@ -842,6 +867,16 @@ def test_explicit_cli_options_override_run_config_environment(
             "9",
             "--timeout-seconds",
             "20",
+            "--planner-timeout-seconds",
+            "2",
+            "--specialist-timeout-seconds",
+            "14",
+            "--critic-timeout-seconds",
+            "4",
+            "--specialist-max-tool-calls",
+            "6",
+            "--critic-max-tool-calls",
+            "3",
             "--votes",
             "3",
             "--output-dir",
@@ -857,6 +892,11 @@ def test_explicit_cli_options_override_run_config_environment(
     assert config.max_steps == 5
     assert config.max_tool_calls == 9
     assert config.timeout_seconds == 20
+    assert config.planner_timeout_seconds == 2
+    assert config.specialist_timeout_seconds == 14
+    assert config.critic_timeout_seconds == 4
+    assert config.specialist_max_tool_calls == 6
+    assert config.critic_max_tool_calls == 3
     assert config.votes == 3
     assert config.output_dir == tmp_path / "cli-run"
     assert config.resume is True
