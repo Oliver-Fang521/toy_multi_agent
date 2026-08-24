@@ -281,13 +281,18 @@ def _is_safe_source_url(value: str | None) -> bool:
         or _has_sensitive_url_component(parsed.fragment)
     ):
         return False
-    normalized_hostname = hostname.rstrip(".").casefold()
+    try:
+        normalized_hostname = hostname.encode("idna").decode("ascii").rstrip(".").casefold()
+    except UnicodeError:
+        return False
+    if not normalized_hostname:
+        return False
     if normalized_hostname == "localhost" or normalized_hostname.endswith(".localhost"):
         return False
     try:
         address = ipaddress.ip_address(normalized_hostname)
     except ValueError:
-        return True
+        return not _is_ambiguous_ipv4_hostname(normalized_hostname)
     return (
         address.is_global
         and not address.is_private
@@ -296,6 +301,14 @@ def _is_safe_source_url(value: str | None) -> bool:
         and not address.is_multicast
         and not address.is_reserved
         and not address.is_unspecified
+    )
+
+
+def _is_ambiguous_ipv4_hostname(hostname: str) -> bool:
+    parts = hostname.split(".")
+    return bool(parts) and all(
+        part.isdigit() or bool(re.fullmatch(r"0x[0-9a-f]+", part))
+        for part in parts
     )
 
 
