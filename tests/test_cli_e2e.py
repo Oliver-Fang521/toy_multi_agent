@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import shutil
+import threading
+import time
 from collections import defaultdict, deque
 from datetime import UTC, datetime
 from pathlib import Path
@@ -137,12 +139,21 @@ class _TimedOrchestratorFactory:
         return TimedOrchestrator()
 
 
-def _checkpoint_audit_event(cursor: str) -> AuditEvent:
+def _checkpoint_audit_event(
+    cursor: str,
+    *,
+    candidate_present: bool = False,
+) -> AuditEvent:
     return AuditEvent(
         sequence=1,
         event_type="checkpoint_saved",
         timestamp=datetime.now(UTC),
-        payload={"cursor": cursor, "logical_tool_calls": 0, "step_count": 1},
+        payload={
+            "cursor": cursor,
+            "logical_tool_calls": 0,
+            "step_count": 1,
+            "candidate_present": candidate_present,
+        },
     )
 
 
@@ -758,9 +769,21 @@ def test_private_notebook_is_a_sibling_and_never_enters_public_artifacts(tmp_pat
 
     asyncio.run(runner.run())
 
-    notebook = runner._orchestrator_factory(tasks[0])._notebook
-    assert notebook is not None
-    notebook.record("unused_private_tool", {"query": sentinel}, {"private_text": sentinel})
+    first_vote_notebook = runner._orchestrator_factory(
+        tasks[0], "vote-0001"
+    )._notebook
+    second_vote_notebook = runner._orchestrator_factory(
+        tasks[0], "vote-0002"
+    )._notebook
+    assert first_vote_notebook is not None
+    assert second_vote_notebook is not None
+    assert first_vote_notebook.task_id == second_vote_notebook.task_id == tasks[0].task_id
+    assert first_vote_notebook.root != second_vote_notebook.root
+    first_vote_notebook.record(
+        "unused_private_tool",
+        {"query": sentinel},
+        {"private_text": sentinel},
+    )
 
     private_root = _private_run_root(output_dir)
     assert private_root == tmp_path / ".run.private"
@@ -1397,6 +1420,76 @@ async def test_runner_specialist_timeout_without_stable_candidate_is_terminal(
 
 
 @pytest.mark.asyncio
+async def test_runner_specialist_timeout_with_checkpoint_candidate_resumes_from_act(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    factory = _TimedOrchestratorFactory(
+        clock,
+        deque(
+            [
+                (
+                    1.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        usage=Usage(total_tokens=3),
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.TIMEOUT,
+                    ),
+                    (
+                        _checkpoint_audit_event("act", candidate_present=True),
+                        _stage_budget_audit_event("specialist", "time"),
+                        _checkpoint_audit_event(
+                            "act", candidate_present=True
+                        ).model_copy(update={"sequence": 3}),
+                    ),
+                ),
+                (
+                    1.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer="42",
+                        usage=Usage(total_tokens=5),
+                        critic_verdict="approve",
+                    ),
+                    (
+                        AuditEvent(
+                            sequence=1,
+                            event_type="checkpoint_restored",
+                            timestamp=datetime.now(UTC),
+                            payload={
+                                "cursor": "act",
+                                "logical_tool_calls": 0,
+                                "step_count": 1,
+                                "candidate_present": True,
+                            },
+                        ),
+                    ),
+                ),
+            ]
+        ),
+    )
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=10.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+
+    assert factory.calls == 2
+    assert result.prediction.answer == "42"
+    assert result.prediction.usage == Usage(total_tokens=5)
+    assert result.prediction.recovery_succeeded is True
+
+
+@pytest.mark.asyncio
 async def test_runner_checkpoint_transient_resumes_once_with_remaining_vote_budget(
     tmp_path: Path,
 ) -> None:
@@ -1469,6 +1562,273 @@ async def test_runner_checkpoint_transient_resumes_once_with_remaining_vote_budg
 
 
 @pytest.mark.asyncio
+async def test_runner_scopes_checkpoints_per_vote_but_reuses_scope_for_recovery(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    calls: list[tuple[str, int]] = []
+    attempts: defaultdict[str, int] = defaultdict(int)
+
+    def factory(active_task: GaiaTask, vote_namespace: str) -> Any:
+        assert active_task.task_id == task.task_id
+        attempts[vote_namespace] += 1
+        vote_attempt = attempts[vote_namespace]
+        calls.append((vote_namespace, vote_attempt))
+
+        class NamespacedOrchestrator:
+            audit_events: tuple[AuditEvent, ...]
+
+            def __init__(self) -> None:
+                if vote_namespace == "vote-0001" and vote_attempt == 1:
+                    self.audit_events = (
+                        _checkpoint_audit_event("verify", candidate_present=True),
+                    )
+                elif vote_namespace == "vote-0001":
+                    self.audit_events = (
+                        AuditEvent(
+                            sequence=1,
+                            event_type="checkpoint_restored",
+                            timestamp=datetime.now(UTC),
+                            payload={
+                                "cursor": "verify",
+                                "logical_tool_calls": 0,
+                                "step_count": 1,
+                                "candidate_present": True,
+                            },
+                        ),
+                    )
+                else:
+                    self.audit_events = ()
+
+            async def run(self, selected_task: GaiaTask) -> TaskPrediction:
+                assert selected_task.task_id == task.task_id
+                if vote_namespace == "vote-0001" and vote_attempt == 1:
+                    return TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        usage=Usage(total_tokens=5),
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.TIMEOUT,
+                    )
+                answer, total_tokens = {
+                    "vote-0001": ("independent-a", 7),
+                    "vote-0002": ("independent-b", 11),
+                    "vote-0003": ("independent-b", 13),
+                }[vote_namespace]
+                return TaskPrediction(
+                    task_id=task.task_id,
+                    level=task.level,
+                    answer=answer,
+                    usage=Usage(total_tokens=total_tokens),
+                    critic_verdict="approve",
+                )
+
+        return NamespacedOrchestrator()
+
+    runner = EvaluationRunner(
+        config=_config(tmp_path, votes=3, timeout_seconds=1.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+    )
+
+    result = await runner._run_task(task)
+
+    assert calls == [
+        ("vote-0001", 1),
+        ("vote-0001", 2),
+        ("vote-0002", 1),
+        ("vote-0003", 1),
+    ]
+    assert result.prediction.task_id == task.task_id
+    assert result.prediction.answer == "independent-b"
+    assert result.prediction.vote_count == 2
+    assert result.prediction.usage == Usage(total_tokens=31)
+
+
+@pytest.mark.asyncio
+async def test_runner_cancelled_restored_attempt_retains_prior_cumulative_usage(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+
+    class CancelledResumeFactory:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, active_task: GaiaTask, vote_namespace: str) -> Any:
+            assert active_task.task_id == task.task_id
+            assert vote_namespace == "vote-0001"
+            self.calls += 1
+            call_number = self.calls
+
+            class CancelledResumeOrchestrator:
+                audit_events = (
+                    (_checkpoint_audit_event("verify", candidate_present=True),)
+                    if call_number == 1
+                    else (
+                        AuditEvent(
+                            sequence=1,
+                            event_type="checkpoint_restored",
+                            timestamp=datetime.now(UTC),
+                            payload={
+                                "cursor": "verify",
+                                "logical_tool_calls": 0,
+                                "step_count": 1,
+                                "candidate_present": True,
+                            },
+                        ),
+                    )
+                )
+
+                async def run(self, selected_task: GaiaTask) -> TaskPrediction:
+                    if call_number == 1:
+                        return TaskPrediction(
+                            task_id=selected_task.task_id,
+                            level=selected_task.level,
+                            answer=None,
+                            usage=Usage(total_tokens=7),
+                            critic_verdict="not_run",
+                            error_category=TerminalErrorCategory.TIMEOUT,
+                        )
+                    await asyncio.Event().wait()
+                    raise AssertionError("unreachable")
+
+            return CancelledResumeOrchestrator()
+
+    factory = CancelledResumeFactory()
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=0.03),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+    )
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+
+    assert factory.calls == 2
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert result.prediction.usage.total_tokens >= 7
+    assert result.prediction.usage.total_tokens == 7
+
+
+@pytest.mark.asyncio
+async def test_runner_critic_budget_exhaustion_at_verify_is_terminal(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    factory = _TimedOrchestratorFactory(
+        clock,
+        deque(
+            [
+                (
+                    1.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        usage=Usage(total_tokens=4),
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.TIMEOUT,
+                    ),
+                    (
+                        _checkpoint_audit_event("verify", candidate_present=True),
+                        _stage_budget_audit_event("critic", "time"),
+                    ),
+                ),
+                (
+                    1.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer="must not run",
+                        critic_verdict="approve",
+                    ),
+                    (),
+                ),
+            ]
+        ),
+    )
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=10.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+
+    assert factory.calls == 1
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert result.prediction.attempt_number == 1
+    assert result.prediction.usage == Usage(total_tokens=4)
+
+
+@pytest.mark.asyncio
+async def test_runner_critic_provider_retry_exhaustion_at_verify_is_terminal(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    retry_event = AuditEvent(
+        sequence=2,
+        event_type="stage_retry_exhausted",
+        timestamp=datetime.now(UTC),
+        payload={"stage": "critic", "retry_category": "APIConnectionError"},
+    )
+    factory = _TimedOrchestratorFactory(
+        clock,
+        deque(
+            [
+                (
+                    1.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        usage=Usage(total_tokens=4),
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.RETRY_EXHAUSTED,
+                        retry_reason="provider_transient_exhausted",
+                        retry_category="APIConnectionError",
+                    ),
+                    (
+                        _checkpoint_audit_event("verify", candidate_present=True),
+                        retry_event,
+                    ),
+                ),
+                (
+                    1.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer="must not run",
+                        critic_verdict="approve",
+                    ),
+                    (),
+                ),
+            ]
+        ),
+    )
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=10.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+
+    assert factory.calls == 1
+    assert result.prediction.error_category == TerminalErrorCategory.RETRY_EXHAUSTED
+    assert result.prediction.attempt_number == 1
+
+
+@pytest.mark.asyncio
 async def test_runner_vote_deadline_cancels_blocking_recovery_attempt(
     tmp_path: Path,
 ) -> None:
@@ -1522,6 +1882,116 @@ async def test_runner_vote_deadline_cancels_blocking_recovery_attempt(
     assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
     assert result.prediction.attempt_number == 2
     assert result.prediction.recovery_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_deadline_does_not_wait_for_cancellation_suppression(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    cleanup_finished = asyncio.Event()
+
+    class CancellationSuppressingFactory:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.cancelled = False
+
+        def __call__(self, active_task: GaiaTask, vote_namespace: str) -> Any:
+            assert active_task.task_id == task.task_id
+            assert vote_namespace == "vote-0001"
+            self.calls += 1
+            factory = self
+
+            class CancellationSuppressingOrchestrator:
+                audit_events: tuple[AuditEvent, ...] = ()
+
+                async def run(self, selected_task: GaiaTask) -> TaskPrediction:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        factory.cancelled = True
+                        await asyncio.sleep(0.08)
+                        cleanup_finished.set()
+                    return TaskPrediction(
+                        task_id=selected_task.task_id,
+                        level=selected_task.level,
+                        answer="late result",
+                        critic_verdict="approve",
+                    )
+
+            return CancellationSuppressingOrchestrator()
+
+    factory = CancellationSuppressingFactory()
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=0.02),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+    )
+    started = asyncio.get_running_loop().time()
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.06
+    assert factory.cancelled is True
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+    await asyncio.wait_for(cleanup_finished.wait(), timeout=0.15)
+
+
+@pytest.mark.asyncio
+async def test_runner_deadline_starts_before_synchronous_factory_work(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    factory_finished = threading.Event()
+
+    class SlowFactory:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.run_calls = 0
+
+        def __call__(self, active_task: GaiaTask, vote_namespace: str) -> Any:
+            assert active_task.task_id == task.task_id
+            assert vote_namespace == "vote-0001"
+            self.calls += 1
+            time.sleep(0.08)
+            factory = self
+
+            class MustNotRunOrchestrator:
+                audit_events: tuple[AuditEvent, ...] = ()
+
+                async def run(self, selected_task: GaiaTask) -> TaskPrediction:
+                    factory.run_calls += 1
+                    return TaskPrediction(
+                        task_id=selected_task.task_id,
+                        level=selected_task.level,
+                        answer="too late",
+                        critic_verdict="approve",
+                    )
+
+            factory_finished.set()
+            return MustNotRunOrchestrator()
+
+    factory = SlowFactory()
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=0.02),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+    )
+
+    started = asyncio.get_running_loop().time()
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.06
+    assert factory.calls == 1
+    assert factory.run_calls == 0
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert result.prediction.attempt_number == 1
+    assert await asyncio.to_thread(factory_finished.wait, 0.15) is True
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
+from inspect import signature
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -56,6 +57,7 @@ from gaia_agent.research_notebook import ResearchNotebook
 from gaia_agent.scoring import question_scorer
 
 _PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
+_VOTE_NAMESPACE_PATTERN = re.compile(r"vote-[0-9]{4,}\Z")
 _TRANSIENT_EXCEPTION_NAMES = frozenset(
     {
         "APIConnectionError",
@@ -94,12 +96,16 @@ _FORBIDDEN_PUBLIC_KEYS = frozenset(
 _MAX_AGENT_TOOL_CALLS = 6
 _RECOVERY_BACKOFF_SECONDS = 0.05
 _EARLY_TRANSIENT_RATIO = 0.5
+_CANCELLATION_CLEANUP_SECONDS = 0.005
+_DETACHED_ATTEMPTS: set[asyncio.Task[Any]] = set()
 _PRIVATE_RUNTIME_AUDIT_EVENT_TYPES = frozenset(
     {
         "checkpoint_restored",
         "checkpoint_saved",
+        "evidence_repair_failed",
         "evidence_repair_completed",
         "evidence_repair_started",
+        "stage_retry_exhausted",
     }
 )
 
@@ -109,6 +115,12 @@ def _private_run_root(output_dir: Path) -> Path:
     return absolute.parent / f".{absolute.name}.private"
 
 
+def _private_vote_root(output_dir: Path, vote_namespace: str) -> Path:
+    if _VOTE_NAMESPACE_PATTERN.fullmatch(vote_namespace) is None:
+        raise ValueError("vote namespace must be an internal stable identifier")
+    return _private_run_root(output_dir) / vote_namespace
+
+
 class TaskOrchestrator(Protocol):
     audit_events: Sequence[AuditEvent]
 
@@ -116,7 +128,10 @@ class TaskOrchestrator(Protocol):
 
 
 DatasetLoader = Callable[[RunConfig], tuple[list[GaiaTask], str]]
-OrchestratorFactory = Callable[[GaiaTask], TaskOrchestrator]
+OrchestratorFactory = (
+    Callable[[GaiaTask, str], TaskOrchestrator]
+    | Callable[[GaiaTask], TaskOrchestrator]
+)
 Sleep = Callable[[float], Awaitable[None]]
 ProviderFactory = Callable[[RunConfig], "ProviderRuntime"]
 RunOpened = Callable[[RunManifest], None]
@@ -159,6 +174,9 @@ class EvaluationRunner:
         self._config = config
         self._dataset_loader = dataset_loader
         self._orchestrator_factory = orchestrator_factory
+        self._factory_accepts_vote_namespace = _accepts_vote_namespace(
+            orchestrator_factory
+        )
         self._sleep = sleep
         self._provider_name = provider_name
         self._evaluation_mode = evaluation_mode
@@ -281,7 +299,10 @@ class EvaluationRunner:
             trace = task_trace.span("vote", {"run_index": run_index}) if task_trace else None
             vote: _TaskRun | None = None
             try:
-                vote = await self._run_vote(task)
+                vote = await self._run_vote(
+                    task,
+                    vote_namespace=f"vote-{run_index + 1:04d}",
+                )
             finally:
                 status = "ok"
                 close_metadata: dict[str, object] | None = None
@@ -326,7 +347,12 @@ class EvaluationRunner:
             plan=first_plan,
         )
 
-    async def _run_vote(self, task: GaiaTask) -> _TaskRun:
+    async def _run_vote(
+        self,
+        task: GaiaTask,
+        *,
+        vote_namespace: str = "vote-0001",
+    ) -> _TaskRun:
         vote_started = self._clock()
         vote_deadline = vote_started + self._config.timeout_seconds
         audit_events: list[AuditEvent] = []
@@ -343,11 +369,22 @@ class EvaluationRunner:
                 prediction = _failure_prediction(task, TerminalErrorCategory.TIMEOUT)
                 actual_attempt_number = max(1, attempt)
                 break
-            orchestrator = self._orchestrator_factory(task)
+            orchestrator: TaskOrchestrator | None = None
             actual_attempt_number = attempt + 1
             try:
-                async with asyncio.timeout(remaining_seconds):
-                    prediction = await orchestrator.run(task)
+                orchestrator = await self._make_orchestrator_with_deadline(
+                    task,
+                    vote_namespace,
+                    remaining_seconds,
+                )
+                remaining_seconds = vote_deadline - self._clock()
+                if remaining_seconds <= 0:
+                    raise TimeoutError
+                prediction = await _run_orchestrator_with_deadline(
+                    orchestrator,
+                    task,
+                    remaining_seconds,
+                )
                 _validate_prediction_identity(prediction, task)
             except Exception as error:  # noqa: BLE001 - task isolation boundary
                 events = tuple(getattr(orchestrator, "audit_events", ()))
@@ -399,6 +436,9 @@ class EvaluationRunner:
                     specialist_timeout_is_terminal = (
                         _specialist_timeout_without_stable_candidate(events)
                     )
+                    critic_failure_is_terminal = _critic_failure_is_terminal(
+                        events
+                    )
                     minimum_recovery_seconds = self._minimum_recovery_seconds()
                     is_early_transient = (
                         not stable_checkpoint_present
@@ -408,6 +448,7 @@ class EvaluationRunner:
                     can_resume_checkpoint = (
                         stable_checkpoint_present
                         and not specialist_timeout_is_terminal
+                        and not critic_failure_is_terminal
                         and remaining_seconds > minimum_recovery_seconds
                     )
                     can_retry_fresh = (
@@ -446,7 +487,7 @@ class EvaluationRunner:
             prediction = prediction.model_copy(
                 update={
                     "usage": (
-                        prediction.usage
+                        _cumulative_recovery_usage(prior_predictions, prediction)
                         if checkpoint_restored_this_attempt
                         else _sum_usage([*prior_predictions, prediction])
                     ),
@@ -462,7 +503,7 @@ class EvaluationRunner:
         prediction = prediction.model_copy(
             update={
                 "usage": (
-                    prediction.usage
+                    _cumulative_recovery_usage(prior_predictions, prediction)
                     if checkpoint_restored_this_attempt
                     else _sum_usage([*prior_predictions, prediction])
                 ),
@@ -476,6 +517,35 @@ class EvaluationRunner:
         )
         return _TaskRun(prediction, tuple(audit_events), first_plan)
 
+    def _make_orchestrator(
+        self,
+        task: GaiaTask,
+        vote_namespace: str,
+    ) -> TaskOrchestrator:
+        if self._factory_accepts_vote_namespace:
+            namespaced_factory = self._orchestrator_factory
+            return namespaced_factory(task, vote_namespace)  # type: ignore[call-arg]
+        legacy_factory = self._orchestrator_factory
+        return legacy_factory(task)  # type: ignore[call-arg]
+
+    async def _make_orchestrator_with_deadline(
+        self,
+        task: GaiaTask,
+        vote_namespace: str,
+        remaining_seconds: float,
+    ) -> TaskOrchestrator:
+        creation = asyncio.create_task(
+            asyncio.to_thread(self._make_orchestrator, task, vote_namespace)
+        )
+        done, _ = await asyncio.wait({creation}, timeout=remaining_seconds)
+        if creation in done:
+            try:
+                return creation.result()
+            except asyncio.CancelledError as error:
+                raise TimeoutError from error
+        await _cancel_and_observe(creation)
+        raise TimeoutError
+
     def _minimum_recovery_seconds(self) -> float:
         return max(
             0.001,
@@ -484,6 +554,55 @@ class EvaluationRunner:
                 self._config.timeout_seconds * 0.1,
             ),
         )
+
+
+def _accepts_vote_namespace(factory: OrchestratorFactory) -> bool:
+    """Keep legacy injected factories working while production receives vote scope."""
+    try:
+        signature(factory).bind(object(), "vote-0001")
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+async def _run_orchestrator_with_deadline(
+    orchestrator: TaskOrchestrator,
+    task: GaiaTask,
+    remaining_seconds: float,
+) -> TaskPrediction:
+    attempt = asyncio.create_task(orchestrator.run(task))
+    done, _ = await asyncio.wait({attempt}, timeout=remaining_seconds)
+    if attempt in done:
+        try:
+            return attempt.result()
+        except asyncio.CancelledError as error:
+            raise TimeoutError from error
+
+    await _cancel_and_observe(attempt)
+    raise TimeoutError
+
+
+async def _cancel_and_observe(attempt: asyncio.Task[Any]) -> None:
+    attempt.cancel()
+    done, _ = await asyncio.wait(
+        {attempt},
+        timeout=_CANCELLATION_CLEANUP_SECONDS,
+    )
+    if attempt in done:
+        _consume_detached_attempt(attempt)
+    else:
+        _DETACHED_ATTEMPTS.add(attempt)
+        attempt.add_done_callback(_consume_detached_attempt)
+
+
+def _consume_detached_attempt(attempt: asyncio.Task[Any]) -> None:
+    _DETACHED_ATTEMPTS.discard(attempt)
+    if attempt.cancelled():
+        return
+    try:
+        attempt.exception()
+    except asyncio.CancelledError:
+        pass
 
 
 def validate_config(config: RunConfig) -> None:
@@ -644,10 +763,13 @@ def build_runner(
         nonlocal notebook_generation
         notebook_generation = manifest.started_at.astimezone(UTC).isoformat()
 
-    def orchestrator_factory(task: GaiaTask) -> Orchestrator:
+    def orchestrator_factory(
+        task: GaiaTask,
+        vote_namespace: str = "vote-0001",
+    ) -> Orchestrator:
         notebook = (
             ResearchNotebook(
-                _private_run_root(config.output_dir),
+                _private_vote_root(config.output_dir, vote_namespace),
                 task.task_id,
                 max_entry_bytes=config.private_notebook_max_bytes,
                 run_generation=notebook_generation,
@@ -883,9 +1005,9 @@ def _has_stable_checkpoint(events: Sequence[AuditEvent]) -> bool:
 def _specialist_timeout_without_stable_candidate(
     events: Sequence[AuditEvent],
 ) -> bool:
-    latest_cursor = next(
+    latest_checkpoint = next(
         (
-            event.payload.get("cursor")
+            event
             for event in reversed(events)
             if event.event_type in {"checkpoint_saved", "checkpoint_restored"}
         ),
@@ -897,7 +1019,26 @@ def _specialist_timeout_without_stable_candidate(
         and event.payload.get("reason") == "time"
         for event in events
     )
-    return specialist_timed_out and latest_cursor == "act"
+    candidate_present = bool(
+        latest_checkpoint
+        and latest_checkpoint.payload.get("candidate_present") is True
+    )
+    return specialist_timed_out and not candidate_present
+
+
+def _critic_failure_is_terminal(events: Sequence[AuditEvent]) -> bool:
+    return any(
+        (
+            event.event_type == "stage_budget_exhausted"
+            and event.payload.get("stage") == "critic"
+            and event.payload.get("reason") == "time"
+        )
+        or (
+            event.event_type == "stage_retry_exhausted"
+            and event.payload.get("stage") == "critic"
+        )
+        for event in events
+    )
 
 
 def _transient_failure_category(error: BaseException) -> str:
@@ -1007,6 +1148,22 @@ def _sum_usage(predictions: Sequence[TaskPrediction]) -> Usage:
         output_tokens=sum(item.usage.output_tokens for item in predictions),
         reasoning_tokens=sum(item.usage.reasoning_tokens for item in predictions),
         total_tokens=sum(item.usage.total_tokens for item in predictions),
+    )
+
+
+def _cumulative_recovery_usage(
+    prior_predictions: Sequence[TaskPrediction],
+    prediction: TaskPrediction,
+) -> Usage:
+    prior = _sum_usage(prior_predictions)
+    return Usage(
+        input_tokens=max(prior.input_tokens, prediction.usage.input_tokens),
+        output_tokens=max(prior.output_tokens, prediction.usage.output_tokens),
+        reasoning_tokens=max(
+            prior.reasoning_tokens,
+            prediction.usage.reasoning_tokens,
+        ),
+        total_tokens=max(prior.total_tokens, prediction.usage.total_tokens),
     )
 
 

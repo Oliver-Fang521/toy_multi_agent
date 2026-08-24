@@ -1223,6 +1223,101 @@ async def test_evidence_repair_checkpoint_links_once_through_trusted_id_assignme
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("linker_error", "failure_category"),
+    [
+        pytest.param(
+            ProviderTransientExhaustedError(
+                retry_category="APIConnectionError",
+                attempt_count=2,
+            ),
+            "provider_transient",
+            id="provider-transient",
+        ),
+        pytest.param(
+            orchestrator_module.StageBudgetExceeded("critic", "time"),
+            "time",
+            id="time-budget",
+        ),
+    ],
+)
+async def test_evidence_repair_failure_is_charged_once_and_routes_to_critic(
+    tmp_path: Path,
+    linker_error: Exception,
+    failure_category: str,
+) -> None:
+    class FailingLinker:
+        last_usage = Usage(input_tokens=3, total_tokens=3)
+
+        def __init__(self, error: Exception) -> None:
+            self.calls = 0
+            self.error = error
+
+        async def link(
+            self,
+            task: GaiaTask,
+            candidate: str,
+            cards: tuple[dict[str, Any], ...],
+        ) -> tuple[str, ...]:
+            self.calls += 1
+            raise self.error
+
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.record(
+        "web_search",
+        {"query": "cached support"},
+        {
+            "answer": "authenticated notebook support",
+            "sources": [{"url": "https://primary.example/cached"}],
+        },
+    )
+    calls: list[str] = []
+    linker = FailingLinker(linker_error)
+    critic = FakeCritic(calls, [_decision("approve", ())])
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (), "stable answer")],
+            )
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(quality_policy="benchmark"),
+        notebook=notebook,
+        evidence_linker=linker,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert linker.calls == 1
+    assert calls == ["planner", "lookup", "critic"]
+    assert critic.candidates == ["stable answer"]
+    assert prediction.answer is None
+    assert prediction.error_category == TerminalErrorCategory.MALFORMED_RESPONSE
+    assert prediction.usage == Usage(input_tokens=3, total_tokens=3)
+    repair_failures = [
+        event
+        for event in orchestrator.audit_events
+        if event.event_type == "evidence_repair_failed"
+    ]
+    assert len(repair_failures) == 1
+    assert repair_failures[0].payload == {"category": failure_category}
+    assert [
+        event.payload["cursor"]
+        for event in orchestrator.audit_events
+        if event.event_type == "checkpoint_saved"
+    ] == ["act", "evidence_repair", "verify", "verify"]
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_restore_decodes_raw_digest_hex_before_correction(
     tmp_path: Path,
 ) -> None:
@@ -1370,6 +1465,16 @@ async def test_failed_critic_refreshes_checkpoint_counters_without_partial_decis
     assert checkpoint.logical_tool_calls == 1
     assert checkpoint.stage_logical_tool_calls == StageToolCallCounts(critic=1)
     assert checkpoint.usage == Usage(input_tokens=5, total_tokens=5)
+    retry_events = [
+        event
+        for event in first.audit_events
+        if event.event_type == "stage_retry_exhausted"
+    ]
+    assert len(retry_events) == 1
+    assert retry_events[0].payload == {
+        "stage": "critic",
+        "retry_category": "APIConnectionError",
+    }
 
     second = Orchestrator(
         planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
@@ -2687,6 +2792,97 @@ async def test_specialist_timeout_routes_prior_validated_state_to_critic() -> No
     assert len(budget_events) == 1
     assert budget_events[0].payload["stage"] == "specialist"
     assert budget_events[0].payload["reason"] == "time"
+
+
+@pytest.mark.asyncio
+async def test_specialist_timeout_with_candidate_and_no_evidence_repairs_then_critic(
+    tmp_path: Path,
+) -> None:
+    class BlockingLookup:
+        last_usage = Usage()
+
+        async def run(
+            self,
+            task: GaiaTask,
+            step: PlanStep,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> AgentResult:
+            calls.append("lookup")
+            assert evidence == ()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class SelectingLinker:
+        last_usage = Usage(input_tokens=2, total_tokens=2)
+
+        def __init__(self, selected_hash: str) -> None:
+            self.selected_hash = selected_hash
+            self.calls = 0
+
+        async def link(
+            self,
+            task: GaiaTask,
+            candidate: str,
+            cards: tuple[dict[str, Any], ...],
+        ) -> tuple[str, ...]:
+            self.calls += 1
+            assert candidate == "42"
+            return (self.selected_hash,)
+
+    task = _task(question="Compute the answer")
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.record(
+        "web_search",
+        {"query": "cached support"},
+        {
+            "answer": "authenticated support for 42",
+            "sources": [{"url": "https://primary.example/cached"}],
+        },
+    )
+    linker = SelectingLinker(notebook.linkable_evidence_cards()[0]["entry_hash"])
+    calls: list[str] = []
+    critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
+    orchestrator = Orchestrator(
+        planner=FakePlanner(
+            calls,
+            _plan(SpecialistName.COMPUTATION, SpecialistName.LOOKUP),
+        ),
+        specialists={
+            SpecialistName.COMPUTATION: FakeSpecialist(
+                SpecialistName.COMPUTATION,
+                calls,
+                [_result(SpecialistName.COMPUTATION, (), "42")],
+            ),
+            SpecialistName.LOOKUP: BlockingLookup(),
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(
+            timeout_seconds=0.20,
+            planner_timeout_seconds=0.01,
+            specialist_timeout_seconds=0.04,
+            critic_timeout_seconds=0.10,
+            quality_policy="benchmark",
+        ),
+        notebook=notebook,
+        evidence_linker=linker,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert linker.calls == 1
+    assert critic.candidates == ["42"]
+    assert [[item.evidence_id for item in seen] for seen in critic.evidence_seen] == [
+        ["evidence-0001"]
+    ]
+    assert calls == ["planner", "computation", "lookup", "critic", "submit_answer"]
+    assert prediction.answer == "42"
+    assert prediction.error_category is None
 
 
 @pytest.mark.asyncio

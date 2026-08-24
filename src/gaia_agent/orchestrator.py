@@ -548,6 +548,7 @@ class Orchestrator:
                 "cursor": refreshed.cursor,
                 "logical_tool_calls": refreshed.logical_tool_calls,
                 "step_count": refreshed.step_count,
+                "candidate_present": refreshed.candidate is not None,
             },
         )
 
@@ -656,6 +657,7 @@ class Orchestrator:
                 "cursor": checkpoint.cursor,
                 "logical_tool_calls": checkpoint.logical_tool_calls,
                 "step_count": checkpoint.step_count,
+                "candidate_present": checkpoint.candidate is not None,
             },
         )
         restored: dict[str, Any] = {
@@ -745,7 +747,7 @@ class Orchestrator:
                 stage_runtime=graph_state["stage_runtime"],
             )
         except StageBudgetExceeded as error:
-            if error.reason != "time" or state.candidate is None or not state.evidence:
+            if error.reason != "time" or state.candidate is None:
                 raise
             state.step_count = stable_step_count
             self.step_count = stable_step_count
@@ -857,13 +859,18 @@ class Orchestrator:
             self._audit("evidence_repair_started", {"card_count": len(cards)})
             try:
                 selected_hashes = await self._run_in_stage(
-                    graph_state["budgets"]["critic"],
+                    _evidence_repair_budget(graph_state["budgets"]["critic"]),
                     lambda: self._evidence_linker.link(
                         task,
                         state.candidate or "",
                         cards,
                     ),
                     graph_state["stage_runtime"],
+                )
+            except Exception as error:  # noqa: BLE001 - optional repair boundary
+                self._audit(
+                    "evidence_repair_failed",
+                    {"category": _evidence_repair_failure_category(error)},
                 )
             finally:
                 state.usage = _add_usage(state.usage, self._evidence_linker.last_usage)
@@ -900,13 +907,20 @@ class Orchestrator:
         state = graph_state["runtime"]
         task = graph_state["task"]
         tools = graph_state["tools"]
-        decision = await self._verify(
-            state,
-            task,
-            tools,
-            budget=graph_state["budgets"]["critic"],
-            stage_runtime=graph_state["stage_runtime"],
-        )
+        try:
+            decision = await self._verify(
+                state,
+                task,
+                tools,
+                budget=graph_state["budgets"]["critic"],
+                stage_runtime=graph_state["stage_runtime"],
+            )
+        except ProviderTransientExhaustedError as error:
+            self._audit(
+                "stage_retry_exhausted",
+                {"stage": "critic", "retry_category": error.retry_category},
+            )
+            raise
         decision = self._apply_quality_policy(state, decision)
         return {"runtime": state, "decision": decision}
 
@@ -1010,6 +1024,7 @@ class Orchestrator:
                 "cursor": cursor,
                 "logical_tool_calls": checkpoint.logical_tool_calls,
                 "step_count": checkpoint.step_count,
+                "candidate_present": checkpoint.candidate is not None,
             },
         )
 
@@ -1518,6 +1533,28 @@ class Orchestrator:
         if self._trace is None:
             return nullcontext()
         return self._trace.span(name, metadata)
+
+
+def _evidence_repair_budget(critic_budget: StageBudget) -> StageBudget:
+    if critic_budget.deadline is None:
+        return critic_budget
+    now = asyncio.get_running_loop().time()
+    remaining = max(0.0, critic_budget.deadline - now)
+    return StageBudget(
+        name="critic",
+        deadline=now + remaining / 2,
+        max_calls=critic_budget.max_calls,
+    )
+
+
+def _evidence_repair_failure_category(error: Exception) -> str:
+    if isinstance(error, (ProviderTransientExhaustedError, ConnectionError)):
+        return "provider_transient"
+    if isinstance(error, (StageBudgetExceeded, TimeoutError)):
+        return "time"
+    if isinstance(error, (StageProtocolError, TypeError, ValueError)):
+        return "protocol"
+    return "linker"
 
 
 def _add_usage(first: Usage, second: Usage) -> Usage:
