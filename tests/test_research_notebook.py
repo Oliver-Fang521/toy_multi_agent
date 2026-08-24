@@ -999,3 +999,122 @@ def test_evidence_cards_collapse_normalized_whitespace_content_duplicates() -> N
     )
 
     assert len(cards) == 1
+
+
+def test_evidence_link_cards_expose_only_bounded_authenticated_metadata(
+    tmp_path: Path,
+) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    notebook.record(
+        "web_search",
+        {"query": "fact"},
+        {
+            "answer": "Authenticated answer " + "x" * 5_000,
+            "sources": [
+                {
+                    "url": "https://example.test/private/path?credential=secret",
+                    "title": "Primary title " + "t" * 1_000,
+                }
+            ],
+            "credential": "never expose",
+            "diagnostic": "private diagnostic",
+        },
+    )
+
+    cards = notebook.linkable_evidence_cards()
+
+    assert len(cards) == 1
+    assert set(cards[0]) <= {"entry_hash", "tool_kind", "title", "domain", "excerpt"}
+    assert cards[0]["tool_kind"] == "web_search"
+    assert cards[0]["domain"] == "example.test"
+    assert len(cards[0]["title"]) <= 256
+    assert len(cards[0]["excerpt"]) <= 1_536
+    encoded = json.dumps(cards)
+    assert "password" not in encoded
+    assert "credential" not in encoded
+    assert "private diagnostic" not in encoded
+
+
+def test_evidence_link_cards_ignore_failed_unusable_and_unauthenticated_entries(
+    tmp_path: Path,
+) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    notebook.record("execute_python", {"instruction": "fail"}, {"error": "traceback"})
+    notebook.record("web_search", {"query": "no source"}, {"answer": "no URL"})
+    notebook.record(
+        "read_webpage",
+        {"url": "https://example.test/fact"},
+        {"url": "https://example.test/fact", "text": "authenticated fact"},
+    )
+    entry = next(
+        path
+        for path in (tmp_path / "private" / "task-1").glob("*.json")
+        if "authenticated fact" in path.read_text(encoding="utf-8")
+    )
+    raw = json.loads(entry.read_text(encoding="utf-8"))
+    raw["result"]["text"] = "tampered fact"
+    entry.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert notebook.linkable_evidence_cards() == ()
+
+
+def test_evidence_for_hashes_resolves_authenticated_source_url_not_model_fields(
+    tmp_path: Path,
+) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    trusted_url = "https://primary.example/fact"
+    notebook.record(
+        "web_search",
+        {"query": "fact"},
+        {
+            "answer": "Supported answer",
+            "sources": [{"url": trusted_url, "title": "Primary source"}],
+        },
+    )
+    entry_hash = notebook.linkable_evidence_cards()[0]["entry_hash"]
+
+    evidence = notebook.evidence_for_hashes((entry_hash, "unknown", entry_hash))
+
+    assert evidence == (
+        Evidence(
+            evidence_id=entry_hash,
+            kind="source",
+            summary="Supported answer",
+            source_url=trusted_url,
+        ),
+    )
+
+
+def test_evidence_for_hashes_maps_only_usable_typed_non_source_results(
+    tmp_path: Path,
+) -> None:
+    notebook = ResearchNotebook(tmp_path / "private", "task-1")
+    notebook.record(
+        "execute_python",
+        {"instruction": "calculate"},
+        {"output_text": "The computed value is 42", "outputs": []},
+    )
+    notebook.record(
+        "transcribe_audio",
+        {"path": "audio.wav"},
+        {"text": "The speaker said forty-two"},
+    )
+    notebook.record(
+        "read_attachment",
+        {"path": "private/image.png"},
+        {"path": "private/image.png", "kind": "image", "media_type": "image/png"},
+    )
+    cards = notebook.linkable_evidence_cards()
+    hashes_by_tool = {card["tool_kind"]: card["entry_hash"] for card in cards}
+
+    evidence = notebook.evidence_for_hashes(
+        (hashes_by_tool["execute_python"], hashes_by_tool["transcribe_audio"])
+    )
+
+    assert [item.kind for item in evidence] == ["computation", "file"]
+    assert [item.summary for item in evidence] == [
+        "The computed value is 42",
+        "The speaker said forty-two",
+    ]
+    assert all(item.source_url is None for item in evidence)
+    assert "read_attachment" not in hashes_by_tool

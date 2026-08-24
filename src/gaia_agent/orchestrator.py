@@ -72,6 +72,17 @@ class Critic(Protocol):
     ) -> CriticDecision: ...
 
 
+class EvidenceLinker(Protocol):
+    last_usage: Usage
+
+    async def link(
+        self,
+        task: GaiaTask,
+        candidate: str,
+        cards: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, ...]: ...
+
+
 class _ToolBudgetExhausted(RuntimeError):
     pass
 
@@ -331,6 +342,7 @@ class Orchestrator:
         config: RunConfig,
         observability: Observability | None = None,
         notebook: ResearchNotebook | None = None,
+        evidence_linker: EvidenceLinker | None = None,
     ) -> None:
         if config.max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -348,6 +360,7 @@ class Orchestrator:
         self._config = config
         self._observability = observability or Observability()
         self._notebook = notebook
+        self._evidence_linker = evidence_linker
         self._trace: TaskTrace | None = None
         self._audit_events: list[AuditEvent] = []
         self.correction_count = 0

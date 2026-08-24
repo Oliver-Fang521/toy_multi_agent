@@ -51,6 +51,8 @@ _DEFAULT_MAX_CONTEXT_BYTES = 24_576
 _MAX_CONTEXT_QUESTION_CHARS = 4_096
 _MAX_CONTEXT_INSTRUCTION_CHARS = 2_048
 _MAX_CARD_SELECTION_BYTES = 1_000_000
+_MAX_EVIDENCE_LINK_CARDS = 12
+_MAX_EVIDENCE_LINK_HASH_CHARS = 128
 _EVIDENCE_CARD_TIMESTAMP = datetime(1970, 1, 1, tzinfo=UTC)
 _CRITIC_FALLBACK_DEGRADED_APPROVAL = "critic_repair_exhausted_degraded_approval"
 _CRITIC_FALLBACK_POLICY_DENIED = "critic_repair_exhausted_policy_denied"
@@ -375,6 +377,110 @@ class PlannerAgent:
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
         return plan
+
+
+class EvidenceLinkerAgent:
+    """Select authenticated notebook entries that support an existing candidate."""
+
+    instructions = (
+        "Select only the provided evidence entry hashes that directly support the existing "
+        "candidate answer. Return only the required JSON object. Do not change the candidate, "
+        "invent evidence, or request additional research."
+    )
+
+    def __init__(
+        self,
+        provider: ModelProvider,
+        *,
+        reasoning_effort: ReasoningEffort = "medium",
+        max_context_bytes: int = _DEFAULT_MAX_CONTEXT_BYTES,
+        max_cards: int = _MAX_EVIDENCE_LINK_CARDS,
+    ) -> None:
+        if max_context_bytes < 1:
+            raise ValueError("max_context_bytes must be positive")
+        if not 1 <= max_cards <= _MAX_EVIDENCE_LINK_CARDS:
+            raise ValueError(
+                f"max_cards must be between 1 and {_MAX_EVIDENCE_LINK_CARDS}"
+            )
+        self.provider = provider
+        self.reasoning_effort = reasoning_effort
+        self.max_context_bytes = max_context_bytes
+        self.max_cards = max_cards
+        self._last_usage: ContextVar[Usage | None] = ContextVar(
+            f"evidence_linker_usage_{id(self)}", default=None
+        )
+
+    @property
+    def last_usage(self) -> Usage:
+        return self._last_usage.get() or Usage()
+
+    async def link(
+        self,
+        task: GaiaTask,
+        candidate: str,
+        cards: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, ...]:
+        self._last_usage.set(Usage())
+        context = _bounded_evidence_link_context(
+            task,
+            candidate,
+            cards,
+            max_cards=self.max_cards,
+            max_json_bytes=self.max_context_bytes,
+        )
+        selected_cards = context["evidence_cards"]
+        if not selected_cards:
+            return ()
+        known_hashes = {
+            card["entry_hash"]
+            for card in selected_cards
+            if isinstance(card.get("entry_hash"), str)
+        }
+        request = ModelRequest(
+            instructions=self.instructions,
+            input_items=_context_input_items(context),
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "evidence_entry_hashes": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": _MAX_EVIDENCE_LINK_HASH_CHARS,
+                        },
+                        "maxItems": self.max_cards,
+                        "uniqueItems": True,
+                    }
+                },
+                "required": ["evidence_entry_hashes"],
+                "additionalProperties": False,
+            },
+            allowed_tools=(),
+            max_output_tokens=_max_output_tokens(self.reasoning_effort),
+            max_tool_calls=0,
+            reasoning_effort=self.reasoning_effort,
+        )
+        response = await self.provider.complete(request)
+        self._last_usage.set(response.usage)
+        parsed = response.parsed
+        if not isinstance(parsed, dict) or set(parsed) != {"evidence_entry_hashes"}:
+            return ()
+        hashes = parsed.get("evidence_entry_hashes")
+        if (
+            not isinstance(hashes, list)
+            or len(hashes) > self.max_cards
+            or any(
+                not isinstance(value, str)
+                or not value
+                or len(value) > _MAX_EVIDENCE_LINK_HASH_CHARS
+                for value in hashes
+            )
+            or len(hashes) != len(set(hashes))
+            or set(hashes) - known_hashes
+        ):
+            return ()
+        return tuple(hashes)
 
 
 class SpecialistAgent:
@@ -965,6 +1071,140 @@ def _bounded_evidence_context(
         if fitted is not None:
             selected.append(fitted)
     return {**context, "evidence": selected}
+
+
+def _bounded_evidence_link_context(
+    task: GaiaTask,
+    candidate: str,
+    cards: Sequence[Mapping[str, Any]],
+    *,
+    max_cards: int,
+    max_json_bytes: int,
+) -> dict[str, Any]:
+    safe_cards: list[dict[str, str]] = []
+    seen_hashes: set[str] = set()
+    for raw_card in cards:
+        card = _safe_evidence_link_card(raw_card)
+        if card is None or card["entry_hash"] in seen_hashes:
+            continue
+        safe_cards.append(card)
+        seen_hashes.add(card["entry_hash"])
+        if len(safe_cards) >= max_cards:
+            break
+    context: dict[str, Any] = {
+        "task_id": _bounded_context_text(task.task_id, _MAX_CONTEXT_QUESTION_CHARS),
+        "question": _bounded_context_text(task.question, _MAX_CONTEXT_QUESTION_CHARS),
+        "level": task.level,
+        "candidate_answer": _bounded_context_text(candidate, _MAX_CONTEXT_QUESTION_CHARS),
+        "evidence_cards": [],
+    }
+    sizing_context = context
+    if safe_cards:
+        sizing_context = {
+            **context,
+            "evidence_cards": [{"entry_hash": safe_cards[0]["entry_hash"]}],
+        }
+    for field in ("candidate_answer", "question", "task_id"):
+        if context_size_bytes(_context_input_items(sizing_context)) <= max_json_bytes:
+            break
+        value = context[field]
+        if isinstance(value, str):
+            fitted = _fit_context_text(sizing_context, field, value, max_json_bytes)
+            context[field] = fitted
+            sizing_context[field] = fitted
+    if context_size_bytes(_context_input_items(context)) > max_json_bytes:
+        raise ValueError("evidence linker context exceeds max_json_bytes")
+    if context_size_bytes(_context_input_items(sizing_context)) > max_json_bytes:
+        return context
+
+    selected: list[dict[str, str]] = []
+    for card in safe_cards:
+        fitted = _fit_evidence_link_card(
+            context,
+            selected,
+            card,
+            max_json_bytes=max_json_bytes,
+        )
+        if fitted is None:
+            continue
+        selected.append(fitted)
+    return {**context, "evidence_cards": selected}
+
+
+def _fit_context_text(
+    context: Mapping[str, Any],
+    field: str,
+    value: str,
+    max_json_bytes: int,
+) -> str:
+    lower, upper = 0, len(value)
+    while lower < upper:
+        midpoint = (lower + upper + 1) // 2
+        candidate = {**context, field: value[:midpoint]}
+        if context_size_bytes(_context_input_items(candidate)) <= max_json_bytes:
+            lower = midpoint
+        else:
+            upper = midpoint - 1
+    return value[:lower]
+
+
+def _safe_evidence_link_card(card: Mapping[str, Any]) -> dict[str, str] | None:
+    entry_hash = card.get("entry_hash")
+    if (
+        not isinstance(entry_hash, str)
+        or not entry_hash
+        or len(entry_hash) > _MAX_EVIDENCE_LINK_HASH_CHARS
+    ):
+        return None
+    limits = {
+        "tool_kind": 256,
+        "title": 256,
+        "domain": 255,
+        "excerpt": 1_536,
+    }
+    safe: dict[str, str] = {"entry_hash": entry_hash}
+    for key, limit in limits.items():
+        value = card.get(key)
+        if isinstance(value, str) and (bounded := _bounded_context_text(value, limit)):
+            safe[key] = bounded
+    return safe
+
+
+def _fit_evidence_link_card(
+    context: Mapping[str, Any],
+    selected: Sequence[Mapping[str, Any]],
+    card: Mapping[str, str],
+    *,
+    max_json_bytes: int,
+) -> dict[str, str] | None:
+    def fits(candidate: Mapping[str, str]) -> bool:
+        candidate_context = {
+            **context,
+            "evidence_cards": [*selected, dict(candidate)],
+        }
+        return context_size_bytes(_context_input_items(candidate_context)) <= max_json_bytes
+
+    candidate = dict(card)
+    if fits(candidate):
+        return candidate
+    for field in ("excerpt", "title", "domain", "tool_kind"):
+        value = candidate.pop(field, None)
+        if value is None or not fits(candidate):
+            continue
+        lower, upper = 0, len(value)
+        while lower < upper:
+            midpoint = (lower + upper + 1) // 2
+            candidate[field] = value[:midpoint]
+            if fits(candidate):
+                lower = midpoint
+            else:
+                upper = midpoint - 1
+        if lower:
+            candidate[field] = value[:lower]
+        else:
+            candidate.pop(field, None)
+        return candidate
+    return None
 
 
 def _fit_card_within_context(

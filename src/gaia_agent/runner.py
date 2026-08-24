@@ -21,6 +21,7 @@ from openai import AsyncOpenAI
 from gaia_agent.agents import (
     ComputationAgent,
     CriticAgent,
+    EvidenceLinkerAgent,
     FileAnalysisAgent,
     LookupAgent,
     PlannerAgent,
@@ -536,6 +537,11 @@ def build_runner(
         max_context_bytes=config.stage_context_max_bytes,
         quality_policy=config.quality_policy,
     )
+    evidence_linker = EvidenceLinkerAgent(
+        provider,
+        reasoning_effort=config.reasoning_effort,
+        max_context_bytes=config.stage_context_max_bytes,
+    )
     notebook_generation: str | None = None
 
     def bind_notebook_generation(manifest: RunManifest) -> None:
@@ -566,6 +572,7 @@ def build_runner(
             config=config,
             observability=observability,
             notebook=notebook,
+            evidence_linker=evidence_linker,
         )
 
     return EvaluationRunner(

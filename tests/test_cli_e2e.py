@@ -14,7 +14,13 @@ from typer.testing import CliRunner
 
 from gaia_agent import cli as cli_module
 from gaia_agent import runner as runner_module
-from gaia_agent.agents import ComputationAgent, CriticAgent, LookupAgent, PlannerAgent
+from gaia_agent.agents import (
+    ComputationAgent,
+    CriticAgent,
+    EvidenceLinkerAgent,
+    LookupAgent,
+    PlannerAgent,
+)
 from gaia_agent.cli import app
 from gaia_agent.config import RunConfig
 from gaia_agent.models import AuditEvent, GaiaTask, TaskPrediction, TerminalErrorCategory, Usage
@@ -615,6 +621,9 @@ def test_build_runner_composes_luna_max_for_every_production_stage(
     assert orchestrator._planner.reasoning_effort == "max"
     assert {agent.reasoning_effort for agent in orchestrator._specialists.values()} == {"max"}
     assert orchestrator._critic.reasoning_effort == "max"
+    assert isinstance(orchestrator._evidence_linker, EvidenceLinkerAgent)
+    assert orchestrator._evidence_linker.reasoning_effort == "max"
+    assert orchestrator._evidence_linker.max_context_bytes == config.stage_context_max_bytes
 
 
 @pytest.mark.parametrize(

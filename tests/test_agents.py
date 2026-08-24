@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from gaia_agent.agents import (
     ComputationAgent,
     CriticAgent,
+    EvidenceLinkerAgent,
     FileAnalysisAgent,
     LookupAgent,
     PlannerAgent,
@@ -23,6 +24,112 @@ from gaia_agent.agents import (
 from gaia_agent.mcp_client import AttachmentPolicyError
 from gaia_agent.models import AgentPlan, Evidence, PlanStep, SpecialistName, Usage
 from gaia_agent.providers import ModelRequest, ModelResponse, ToolEvent
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_selects_only_known_hashes_without_tools(
+    fake_provider, task
+) -> None:
+    fake_provider.return_parsed({"evidence_entry_hashes": ["known"]})
+    linker = EvidenceLinkerAgent(fake_provider, reasoning_effort="max")
+
+    selected = await linker.link(
+        task,
+        "answer",
+        ({"entry_hash": "known", "tool_kind": "read_webpage", "excerpt": "x"},),
+    )
+
+    assert selected == ("known",)
+    assert len(fake_provider.requests) == 1
+    assert fake_provider.requests[0].allowed_tools == ()
+    assert fake_provider.requests[0].max_tool_calls == 0
+    assert fake_provider.requests[0].reasoning_effort == "max"
+    assert fake_provider.executors == [None]
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_rejects_the_whole_selection_for_unknown_or_duplicate_hashes(
+    fake_provider, task
+) -> None:
+    fake_provider.return_parsed(
+        {"evidence_entry_hashes": ["known", "invented", "known"]}
+    )
+
+    selected = await EvidenceLinkerAgent(fake_provider).link(
+        task,
+        "answer",
+        ({"entry_hash": "known", "excerpt": "authenticated excerpt"},),
+    )
+
+    assert selected == ()
+    assert len(fake_provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_malformed_output_degrades_without_a_second_request(
+    fake_provider, task
+) -> None:
+    fake_provider.return_parsed(
+        {"evidence_entry_hashes": "known"},
+        usage=Usage(input_tokens=7, total_tokens=7),
+    )
+    linker = EvidenceLinkerAgent(fake_provider)
+
+    selected = await linker.link(
+        task,
+        "answer",
+        ({"entry_hash": "known", "excerpt": "authenticated excerpt"},),
+    )
+
+    assert selected == ()
+    assert len(fake_provider.requests) == 1
+    assert linker.last_usage == Usage(input_tokens=7, total_tokens=7)
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_bounds_and_sanitizes_private_model_context(
+    fake_provider, task
+) -> None:
+    fake_provider.return_parsed({"evidence_entry_hashes": []})
+    linker = EvidenceLinkerAgent(fake_provider, max_context_bytes=1_200)
+    cards = tuple(
+        {
+            "entry_hash": f"known-{index}",
+            "tool_kind": "read_webpage",
+            "title": "title " + "t" * 400,
+            "domain": "example.test",
+            "excerpt": "excerpt " + "x" * 2_000,
+            "url": "https://private.example/full",
+            "error": "private failure detail",
+        }
+        for index in range(20)
+    )
+
+    await linker.link(task, "candidate " + "c" * 4_000, cards)
+
+    request = fake_provider.requests[0]
+    assert context_size_bytes(request.input_items) <= 1_200
+    context = json.loads(request.input_items[0]["content"][0]["text"])
+    assert len(context["evidence_cards"]) <= 12
+    assert all(
+        set(card) <= {"entry_hash", "tool_kind", "title", "domain", "excerpt"}
+        for card in context["evidence_cards"]
+    )
+    assert "https://private.example/full" not in json.dumps(context)
+    assert "private failure detail" not in json.dumps(context)
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_short_circuits_when_there_are_no_cards(
+    fake_provider, task
+) -> None:
+    linker = EvidenceLinkerAgent(fake_provider)
+
+    selected = await linker.link(task, "answer", ())
+
+    assert selected == ()
+    assert fake_provider.requests == []
+    assert linker.last_usage == Usage()
 
 
 @pytest.mark.asyncio

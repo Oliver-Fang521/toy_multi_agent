@@ -17,11 +17,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from gaia_agent.models import StageCheckpoint
+from gaia_agent.models import Evidence, StageCheckpoint
 
 _MAX_CARD_TITLE_CHARS = 256
 _MAX_CARD_DOMAIN_CHARS = 255
 _MAX_CARD_EXCERPT_CHARS = 1_536
+_LINKABLE_CARD_KEYS = frozenset(
+    {"entry_hash", "tool_kind", "title", "domain", "excerpt"}
+)
+_SOURCE_TOOLS = frozenset({"web_search", "read_webpage"})
 _ENTRY_SCHEMA_VERSION = 1
 _ENTRY_CONTRACT = "gaia.research-notebook.entry"
 _TRUST_ANCHOR_SCHEMA_VERSION = 1
@@ -151,6 +155,7 @@ def _card_fields(result: Mapping[str, Any]) -> tuple[str | None, str | None, str
         "content",
         "logs",
         "output",
+        "output_text",
         "result",
         "value",
         "data",
@@ -197,6 +202,57 @@ def _json_size_bytes(value: object) -> int:
             ensure_ascii=False,
             allow_nan=False,
         ).encode("utf-8")
+    )
+
+
+def _evidence_from_entry(entry: NotebookEntry) -> Evidence | None:
+    if entry.result.get("error"):
+        return None
+    entry_hash = hashlib.sha256(entry.signature.encode("utf-8")).hexdigest()
+    url, title, excerpt = _card_fields(entry.result)
+    summary = _bound_text(excerpt or title, _MAX_CARD_EXCERPT_CHARS)
+    if not summary:
+        return None
+    if entry.tool in _SOURCE_TOOLS:
+        if not _is_safe_source_url(url):
+            return None
+        return Evidence(
+            evidence_id=entry_hash,
+            kind="source",
+            summary=summary,
+            source_url=url,
+        )
+    if entry.tool == "execute_python":
+        kind = "computation"
+    elif entry.tool == "transcribe_audio":
+        kind = "file"
+    elif entry.tool == "read_attachment":
+        media_type = entry.result.get("media_type")
+        result_kind = entry.result.get("kind")
+        kind = (
+            "visual"
+            if result_kind == "image"
+            or (isinstance(media_type, str) and media_type.startswith("image/"))
+            else "file"
+        )
+    else:
+        return None
+    return Evidence(
+        evidence_id=entry_hash,
+        kind=kind,
+        summary=summary,
+    )
+
+
+def _is_safe_source_url(value: str | None) -> bool:
+    if not value:
+        return False
+    parsed = urlparse(value)
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
     )
 
 
@@ -273,6 +329,48 @@ class ResearchNotebook:
         self._assert_private_directory(self._task_root)
         self._atomic_write(self._entry_path(signature), payload)
 
+    def linkable_evidence_cards(
+        self,
+        *,
+        max_items: int = 12,
+        max_json_bytes: int = 24_576,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return only bounded model-safe cards from authenticated usable entries."""
+        entries = tuple(
+            entry
+            for entry in self._authenticated_entries()
+            if _evidence_from_entry(entry) is not None
+        )
+        return tuple(
+            {key: value for key, value in card.items() if key in _LINKABLE_CARD_KEYS}
+            for card in select_evidence_cards(
+                entries,
+                max_items=max_items,
+                max_json_bytes=max_json_bytes,
+            )
+        )
+
+    def evidence_for_hashes(self, hashes: Sequence[str]) -> tuple[Evidence, ...]:
+        """Resolve selected card hashes through authenticated private notebook data."""
+        allowed_hashes = {
+            card["entry_hash"] for card in self.linkable_evidence_cards()
+        }
+        evidence_by_hash = {
+            item.evidence_id: item
+            for entry in self._authenticated_entries()
+            if (item := _evidence_from_entry(entry)) is not None
+            and item.evidence_id in allowed_hashes
+        }
+        resolved: list[Evidence] = []
+        seen: set[str] = set()
+        for entry_hash in hashes:
+            if not isinstance(entry_hash, str) or entry_hash in seen:
+                continue
+            seen.add(entry_hash)
+            if evidence := evidence_by_hash.get(entry_hash):
+                resolved.append(evidence)
+        return tuple(resolved)
+
     def save_stage_checkpoint(self, checkpoint: StageCheckpoint) -> None:
         if not isinstance(checkpoint, StageCheckpoint):
             raise TypeError("stage checkpoint must be a StageCheckpoint")
@@ -319,6 +417,48 @@ class ResearchNotebook:
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    def _authenticated_entries(self) -> tuple[NotebookEntry, ...]:
+        entries: list[NotebookEntry] = []
+        try:
+            task_directory = self._open_private_task_directory()
+            try:
+                filenames = os.listdir(task_directory)
+                for filename in filenames:
+                    if (
+                        len(filename) != 69
+                        or not filename.endswith(".json")
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in filename[:-5]
+                        )
+                    ):
+                        continue
+                    payload = _read_bounded_entry_at(
+                        task_directory,
+                        filename,
+                        self.max_entry_bytes,
+                        required_mode=0o600,
+                    )
+                    if payload is None:
+                        continue
+                    try:
+                        entry = _parse_entry(
+                            json.loads(payload),
+                            integrity_key=self._integrity_key,
+                            expected_notebook_scope=_notebook_scope(self.root),
+                            expected_task_id=self.task_id,
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if entry.signature != filename[:-5]:
+                        continue
+                    entries.append(entry)
+            finally:
+                os.close(task_directory)
+        except (OSError, TypeError, ValueError):
+            return ()
+        return tuple(sorted(entries, key=lambda item: (item.created_at, item.signature)))
 
     def _open_private_task_directory(self) -> int:
         self._assert_private_directory(self.root)
