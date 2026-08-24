@@ -28,6 +28,9 @@ from gaia_agent.models import (
     GaiaTask,
     PlanStep,
     SpecialistName,
+    StageCheckpoint,
+    StageCursor,
+    StageToolCallCounts,
     TaskPrediction,
     TerminalErrorCategory,
     Usage,
@@ -223,6 +226,32 @@ class _BudgetedToolClient:
     def stage_logical_call_count(self, stage: str) -> int:
         return self._stage_logical_call_counts[stage]
 
+    def restore_logical_call_counts(
+        self,
+        logical_tool_calls: int,
+        stage_counts: StageToolCallCounts,
+    ) -> None:
+        if self.logical_call_count or any(self._stage_logical_call_counts.values()):
+            raise ValueError("logical tool-call counters may be restored only once")
+        if logical_tool_calls != stage_counts.total:
+            raise ValueError("restored logical tool-call counters do not reconcile")
+        self.logical_call_count = logical_tool_calls
+        self.call_count = logical_tool_calls
+        self._stage_logical_call_counts.update(
+            {
+                "planner": stage_counts.planner,
+                "specialist": stage_counts.specialist,
+                "critic": stage_counts.critic,
+            }
+        )
+
+    def stage_logical_call_counts(self) -> StageToolCallCounts:
+        return StageToolCallCounts(
+            planner=self.stage_logical_call_count("planner"),
+            specialist=self.stage_logical_call_count("specialist"),
+            critic=self.stage_logical_call_count("critic"),
+        )
+
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         signature = json.dumps(
             {"name": name, "arguments": arguments},
@@ -327,6 +356,9 @@ class _GraphState(TypedDict, total=False):
     soft_step_failures: int
     decision: CriticDecision
     prediction: TaskPrediction
+    entry_cursor: Literal[
+        "plan", "act", "evidence_repair", "verify", "correct", "submit"
+    ]
 
 
 class Orchestrator:
@@ -466,6 +498,7 @@ class Orchestrator:
                 }
             )
         assert category is not None
+        self._refresh_checkpoint_accounting(state, budgeted_tools)
         self._audit(
             "terminal_failure",
             {"category": category.value, "critic_verdict": state.critic_verdict},
@@ -488,6 +521,34 @@ class Orchestrator:
             provider_attempt_count=(
                 provider_exhaustion.attempt_count if provider_exhaustion is not None else 0
             ),
+        )
+
+    def _refresh_checkpoint_accounting(
+        self,
+        state: _TaskState,
+        tools: _BudgetedToolClient | None,
+    ) -> None:
+        if self._notebook is None or tools is None:
+            return
+        checkpoint = self._notebook.load_stage_checkpoint()
+        if checkpoint is None:
+            return
+        refreshed = StageCheckpoint.model_validate(
+            {
+                **checkpoint.model_dump(mode="python"),
+                "usage": state.usage,
+                "logical_tool_calls": tools.logical_call_count,
+                "stage_logical_tool_calls": tools.stage_logical_call_counts(),
+            }
+        )
+        self._notebook.save_stage_checkpoint(refreshed)
+        self._audit(
+            "checkpoint_saved",
+            {
+                "cursor": refreshed.cursor,
+                "logical_tool_calls": refreshed.logical_tool_calls,
+                "step_count": refreshed.step_count,
+            },
         )
 
     async def _execute(
@@ -517,19 +578,38 @@ class Orchestrator:
 
     def _build_graph(self) -> Any:
         graph = StateGraph(_GraphState)
+        graph.add_node("restore", self._graph_restore)
         graph.add_node("plan", self._graph_plan)
         graph.add_node("act", self._graph_act)
+        graph.add_node("evidence_repair", self._graph_evidence_repair)
         graph.add_node("verify", self._graph_verify)
         graph.add_node("correct", self._graph_correct)
         graph.add_node("reject", self._graph_reject)
         graph.add_node("submit", self._graph_submit)
-        graph.add_edge(START, "plan")
+        graph.add_edge(START, "restore")
+        graph.add_conditional_edges(
+            "restore",
+            self._route_after_restore,
+            {
+                "plan": "plan",
+                "act": "act",
+                "evidence_repair": "evidence_repair",
+                "verify": "verify",
+                "correct": "correct",
+                "submit": "submit",
+            },
+        )
         graph.add_edge("plan", "act")
         graph.add_conditional_edges(
             "act",
             self._route_after_act,
-            {"act": "act", "verify": "verify"},
+            {
+                "act": "act",
+                "evidence_repair": "evidence_repair",
+                "verify": "verify",
+            },
         )
+        graph.add_edge("evidence_repair", "verify")
         graph.add_conditional_edges(
             "verify",
             self._route_after_verify,
@@ -541,7 +621,58 @@ class Orchestrator:
         return graph.compile()
 
     def _graph_recursion_limit(self) -> int:
-        return max(25, self._config.max_steps + 8)
+        return max(25, self._config.max_steps + 10)
+
+    async def _graph_restore(self, graph_state: _GraphState) -> dict[str, Any]:
+        checkpoint = (
+            self._notebook.load_stage_checkpoint()
+            if self._notebook is not None
+            else None
+        )
+        if checkpoint is None:
+            return {"entry_cursor": "plan"}
+        state = graph_state["runtime"]
+        state.plan = checkpoint.plan
+        state.evidence = list(checkpoint.evidence)
+        state.evidence_origins = dict(checkpoint.evidence_origins)
+        state.raw_evidence_id_digests = {
+            bytes.fromhex(digest) for digest in checkpoint.raw_evidence_id_digests
+        }
+        state.candidate_origins = dict(checkpoint.candidate_origins)
+        state.candidate = checkpoint.candidate
+        state.usage = checkpoint.usage
+        state.step_count = checkpoint.step_count
+        state.verify_count = checkpoint.verify_count
+        state.critic_verdict = checkpoint.critic_verdict
+        self.correction_count = checkpoint.correction_count
+        self.step_count = checkpoint.step_count
+        graph_state["tools"].restore_logical_call_counts(
+            checkpoint.logical_tool_calls,
+            checkpoint.stage_logical_tool_calls,
+        )
+        self._audit(
+            "checkpoint_restored",
+            {
+                "cursor": checkpoint.cursor,
+                "logical_tool_calls": checkpoint.logical_tool_calls,
+                "step_count": checkpoint.step_count,
+            },
+        )
+        restored: dict[str, Any] = {
+            "runtime": state,
+            "entry_cursor": checkpoint.cursor,
+            "next_step_index": checkpoint.next_step_index,
+            "soft_step_failures": checkpoint.soft_step_failures,
+        }
+        if checkpoint.decision is not None:
+            restored["decision"] = checkpoint.decision
+        return restored
+
+    def _route_after_restore(
+        self,
+        graph_state: _GraphState,
+    ) -> Literal["plan", "act", "evidence_repair", "verify", "correct", "submit"]:
+        return graph_state.get("entry_cursor", "plan")
 
     async def _graph_plan(self, graph_state: _GraphState) -> dict[str, Any]:
         state = graph_state["runtime"]
@@ -582,7 +713,9 @@ class Orchestrator:
                 "specialists": [step.specialist.value for step in plan.steps],
             },
         )
-        return {"runtime": state, "next_step_index": 0}
+        update = {"runtime": state, "next_step_index": 0}
+        self._save_checkpoint(graph_state, "act", next_step_index=0)
+        return update
 
     async def _graph_act(self, graph_state: _GraphState) -> dict[str, Any]:
         state = graph_state["runtime"]
@@ -600,6 +733,7 @@ class Orchestrator:
         ):
             self._audit_context_budget_pressure(pressure)
             return {"runtime": state, "next_step_index": len(state.plan.steps)}
+        stable_step_count = state.step_count
         try:
             await self._act(
                 state,
@@ -613,6 +747,8 @@ class Orchestrator:
         except StageBudgetExceeded as error:
             if error.reason != "time" or state.candidate is None or not state.evidence:
                 raise
+            state.step_count = stable_step_count
+            self.step_count = stable_step_count
             self._audit_stage_budget_exhausted(
                 error,
                 graph_state["budgets"]["specialist"],
@@ -628,9 +764,12 @@ class Orchestrator:
                 or not state.evidence
             ):
                 raise
+            attempted_step_number = state.step_count
+            state.step_count = stable_step_count
+            self.step_count = stable_step_count
             self._audit(
                 "soft_step_failure",
-                {"step_number": state.step_count, "code": error.code.value},
+                {"step_number": attempted_step_number, "code": error.code.value},
             )
             return {
                 "runtime": state,
@@ -639,7 +778,10 @@ class Orchestrator:
             }
         return {"runtime": state, "next_step_index": step_index + 1}
 
-    def _route_after_act(self, graph_state: _GraphState) -> Literal["act", "verify"]:
+    def _route_after_act(
+        self,
+        graph_state: _GraphState,
+    ) -> Literal["act", "evidence_repair", "verify"]:
         state = graph_state["runtime"]
         if state.plan is None:
             raise ValueError("graph act router requires a plan")
@@ -652,7 +794,13 @@ class Orchestrator:
                 next_step,
             ):
                 self._audit_context_budget_pressure(pressure)
-                return "verify"
+                route: Literal["act", "evidence_repair", "verify"] = "verify"
+                self._save_checkpoint(
+                    graph_state,
+                    route,
+                    next_step_index=step_index,
+                )
+                return route
             if _ready_for_critic(state):
                 self._audit(
                     "plan_early_stop",
@@ -661,11 +809,92 @@ class Orchestrator:
                         "remaining_steps": len(state.plan.steps) - step_index,
                     },
                 )
-                return "verify"
-            return "act"
+                route = "verify"
+                self._save_checkpoint(
+                    graph_state,
+                    route,
+                    next_step_index=step_index,
+                )
+                return route
+            route = "act"
+            self._save_checkpoint(
+                graph_state,
+                route,
+                next_step_index=step_index,
+            )
+            return route
         if step_index == len(state.plan.steps):
-            return "verify"
+            route = (
+                "evidence_repair"
+                if state.candidate is not None and not state.evidence
+                else "verify"
+            )
+            self._save_checkpoint(
+                graph_state,
+                route,
+                next_step_index=step_index,
+            )
+            return route
         raise ValueError("graph act router received an invalid plan index")
+
+    async def _graph_evidence_repair(
+        self,
+        graph_state: _GraphState,
+    ) -> dict[str, Any]:
+        state = graph_state["runtime"]
+        task = graph_state["task"]
+        if state.plan is None or state.candidate is None:
+            raise ValueError("evidence repair requires a stable plan and candidate")
+        cards = (
+            self._notebook.linkable_evidence_cards(
+                max_json_bytes=self._config.stage_context_max_bytes
+            )
+            if self._notebook is not None
+            else ()
+        )
+        selected_hashes: tuple[str, ...] = ()
+        if self._evidence_linker is not None and cards and not state.evidence:
+            self._audit("evidence_repair_started", {"card_count": len(cards)})
+            try:
+                selected_hashes = await self._run_in_stage(
+                    graph_state["budgets"]["critic"],
+                    lambda: self._evidence_linker.link(
+                        task,
+                        state.candidate or "",
+                        cards,
+                    ),
+                    graph_state["stage_runtime"],
+                )
+            finally:
+                state.usage = _add_usage(state.usage, self._evidence_linker.last_usage)
+            resolved = self._notebook.evidence_for_hashes(selected_hashes)
+            if resolved:
+                if state.step_count < 1:
+                    raise ValueError("evidence repair requires a completed specialist step")
+                source_step = state.plan.steps[
+                    min(state.step_count - 1, len(state.plan.steps) - 1)
+                ]
+                self._record_result(
+                    state,
+                    source_step,
+                    AgentResult(
+                        specialist=source_step.specialist,
+                        evidence=resolved,
+                    ),
+                )
+            self._audit(
+                "evidence_repair_completed",
+                {
+                    "selected_count": len(selected_hashes),
+                    "resolved_count": len(resolved),
+                },
+            )
+        self._save_checkpoint(
+            graph_state,
+            "verify",
+            next_step_index=graph_state.get("next_step_index", len(state.plan.steps)),
+        )
+        return {"runtime": state}
 
     async def _graph_verify(self, graph_state: _GraphState) -> dict[str, Any]:
         state = graph_state["runtime"]
@@ -689,9 +918,12 @@ class Orchestrator:
         if decision is None:
             raise ValueError("graph verify router requires a critic decision")
         if decision.verdict == "approve":
+            self._save_checkpoint(graph_state, "submit")
             return "submit"
         if not self.correction_count:
+            self._save_checkpoint(graph_state, "correct")
             return "correct"
+        self._save_checkpoint(graph_state, "correct")
         return "reject"
 
     async def _graph_correct(self, graph_state: _GraphState) -> dict[str, Any]:
@@ -707,6 +939,7 @@ class Orchestrator:
             budget=graph_state["budgets"]["specialist"],
             stage_runtime=graph_state["stage_runtime"],
         )
+        self._save_checkpoint(graph_state, "verify")
         return {"runtime": state}
 
     async def _graph_reject(self, graph_state: _GraphState) -> dict[str, Any]:
@@ -729,6 +962,56 @@ class Orchestrator:
             graph_state["stage_runtime"],
         )
         return {"prediction": prediction}
+
+    def _save_checkpoint(
+        self,
+        graph_state: _GraphState,
+        cursor: StageCursor,
+        *,
+        next_step_index: int | None = None,
+    ) -> None:
+        if self._notebook is None:
+            return
+        state = graph_state["runtime"]
+        if state.plan is None:
+            raise ValueError("stable checkpoint requires a plan")
+        decision = (
+            graph_state.get("decision") if cursor in {"correct", "submit"} else None
+        )
+        checkpoint = StageCheckpoint(
+            cursor=cursor,
+            plan=state.plan,
+            evidence=tuple(state.evidence),
+            evidence_origins=dict(state.evidence_origins),
+            raw_evidence_id_digests=tuple(
+                sorted(digest.hex() for digest in state.raw_evidence_id_digests)
+            ),
+            candidate_origins=dict(state.candidate_origins),
+            candidate=state.candidate,
+            usage=state.usage,
+            step_count=state.step_count,
+            verify_count=state.verify_count,
+            correction_count=self.correction_count,
+            next_step_index=(
+                graph_state.get("next_step_index", 0)
+                if next_step_index is None
+                else next_step_index
+            ),
+            soft_step_failures=graph_state.get("soft_step_failures", 0),
+            logical_tool_calls=graph_state["tools"].logical_call_count,
+            stage_logical_tool_calls=graph_state["tools"].stage_logical_call_counts(),
+            critic_verdict=state.critic_verdict,
+            decision=decision,
+        )
+        self._notebook.save_stage_checkpoint(checkpoint)
+        self._audit(
+            "checkpoint_saved",
+            {
+                "cursor": cursor,
+                "logical_tool_calls": checkpoint.logical_tool_calls,
+                "step_count": checkpoint.step_count,
+            },
+        )
 
     async def _act(
         self,

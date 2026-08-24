@@ -100,6 +100,67 @@ class _ScriptedOrchestrator:
         return outcome
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _TimedOrchestratorFactory:
+    def __init__(
+        self,
+        clock: _FakeClock,
+        outcomes: deque[tuple[float, TaskPrediction, tuple[AuditEvent, ...]]],
+    ) -> None:
+        self.clock = clock
+        self.outcomes = outcomes
+        self.calls = 0
+
+    def __call__(self, task: GaiaTask) -> Any:
+        self.calls += 1
+        duration, prediction, events = self.outcomes.popleft()
+        clock = self.clock
+
+        class TimedOrchestrator:
+            audit_events = events
+
+            async def run(self, active_task: GaiaTask) -> TaskPrediction:
+                assert active_task.task_id == task.task_id
+                clock.advance(duration)
+                return prediction
+
+        return TimedOrchestrator()
+
+
+def _checkpoint_audit_event(cursor: str) -> AuditEvent:
+    return AuditEvent(
+        sequence=1,
+        event_type="checkpoint_saved",
+        timestamp=datetime.now(UTC),
+        payload={"cursor": cursor, "logical_tool_calls": 0, "step_count": 1},
+    )
+
+
+def _stage_budget_audit_event(stage: str, reason: str) -> AuditEvent:
+    return AuditEvent(
+        sequence=2,
+        event_type="stage_budget_exhausted",
+        timestamp=datetime.now(UTC),
+        payload={
+            "stage": stage,
+            "reason": reason,
+            "timeout_seconds": 1.0,
+            "max_calls": 1,
+            "logical_calls": 0,
+        },
+    )
+
+
 class _OfflineProvider:
     async def complete(
         self,
@@ -1145,6 +1206,322 @@ async def test_runner_retries_one_transient_failure_once_only(tmp_path: Path) ->
     ]
     assert predictions[2]["retry_category"] == "ConnectionError"
     assert "PrivateConnectionError" not in repr(predictions)
+
+
+@pytest.mark.asyncio
+async def test_runner_early_transient_without_checkpoint_retries_inside_vote_deadline(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    factory = _TimedOrchestratorFactory(
+        clock,
+        deque(
+            [
+                (
+                    1.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        usage=Usage(total_tokens=2),
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.TIMEOUT,
+                    ),
+                    (),
+                ),
+                (
+                    2.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer="recovered answer",
+                        usage=Usage(total_tokens=3),
+                        critic_verdict="approve",
+                        evidence_ids=("evidence-0001",),
+                    ),
+                    (),
+                ),
+            ]
+        ),
+    )
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=10.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=record_sleep,
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task)
+
+    assert factory.calls == 2
+    assert clock() == 3.0
+    assert sleeps == [0.05]
+    assert result.prediction.answer == "recovered answer"
+    assert result.prediction.usage == Usage(total_tokens=5)
+    assert result.prediction.attempt_number == 2
+    assert result.prediction.recovery_count == 1
+    assert result.prediction.recovery_succeeded is True
+
+
+@pytest.mark.asyncio
+async def test_runner_late_transient_without_checkpoint_is_not_replayed_from_plan(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    factory = _TimedOrchestratorFactory(
+        clock,
+        deque(
+            [
+                (
+                    6.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.TIMEOUT,
+                    ),
+                    (),
+                )
+            ]
+        ),
+    )
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=10.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task)
+
+    assert factory.calls == 1
+    assert result.prediction.attempt_number == 1
+    assert result.prediction.recovery_count == 0
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_runner_near_deadline_checkpoint_is_not_replayed_from_plan(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    factory = _TimedOrchestratorFactory(
+        clock,
+        deque(
+            [
+                (
+                    9.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.TIMEOUT,
+                    ),
+                    (_checkpoint_audit_event("verify"),),
+                )
+            ]
+        ),
+    )
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=10.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task)
+
+    assert factory.calls == 1
+    assert result.prediction.attempt_number == 1
+    assert result.prediction.recovery_count == 0
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_runner_specialist_timeout_without_stable_candidate_is_terminal(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    factory = _TimedOrchestratorFactory(
+        clock,
+        deque(
+            [
+                (
+                    1.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.TIMEOUT,
+                    ),
+                    (
+                        _checkpoint_audit_event("act"),
+                        _stage_budget_audit_event("specialist", "time"),
+                        _checkpoint_audit_event("act").model_copy(
+                            update={"sequence": 3}
+                        ),
+                    ),
+                )
+            ]
+        ),
+    )
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=10.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task)
+
+    assert factory.calls == 1
+    assert result.prediction.attempt_number == 1
+    assert result.prediction.recovery_count == 0
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_runner_checkpoint_transient_resumes_once_with_remaining_vote_budget(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    factory = _TimedOrchestratorFactory(
+        clock,
+        deque(
+            [
+                (
+                    2.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        usage=Usage(total_tokens=5),
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.RETRY_EXHAUSTED,
+                        retry_reason="provider_transient_exhausted",
+                        retry_category="APIConnectionError",
+                        provider_attempt_count=2,
+                    ),
+                    (_checkpoint_audit_event("verify"),),
+                ),
+                (
+                    3.0,
+                    TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer="resumed answer",
+                        usage=Usage(total_tokens=8),
+                        critic_verdict="approve",
+                        evidence_ids=("evidence-0001",),
+                    ),
+                    (
+                        AuditEvent(
+                            sequence=1,
+                            event_type="checkpoint_restored",
+                            timestamp=datetime.now(UTC),
+                            payload={
+                                "cursor": "verify",
+                                "logical_tool_calls": 0,
+                                "step_count": 1,
+                            },
+                        ),
+                    ),
+                ),
+            ]
+        ),
+    )
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=10.0),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task)
+
+    assert factory.calls == 2
+    assert clock() == 5.0
+    assert result.prediction.answer == "resumed answer"
+    assert result.prediction.usage == Usage(total_tokens=8)
+    assert result.prediction.attempt_number == 2
+    assert result.prediction.recovery_count == 1
+    assert any(
+        event.event_type == "checkpoint_restored" for event in result.audit_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_vote_deadline_cancels_blocking_recovery_attempt(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+
+    class DeadlineFactory:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.cancelled = False
+
+        def __call__(self, active_task: GaiaTask) -> Any:
+            self.calls += 1
+            factory = self
+
+            class DeadlineOrchestrator:
+                audit_events: tuple[AuditEvent, ...] = ()
+
+                async def run(self, selected_task: GaiaTask) -> TaskPrediction:
+                    assert selected_task.task_id == active_task.task_id
+                    if factory.calls == 1:
+                        return TaskPrediction(
+                            task_id=selected_task.task_id,
+                            level=selected_task.level,
+                            answer=None,
+                            critic_verdict="not_run",
+                            error_category=TerminalErrorCategory.TIMEOUT,
+                        )
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        factory.cancelled = True
+                        raise
+                    raise AssertionError("unreachable")
+
+            return DeadlineOrchestrator()
+
+    factory = DeadlineFactory()
+    runner = EvaluationRunner(
+        config=_config(tmp_path, timeout_seconds=0.05),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+    )
+    started = asyncio.get_running_loop().time()
+
+    result = await runner._run_vote(task)
+
+    assert factory.calls == 2
+    assert factory.cancelled is True
+    assert asyncio.get_running_loop().time() - started < 0.15
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert result.prediction.attempt_number == 2
+    assert result.prediction.recovery_count == 1
 
 
 @pytest.mark.asyncio

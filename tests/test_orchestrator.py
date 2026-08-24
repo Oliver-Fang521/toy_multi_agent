@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 from collections import deque
@@ -22,6 +23,8 @@ from gaia_agent.models import (
     GaiaTask,
     PlanStep,
     SpecialistName,
+    StageCheckpoint,
+    StageToolCallCounts,
     TaskPrediction,
     TerminalErrorCategory,
     Usage,
@@ -900,6 +903,500 @@ def _orchestrator(
         tool_client_factory=FakeToolFactory(tools),
         config=config or _config(),
     )
+
+
+def _checkpoint(
+    *,
+    cursor: str,
+    plan: AgentPlan | None = None,
+    candidate: str | None = "restored answer",
+    decision: CriticDecision | None = None,
+    next_step_index: int = 1,
+    logical_tool_calls: int = 2,
+    stage_logical_tool_calls: StageToolCallCounts | None = None,
+) -> StageCheckpoint:
+    active_plan = plan or _plan(SpecialistName.LOOKUP)
+    has_stable_result = candidate is not None
+    evidence = (
+        (_evidence("evidence-0001", "source", summary="restored support"),)
+        if has_stable_result
+        else ()
+    )
+    step_count = 1 if has_stable_result else 0
+    raw_evidence_id = "provider-evidence-1"
+    return StageCheckpoint(
+        cursor=cursor,
+        plan=active_plan,
+        evidence=evidence,
+        evidence_origins={"evidence-0001": 1} if evidence else {},
+        raw_evidence_id_digests=(
+            hashlib.sha256(raw_evidence_id.encode("utf-8")).hexdigest(),
+        )
+        if evidence
+        else (),
+        candidate_origins={1: candidate} if candidate is not None else {},
+        candidate=candidate,
+        usage=Usage(input_tokens=4, output_tokens=6, total_tokens=10),
+        step_count=step_count,
+        verify_count=0,
+        correction_count=0,
+        next_step_index=next_step_index,
+        soft_step_failures=0,
+        logical_tool_calls=logical_tool_calls,
+        stage_logical_tool_calls=stage_logical_tool_calls
+        or StageToolCallCounts(specialist=logical_tool_calls),
+        critic_verdict="not_run" if decision is None else decision.verdict,
+        decision=decision,
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_restore_verify_skips_planner_and_specialist(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(_checkpoint(cursor="verify"))
+    calls: list[str] = []
+    critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(SpecialistName.LOOKUP, calls, [])
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(),
+        notebook=notebook,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert prediction.answer == "restored answer"
+    assert prediction.usage == Usage(input_tokens=4, output_tokens=6, total_tokens=10)
+    assert critic.candidates == ["restored answer"]
+    assert calls == ["critic", "submit_answer"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_restore_act_resumes_at_next_specialist(tmp_path: Path) -> None:
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(
+        _checkpoint(
+            cursor="act",
+            candidate=None,
+            next_step_index=0,
+            logical_tool_calls=0,
+            stage_logical_tool_calls=StageToolCallCounts(),
+        )
+    )
+    calls: list[str] = []
+    source = _evidence("provider-source", "source")
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "fresh specialist answer")],
+            )
+        },
+        critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(),
+        notebook=notebook,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert prediction.answer == "fresh specialist answer"
+    assert calls == ["lookup", "critic", "submit_answer"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_restore_submit_skips_completed_critic(tmp_path: Path) -> None:
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    decision = _decision("approve", ("evidence-0001",))
+    notebook.save_stage_checkpoint(
+        _checkpoint(cursor="submit", decision=decision)
+    )
+    calls: list[str] = []
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(SpecialistName.LOOKUP, calls, [])
+        },
+        critic=FakeCritic(calls, []),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(),
+        notebook=notebook,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert prediction.answer == "restored answer"
+    assert calls == ["submit_answer"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_checkpoint_restore_falls_back_to_normal_plan(tmp_path: Path) -> None:
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(
+        _checkpoint(
+            cursor="act",
+            candidate=None,
+            next_step_index=0,
+            logical_tool_calls=0,
+            stage_logical_tool_calls=StageToolCallCounts(),
+        )
+    )
+    path = notebook.root / task.task_id / ".stage-checkpoint.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["checkpoint"]["next_step_index"] = 99
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    calls: list[str] = []
+    source = _evidence("provider-source", "source")
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "fresh answer")],
+            )
+        },
+        critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(),
+        notebook=notebook,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert prediction.answer == "fresh answer"
+    assert calls == ["planner", "lookup", "critic", "submit_answer"]
+
+
+@pytest.mark.asyncio
+async def test_stable_checkpoint_transitions_are_saved_before_downstream_work(
+    tmp_path: Path,
+) -> None:
+    class RecordingNotebook(ResearchNotebook):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.saved: list[StageCheckpoint] = []
+
+        def save_stage_checkpoint(self, checkpoint: StageCheckpoint) -> None:
+            self.saved.append(checkpoint)
+            super().save_stage_checkpoint(checkpoint)
+
+    task = _task()
+    notebook = RecordingNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    calls: list[str] = []
+    source = _evidence("provider-source", "source")
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "stable answer")],
+            )
+        },
+        critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(),
+        notebook=notebook,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert prediction.answer == "stable answer"
+    assert [checkpoint.cursor for checkpoint in notebook.saved] == [
+        "act",
+        "verify",
+        "submit",
+    ]
+    assert calls == ["planner", "lookup", "critic", "submit_answer"]
+
+
+@pytest.mark.asyncio
+async def test_evidence_repair_checkpoint_links_once_through_trusted_id_assignment(
+    tmp_path: Path,
+) -> None:
+    class SelectingLinker:
+        last_usage = Usage(input_tokens=3, total_tokens=3)
+
+        def __init__(self, selected_hash: str) -> None:
+            self.selected_hash = selected_hash
+            self.calls: list[tuple[str, tuple[dict[str, Any], ...]]] = []
+
+        async def link(
+            self,
+            task: GaiaTask,
+            candidate: str,
+            cards: tuple[dict[str, Any], ...],
+        ) -> tuple[str, ...]:
+            self.calls.append((candidate, cards))
+            return (self.selected_hash,)
+
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.record(
+        "web_search",
+        {"query": "cached support"},
+        {
+            "answer": "authenticated notebook support",
+            "sources": [
+                {
+                    "url": "https://primary.example/cached",
+                    "title": "Primary cached source",
+                }
+            ],
+        },
+    )
+    entry_hash = notebook.linkable_evidence_cards()[0]["entry_hash"]
+    linker = SelectingLinker(entry_hash)
+    calls: list[str] = []
+    critic = FakeCritic(calls, [_decision("approve", ("evidence-0001",))])
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (), "linked answer")],
+            )
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(),
+        notebook=notebook,
+        evidence_linker=linker,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert prediction.answer == "linked answer"
+    assert prediction.evidence_ids == ("evidence-0001",)
+    assert prediction.usage == Usage(input_tokens=3, total_tokens=3)
+    assert len(linker.calls) == 1
+    assert linker.calls[0][0] == "linked answer"
+    assert [item.evidence_id for item in critic.evidence_seen[0]] == [
+        "evidence-0001"
+    ]
+    assert entry_hash not in prediction.evidence_ids
+    checkpoint_cursors = [
+        event.payload["cursor"]
+        for event in orchestrator.audit_events
+        if event.event_type == "checkpoint_saved"
+    ]
+    assert checkpoint_cursors == ["act", "evidence_repair", "verify", "submit"]
+    assert calls == ["planner", "lookup", "critic", "submit_answer"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_restore_decodes_raw_digest_hex_before_correction(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    decision = _decision("insufficient_evidence", ("evidence-0001",))
+    notebook.save_stage_checkpoint(
+        _checkpoint(cursor="correct", decision=decision)
+    )
+    calls: list[str] = []
+    duplicate = _evidence("provider-evidence-1", "source")
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (duplicate,), "replacement")],
+            )
+        },
+        critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(),
+        notebook=notebook,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    assert prediction.answer is None
+    assert prediction.error_category == TerminalErrorCategory.MALFORMED_RESPONSE
+    assert calls == ["lookup"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_restore_preserves_logical_call_counters_without_double_charge(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(_checkpoint(cursor="verify"))
+    calls: list[str] = []
+    tools = FakeTools(calls)
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(SpecialistName.LOOKUP, calls, [])
+        },
+        critic=FakeCritic(
+            calls,
+            [_decision("approve", ("evidence-0001",))],
+            tool_calls=[("web_search", {"query": "verify restored answer"})],
+        ),
+        tool_client_factory=FakeToolFactory(tools),
+        config=_config(
+            max_tool_calls=4,
+            specialist_max_tool_calls=2,
+            critic_max_tool_calls=2,
+        ),
+        notebook=notebook,
+    )
+
+    prediction = await orchestrator.run(task)
+
+    started_call_numbers = [
+        event.payload["call_number"]
+        for event in orchestrator.audit_events
+        if event.event_type == "tool_call_started"
+    ]
+    assert prediction.answer == "restored answer"
+    assert orchestrator.tool_call_count == 4
+    assert started_call_numbers == [3, 4]
+    assert tools.call_arguments == [
+        ("web_search", {"query": "verify restored answer"}),
+        (
+            "submit_answer",
+            {"answer": "restored answer", "evidence_ids": ["evidence-0001"]},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_critic_refreshes_checkpoint_counters_without_partial_decision(
+    tmp_path: Path,
+) -> None:
+    class ToolThenTransientCritic:
+        last_usage = Usage(input_tokens=5, total_tokens=5)
+
+        async def verify(
+            self,
+            task: GaiaTask,
+            candidate: str | None,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> CriticDecision:
+            calls.append("critic")
+            await tools.call("web_search", {"query": "first critic attempt"})
+            raise ProviderTransientExhaustedError(
+                retry_category="APIConnectionError",
+                attempt_count=2,
+            )
+
+    task = _task()
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    calls: list[str] = []
+    tools = FakeTools(calls)
+    source = _evidence("provider-source", "source")
+    first = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "stable answer")],
+            )
+        },
+        critic=ToolThenTransientCritic(),
+        tool_client_factory=FakeToolFactory(tools),
+        config=_config(
+            max_tool_calls=2,
+            specialist_max_tool_calls=1,
+            critic_max_tool_calls=1,
+        ),
+        notebook=notebook,
+    )
+
+    first_prediction = await first.run(task)
+    checkpoint = notebook.load_stage_checkpoint()
+
+    assert first_prediction.error_category == TerminalErrorCategory.RETRY_EXHAUSTED
+    assert checkpoint is not None
+    assert checkpoint.cursor == "verify"
+    assert checkpoint.decision is None
+    assert checkpoint.logical_tool_calls == 1
+    assert checkpoint.stage_logical_tool_calls == StageToolCallCounts(critic=1)
+    assert checkpoint.usage == Usage(input_tokens=5, total_tokens=5)
+
+    second = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(SpecialistName.LOOKUP, calls, [])
+        },
+        critic=FakeCritic(
+            calls,
+            [_decision("approve", ("evidence-0001",))],
+            tool_calls=[("web_search", {"query": "second critic attempt"})],
+        ),
+        tool_client_factory=FakeToolFactory(tools),
+        config=_config(
+            max_tool_calls=2,
+            specialist_max_tool_calls=1,
+            critic_max_tool_calls=1,
+        ),
+        notebook=notebook,
+    )
+
+    second_prediction = await second.run(task)
+
+    assert second_prediction.error_category == TerminalErrorCategory.TOOL_BUDGET_EXHAUSTED
+    assert tools.call_arguments == [
+        ("web_search", {"query": "first critic attempt"})
+    ]
+    assert calls == ["planner", "lookup", "critic", "web_search", "critic"]
 
 
 def test_benchmark_quality_policy_keeps_a_critic_approved_candidate() -> None:

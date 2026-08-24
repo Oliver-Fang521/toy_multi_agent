@@ -92,6 +92,16 @@ _FORBIDDEN_PUBLIC_KEYS = frozenset(
     }
 )
 _MAX_AGENT_TOOL_CALLS = 6
+_RECOVERY_BACKOFF_SECONDS = 0.05
+_EARLY_TRANSIENT_RATIO = 0.5
+_PRIVATE_RUNTIME_AUDIT_EVENT_TYPES = frozenset(
+    {
+        "checkpoint_restored",
+        "checkpoint_saved",
+        "evidence_repair_completed",
+        "evidence_repair_started",
+    }
+)
 
 
 def _private_run_root(output_dir: Path) -> Path:
@@ -110,6 +120,7 @@ OrchestratorFactory = Callable[[GaiaTask], TaskOrchestrator]
 Sleep = Callable[[float], Awaitable[None]]
 ProviderFactory = Callable[[RunConfig], "ProviderRuntime"]
 RunOpened = Callable[[RunManifest], None]
+Clock = Callable[[], float]
 
 
 @dataclass(frozen=True)
@@ -143,6 +154,7 @@ class EvaluationRunner:
         evaluation_mode: Literal["production", "test"] = "test",
         observability: Observability | None = None,
         run_opened: RunOpened | None = None,
+        clock: Clock = time.monotonic,
     ) -> None:
         self._config = config
         self._dataset_loader = dataset_loader
@@ -152,6 +164,7 @@ class EvaluationRunner:
         self._evaluation_mode = evaluation_mode
         self._observability = observability or Observability()
         self._run_opened = run_opened
+        self._clock = clock
         self._last_flush_ok: bool | None = None
 
     @property
@@ -314,16 +327,27 @@ class EvaluationRunner:
         )
 
     async def _run_vote(self, task: GaiaTask) -> _TaskRun:
+        vote_started = self._clock()
+        vote_deadline = vote_started + self._config.timeout_seconds
         audit_events: list[AuditEvent] = []
         first_plan: AgentPlan | None = None
         prior_predictions: list[TaskPrediction] = []
         retry_reason: str | None = None
         retry_category: str | None = None
         provider_attempt_count = 0
+        recovery_attempted = False
+        checkpoint_restored_this_attempt = False
         for attempt in range(2):
+            remaining_seconds = vote_deadline - self._clock()
+            if remaining_seconds <= 0:
+                prediction = _failure_prediction(task, TerminalErrorCategory.TIMEOUT)
+                actual_attempt_number = max(1, attempt)
+                break
             orchestrator = self._orchestrator_factory(task)
+            actual_attempt_number = attempt + 1
             try:
-                prediction = await orchestrator.run(task)
+                async with asyncio.timeout(remaining_seconds):
+                    prediction = await orchestrator.run(task)
                 _validate_prediction_identity(prediction, task)
             except Exception as error:  # noqa: BLE001 - task isolation boundary
                 events = tuple(getattr(orchestrator, "audit_events", ()))
@@ -331,7 +355,9 @@ class EvaluationRunner:
                 first_plan = first_plan or _plan_from_audit(events)
                 is_transient = _is_transient_failure(error)
                 category = (
-                    TerminalErrorCategory.RETRY_EXHAUSTED
+                    TerminalErrorCategory.TIMEOUT
+                    if isinstance(error, TimeoutError)
+                    else TerminalErrorCategory.RETRY_EXHAUSTED
                     if is_transient
                     else _category_for_exception(error)
                 )
@@ -349,27 +375,69 @@ class EvaluationRunner:
                 events = tuple(getattr(orchestrator, "audit_events", ()))
                 audit_events.extend(events)
                 first_plan = first_plan or _plan_from_audit(events)
-            if retry_reason is None and _is_transient_prediction(prediction):
+            checkpoint_restored_this_attempt = any(
+                event.event_type == "checkpoint_restored" for event in events
+            )
+            provider_attempt_count += prediction.provider_attempt_count
+            if self._clock() >= vote_deadline and prediction.error_category is None:
+                prediction = _failure_prediction(
+                    task,
+                    TerminalErrorCategory.TIMEOUT,
+                ).model_copy(update={"usage": prediction.usage})
+            is_transient = _is_transient_prediction(prediction)
+            if retry_reason is None and is_transient:
                 retry_reason = prediction.retry_reason or "timeout"
                 retry_category = prediction.retry_category or (
                     "TimeoutError"
                     if prediction.error_category == TerminalErrorCategory.TIMEOUT
                     else "provider_transient"
                 )
-                provider_attempt_count += prediction.provider_attempt_count
                 if attempt == 0:
-                    prior_predictions.append(prediction)
-                    await self._sleep(0.05)
-                    continue
-            elif retry_reason is not None:
-                provider_attempt_count += prediction.provider_attempt_count
+                    elapsed_seconds = self._clock() - vote_started
+                    remaining_seconds = vote_deadline - self._clock()
+                    stable_checkpoint_present = _has_stable_checkpoint(events)
+                    specialist_timeout_is_terminal = (
+                        _specialist_timeout_without_stable_candidate(events)
+                    )
+                    minimum_recovery_seconds = self._minimum_recovery_seconds()
+                    is_early_transient = (
+                        not stable_checkpoint_present
+                        and elapsed_seconds
+                        <= self._config.timeout_seconds * _EARLY_TRANSIENT_RATIO
+                    )
+                    can_resume_checkpoint = (
+                        stable_checkpoint_present
+                        and not specialist_timeout_is_terminal
+                        and remaining_seconds > minimum_recovery_seconds
+                    )
+                    can_retry_fresh = (
+                        is_early_transient
+                        and remaining_seconds > minimum_recovery_seconds
+                    )
+                    if can_resume_checkpoint or can_retry_fresh:
+                        await self._sleep(
+                            min(
+                                _RECOVERY_BACKOFF_SECONDS,
+                                max(
+                                    0.0,
+                                    remaining_seconds - minimum_recovery_seconds,
+                                ),
+                            )
+                        )
+                        if (
+                            vote_deadline - self._clock()
+                            > minimum_recovery_seconds
+                        ):
+                            prior_predictions.append(prediction)
+                            recovery_attempted = True
+                            continue
 
-            recovery_succeeded = retry_reason is not None and prediction.error_category is None
-            if retry_reason is not None:
+            recovery_succeeded = recovery_attempted and prediction.error_category is None
+            if recovery_attempted:
                 audit_events.append(
                     _task_recovery_event(
                         sequence=len(audit_events) + 1,
-                        attempt_number=attempt + 1,
+                        attempt_number=actual_attempt_number,
                         retry_reason=retry_reason,
                         retry_category=retry_category or "provider_transient",
                         recovery_succeeded=recovery_succeeded,
@@ -377,9 +445,13 @@ class EvaluationRunner:
                 )
             prediction = prediction.model_copy(
                 update={
-                    "usage": _sum_usage([*prior_predictions, prediction]),
-                    "attempt_number": attempt + 1,
-                    "recovery_count": 1 if retry_reason is not None else 0,
+                    "usage": (
+                        prediction.usage
+                        if checkpoint_restored_this_attempt
+                        else _sum_usage([*prior_predictions, prediction])
+                    ),
+                    "attempt_number": actual_attempt_number,
+                    "recovery_count": 1 if recovery_attempted else 0,
                     "recovery_succeeded": recovery_succeeded,
                     "retry_reason": retry_reason,
                     "retry_category": retry_category,
@@ -387,7 +459,31 @@ class EvaluationRunner:
                 }
             )
             return _TaskRun(prediction, tuple(audit_events), first_plan)
-        raise AssertionError("bounded retry loop did not return")
+        prediction = prediction.model_copy(
+            update={
+                "usage": (
+                    prediction.usage
+                    if checkpoint_restored_this_attempt
+                    else _sum_usage([*prior_predictions, prediction])
+                ),
+                "attempt_number": actual_attempt_number,
+                "recovery_count": 1 if recovery_attempted else 0,
+                "recovery_succeeded": False,
+                "retry_reason": retry_reason,
+                "retry_category": retry_category,
+                "provider_attempt_count": provider_attempt_count,
+            }
+        )
+        return _TaskRun(prediction, tuple(audit_events), first_plan)
+
+    def _minimum_recovery_seconds(self) -> float:
+        return max(
+            0.001,
+            min(
+                self._config.critic_timeout_seconds,
+                self._config.timeout_seconds * 0.1,
+            ),
+        )
 
 
 def validate_config(config: RunConfig) -> None:
@@ -777,6 +873,33 @@ def _is_transient_prediction(prediction: TaskPrediction) -> bool:
     )
 
 
+def _has_stable_checkpoint(events: Sequence[AuditEvent]) -> bool:
+    return any(
+        event.event_type in {"checkpoint_saved", "checkpoint_restored"}
+        for event in events
+    )
+
+
+def _specialist_timeout_without_stable_candidate(
+    events: Sequence[AuditEvent],
+) -> bool:
+    latest_cursor = next(
+        (
+            event.payload.get("cursor")
+            for event in reversed(events)
+            if event.event_type in {"checkpoint_saved", "checkpoint_restored"}
+        ),
+        None,
+    )
+    specialist_timed_out = any(
+        event.event_type == "stage_budget_exhausted"
+        and event.payload.get("stage") == "specialist"
+        and event.payload.get("reason") == "time"
+        for event in events
+    )
+    return specialist_timed_out and latest_cursor == "act"
+
+
 def _transient_failure_category(error: BaseException) -> str:
     if isinstance(error, TimeoutError):
         return "TimeoutError"
@@ -910,7 +1033,12 @@ def _persist_task_artifacts(store: RunStore, task_id: str, task_run: _TaskRun) -
         store.write_plan(task_id, task_run.plan)
     audit_path = store.task_directory(task_id) / "audit.jsonl"
     first_sequence = _next_audit_sequence(audit_path)
-    for sequence, event in enumerate(task_run.audit_events, start=first_sequence):
+    public_events = (
+        event
+        for event in task_run.audit_events
+        if event.event_type not in _PRIVATE_RUNTIME_AUDIT_EVENT_TYPES
+    )
+    for sequence, event in enumerate(public_events, start=first_sequence):
         store.append_audit(task_id, event.model_copy(update={"sequence": sequence}))
 
 
