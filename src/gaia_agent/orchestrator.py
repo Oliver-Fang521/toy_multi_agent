@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 import string
-import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, nullcontext
@@ -105,6 +104,11 @@ class StageBudgetExceeded(RuntimeError):
         super().__init__(f"{stage} stage budget exhausted")
         self.stage = stage
         self.reason = reason
+
+
+@dataclass
+class _StageRuntime:
+    active: Literal["planner", "specialist", "critic"] | None = None
 
 
 @dataclass
@@ -307,6 +311,7 @@ class _GraphState(TypedDict, total=False):
     runtime: Required[_TaskState]
     tools: Required[_BudgetedToolClient]
     budgets: Required[dict[str, StageBudget]]
+    stage_runtime: Required[_StageRuntime]
     next_step_index: int
     soft_step_failures: int
     decision: CriticDecision
@@ -355,7 +360,9 @@ class Orchestrator:
         return tuple(self._audit_events)
 
     async def run(self, task: GaiaTask) -> TaskPrediction:
-        started = time.monotonic()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        global_deadline = started + self._config.timeout_seconds
         self._audit_events = []
         self.correction_count = 0
         self.step_count = 0
@@ -369,22 +376,32 @@ class Orchestrator:
         category: TerminalErrorCategory | None = None
         provider_exhaustion: ProviderTransientExhaustedError | None = None
         budgets = self._stage_budgets(started)
+        stage_runtime = _StageRuntime()
         try:
-            async with asyncio.timeout_at(started + self._config.timeout_seconds):
-                async with self._tool_client_factory(execution_task) as active_tools:
-                    raw_tools = active_tools
-                    budgeted_tools = _BudgetedToolClient(
-                        active_tools,
-                        max_calls=self._config.max_tool_calls,
-                        audit=self._audit,
-                        notebook=self._notebook,
-                    )
-                    prediction = await self._execute(
-                        state,
-                        execution_task,
-                        budgeted_tools,
-                        budgets,
-                    )
+            try:
+                async with asyncio.timeout_at(global_deadline):
+                    async with self._tool_client_factory(execution_task) as active_tools:
+                        raw_tools = active_tools
+                        budgeted_tools = _BudgetedToolClient(
+                            active_tools,
+                            max_calls=self._config.max_tool_calls,
+                            audit=self._audit,
+                            notebook=self._notebook,
+                        )
+                        prediction = await self._execute(
+                            state,
+                            execution_task,
+                            budgeted_tools,
+                            budgets,
+                            stage_runtime,
+                        )
+            except TimeoutError as error:
+                active_stage = stage_runtime.active
+                if active_stage is not None:
+                    stage_deadline = budgets[active_stage].deadline
+                    if stage_deadline is not None and loop.time() >= stage_deadline:
+                        raise StageBudgetExceeded(active_stage, "time") from error
+                raise
         except ProviderTransientExhaustedError as error:
             category = TerminalErrorCategory.RETRY_EXHAUSTED
             provider_exhaustion = error
@@ -396,20 +413,10 @@ class Orchestrator:
                 if error.reason == "time"
                 else TerminalErrorCategory.TOOL_BUDGET_EXHAUSTED
             )
-            budget = budgets[error.stage]
-            self._audit(
-                "stage_budget_exhausted",
-                {
-                    "stage": error.stage,
-                    "reason": error.reason,
-                    "timeout_seconds": self._stage_timeout_seconds(error.stage),
-                    "max_calls": budget.max_calls,
-                    "logical_calls": (
-                        budgeted_tools.stage_logical_call_count(error.stage)
-                        if budgeted_tools is not None
-                        else 0
-                    ),
-                },
+            self._audit_stage_budget_exhausted(
+                error,
+                budgets[error.stage],
+                budgeted_tools,
             )
         except _ToolBudgetExhausted:
             category = TerminalErrorCategory.TOOL_BUDGET_EXHAUSTED
@@ -441,7 +448,7 @@ class Orchestrator:
         if prediction is not None:
             return prediction.model_copy(
                 update={
-                    "duration_seconds": time.monotonic() - started,
+                    "duration_seconds": loop.time() - started,
                     "usage": state.usage,
                 }
             )
@@ -454,7 +461,7 @@ class Orchestrator:
             task_id=task.task_id,
             level=task.level,
             answer=None,
-            duration_seconds=time.monotonic() - started,
+            duration_seconds=loop.time() - started,
             usage=state.usage,
             critic_verdict=state.critic_verdict,
             evidence_ids=tuple(item.evidence_id for item in state.evidence),
@@ -476,6 +483,7 @@ class Orchestrator:
         task: GaiaTask,
         tools: _BudgetedToolClient,
         budgets: dict[str, StageBudget],
+        stage_runtime: _StageRuntime,
     ) -> TaskPrediction:
         result = await self._graph.ainvoke(
             {
@@ -483,6 +491,7 @@ class Orchestrator:
                 "runtime": state,
                 "tools": tools,
                 "budgets": budgets,
+                "stage_runtime": stage_runtime,
                 "next_step_index": 0,
                 "soft_step_failures": 0,
             },
@@ -530,6 +539,7 @@ class Orchestrator:
                 plan = await self._run_in_stage(
                     graph_state["budgets"]["planner"],
                     lambda: self._planner.plan(task),
+                    graph_state["stage_runtime"],
                 )
             finally:
                 state.usage = _add_usage(state.usage, self._planner.last_usage)
@@ -585,7 +595,17 @@ class Orchestrator:
                 tools,
                 correction=False,
                 budget=graph_state["budgets"]["specialist"],
+                stage_runtime=graph_state["stage_runtime"],
             )
+        except StageBudgetExceeded as error:
+            if state.candidate is None or not state.evidence:
+                raise
+            self._audit_stage_budget_exhausted(
+                error,
+                graph_state["budgets"]["specialist"],
+                tools,
+            )
+            return {"runtime": state, "next_step_index": len(state.plan.steps)}
         except StageProtocolError as error:
             if (
                 not error.repairable
@@ -643,6 +663,7 @@ class Orchestrator:
             task,
             tools,
             budget=graph_state["budgets"]["critic"],
+            stage_runtime=graph_state["stage_runtime"],
         )
         decision = self._apply_quality_policy(state, decision)
         return {"runtime": state, "decision": decision}
@@ -671,6 +692,7 @@ class Orchestrator:
             decision,
             graph_state["tools"],
             budget=graph_state["budgets"]["specialist"],
+            stage_runtime=graph_state["stage_runtime"],
         )
         return {"runtime": state}
 
@@ -681,12 +703,17 @@ class Orchestrator:
         decision = graph_state.get("decision")
         if decision is None:
             raise ValueError("graph submit node requires a critic decision")
-        prediction = await self._submit(
-            graph_state["runtime"],
-            graph_state["task"],
-            decision,
-            graph_state["tools"],
-            budget=graph_state["budgets"]["critic"],
+        budget = graph_state["budgets"]["critic"]
+        prediction = await self._run_in_stage(
+            budget,
+            lambda: self._submit(
+                graph_state["runtime"],
+                graph_state["task"],
+                decision,
+                graph_state["tools"],
+                budget=budget,
+            ),
+            graph_state["stage_runtime"],
         )
         return {"prediction": prediction}
 
@@ -699,6 +726,7 @@ class Orchestrator:
         *,
         correction: bool,
         budget: StageBudget,
+        stage_runtime: _StageRuntime | None = None,
     ) -> None:
         if state.step_count >= self._config.max_steps:
             raise _CorrectionUnavailable("correction would exceed the global step budget")
@@ -742,6 +770,7 @@ class Orchestrator:
                 result = await self._run_in_stage(
                     budget,
                     lambda: specialist.run(task, step, tuple(state.evidence), tools),
+                    stage_runtime,
                 )
             finally:
                 state.usage = _add_usage(state.usage, specialist.last_usage)
@@ -816,6 +845,7 @@ class Orchestrator:
         tools: _BudgetedToolClient,
         *,
         budget: StageBudget,
+        stage_runtime: _StageRuntime | None = None,
     ) -> CriticDecision:
         state.verify_count += 1
         tools.start_scope(
@@ -848,6 +878,7 @@ class Orchestrator:
                         tuple(state.evidence),
                         tools,
                     ),
+                    stage_runtime,
                 )
             finally:
                 state.usage = _add_usage(state.usage, self._critic.last_usage)
@@ -938,6 +969,7 @@ class Orchestrator:
         tools: _BudgetedToolClient,
         *,
         budget: StageBudget | None = None,
+        stage_runtime: _StageRuntime | None = None,
     ) -> None:
         if self.correction_count:
             raise _CorrectionUnavailable("only one correction cycle is allowed")
@@ -975,6 +1007,7 @@ class Orchestrator:
                     tools,
                     correction=True,
                     budget=active_budget,
+                    stage_runtime=stage_runtime,
                 )
         self._audit(
             "correction_completed",
@@ -1136,14 +1169,44 @@ class Orchestrator:
         self,
         budget: StageBudget,
         operation: Callable[[], Awaitable[Any]],
+        stage_runtime: _StageRuntime | None = None,
     ) -> Any:
+        previous_stage = stage_runtime.active if stage_runtime is not None else None
+        if stage_runtime is not None:
+            stage_runtime.active = budget.name
+        interrupted = False
         try:
             if budget.deadline is None:
                 return await operation()
             async with asyncio.timeout_at(budget.deadline):
                 return await operation()
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         except TimeoutError as error:
             raise StageBudgetExceeded(budget.name, "time") from error
+        finally:
+            if stage_runtime is not None and not interrupted:
+                stage_runtime.active = previous_stage
+
+    def _audit_stage_budget_exhausted(
+        self,
+        error: StageBudgetExceeded,
+        budget: StageBudget,
+        tools: _BudgetedToolClient | None,
+    ) -> None:
+        self._audit(
+            "stage_budget_exhausted",
+            {
+                "stage": error.stage,
+                "reason": error.reason,
+                "timeout_seconds": self._stage_timeout_seconds(error.stage),
+                "max_calls": budget.max_calls,
+                "logical_calls": (
+                    tools.stage_logical_call_count(error.stage) if tools is not None else 0
+                ),
+            },
+        )
 
     def _audit(self, event_type: str, payload: dict[str, Any]) -> None:
         self._audit_events.append(

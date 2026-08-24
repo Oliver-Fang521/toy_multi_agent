@@ -2111,6 +2111,140 @@ async def test_critic_stage_timeout_does_not_submit_unverified_answer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_specialist_timeout_routes_prior_validated_state_to_critic() -> None:
+    calls: list[str] = []
+
+    class BlockingLookup:
+        last_usage = Usage()
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        async def run(
+            self,
+            task: GaiaTask,
+            step: PlanStep,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> AgentResult:
+            calls.append("lookup")
+            assert [item.evidence_id for item in evidence] == ["evidence-0001"]
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+    blocking_lookup = BlockingLookup()
+    computation = FakeSpecialist(
+        SpecialistName.COMPUTATION,
+        calls,
+        [
+            _result(
+                SpecialistName.COMPUTATION,
+                (_evidence("calculation-1", "computation"),),
+                "42",
+            )
+        ],
+    )
+    critic = FakeCritic(
+        calls,
+        [_decision("approve", ("evidence-0001",))],
+    )
+    orchestrator = Orchestrator(
+        planner=FakePlanner(
+            calls,
+            _plan(SpecialistName.COMPUTATION, SpecialistName.LOOKUP),
+        ),
+        specialists={
+            SpecialistName.COMPUTATION: computation,
+            SpecialistName.LOOKUP: blocking_lookup,
+        },
+        critic=critic,
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(
+            timeout_seconds=0.20,
+            planner_timeout_seconds=0.01,
+            specialist_timeout_seconds=0.04,
+            critic_timeout_seconds=0.10,
+            quality_policy="benchmark",
+        ),
+    )
+
+    prediction = await orchestrator.run(_task(question="Compute the answer"))
+
+    assert blocking_lookup.cancelled is True
+    assert critic.candidates == ["42"]
+    assert [[item.evidence_id for item in seen] for seen in critic.evidence_seen] == [
+        ["evidence-0001"]
+    ]
+    assert calls == ["planner", "computation", "lookup", "critic", "submit_answer"]
+    assert prediction.answer == "42"
+    assert prediction.error_category is None
+    budget_events = [
+        event
+        for event in orchestrator.audit_events
+        if event.event_type == "stage_budget_exhausted"
+    ]
+    assert len(budget_events) == 1
+    assert budget_events[0].payload["stage"] == "specialist"
+    assert budget_events[0].payload["reason"] == "time"
+
+
+@pytest.mark.asyncio
+async def test_derived_default_critic_deadline_emits_typed_budget_audit() -> None:
+    calls: list[str] = []
+
+    class BlockingCritic:
+        last_usage = Usage()
+
+        async def verify(
+            self,
+            task: GaiaTask,
+            candidate: str | None,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> CriticDecision:
+            calls.append("critic")
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    source = _evidence("source-1", "source")
+    orchestrator = Orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={
+            SpecialistName.LOOKUP: FakeSpecialist(
+                SpecialistName.LOOKUP,
+                calls,
+                [_result(SpecialistName.LOOKUP, (source,), "Marie Curie")],
+            )
+        },
+        critic=BlockingCritic(),
+        tool_client_factory=FakeToolFactory(FakeTools(calls)),
+        config=_config(timeout_seconds=0.06),
+    )
+
+    prediction = await orchestrator.run(_task())
+
+    budget_events = [
+        event
+        for event in orchestrator.audit_events
+        if event.event_type == "stage_budget_exhausted"
+    ]
+    assert len(budget_events) == 1
+    assert budget_events[0].payload == {
+        "stage": "critic",
+        "reason": "time",
+        "timeout_seconds": pytest.approx(0.012),
+        "max_calls": 6,
+        "logical_calls": 0,
+    }
+    assert prediction.answer is None
+    assert prediction.error_category == TerminalErrorCategory.TIMEOUT
+
+
+@pytest.mark.asyncio
 async def test_specialist_completion_preserves_reserved_critic_deadline() -> None:
     calls: list[str] = []
     source = _evidence("source-1", "source")
