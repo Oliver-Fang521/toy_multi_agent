@@ -1,4 +1,3 @@
-import asyncio
 import json
 from collections.abc import Callable
 from typing import Any
@@ -6,8 +5,10 @@ from typing import Any
 import httpx
 import pytest
 
+from gaia_agent import search as search_module
 from gaia_agent.reliability import RetryPolicy
 from gaia_agent.search import (
+    OpenAISearchProvider,
     SearchProviderChain,
     SearchProviderError,
     SearchUnavailableError,
@@ -120,6 +121,99 @@ def _transient(provider: str) -> SearchProviderError:
 
 
 @pytest.mark.asyncio
+async def test_builtin_timeout_is_retryable_and_falls_back_to_serper() -> None:
+    class TimedOutOpenAI:
+        provider = "openai"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            raise TimeoutError
+
+    class HealthySerper:
+        provider = "serper"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            return {"answer": "fallback", "sources": []}
+
+    chain = SearchProviderChain(
+        [OpenAISearchProvider(TimedOutOpenAI()), HealthySerper()],
+        RetryPolicy(max_attempts=1),
+        clock=lambda: 0.0,
+    )
+
+    result = await chain.search("question")
+
+    assert result.provider == "serper"
+    assert result.fallback_used is True
+
+
+@pytest.mark.asyncio
+async def test_search_chain_does_not_retry_when_deadline_cannot_cover_backoff() -> None:
+    class AlwaysTimeoutProvider:
+        provider = "openai"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            raise SearchProviderError(provider=self.provider, category="timeout", retryable=True)
+
+    provider = AlwaysTimeoutProvider()
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    chain = SearchProviderChain(
+        [provider],
+        RetryPolicy(max_attempts=2, base_delay_seconds=0.5),
+        clock=lambda: 10.0,
+        operation_timeout_seconds=0.1,
+        sleep=sleep,
+    )
+
+    with pytest.raises(search_module.SearchDeadlineExceeded):
+        await chain.search("question")
+
+    assert provider.calls == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_search_chain_does_not_start_fallback_after_deadline() -> None:
+    class TimedOutOpenAI:
+        provider = "openai"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            now[0] = 10.1
+            raise SearchProviderError(provider=self.provider, category="timeout", retryable=True)
+
+    class HealthySerper:
+        provider = "serper"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            return {"answer": "fallback", "sources": []}
+
+    now = [10.0]
+    serper = HealthySerper()
+    chain = SearchProviderChain(
+        [TimedOutOpenAI(), serper],
+        RetryPolicy(max_attempts=1),
+        clock=lambda: now[0],
+        operation_timeout_seconds=0.1,
+    )
+
+    with pytest.raises(search_module.SearchDeadlineExceeded):
+        await chain.search("question")
+
+    assert serper.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_search_chain_falls_back_in_order_after_bounded_transient_retries() -> None:
     openai = _ScriptedProvider("openai", [_transient("openai"), _transient("openai")])
     serper = _ScriptedProvider("serper", [{"answer": "fallback", "sources": []}])
@@ -172,21 +266,19 @@ async def test_search_chain_opens_circuit_skips_provider_then_closes_after_probe
 
 
 @pytest.mark.asyncio
-async def test_search_chain_waits_with_bounded_backoff_before_retrying_transient_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_search_chain_waits_with_bounded_backoff_before_retrying_transient_failure() -> None:
     delays: list[float] = []
 
     async def sleep(delay: float) -> None:
         delays.append(delay)
 
-    monkeypatch.setattr(asyncio, "sleep", sleep)
     openai = _ScriptedProvider("openai", [_transient("openai"), _transient("openai")])
     serper = _ScriptedProvider("serper", [{"answer": "fallback", "sources": []}])
     chain = SearchProviderChain(
         [openai, serper],
         RetryPolicy(max_attempts=2, base_delay_seconds=0.5, max_delay_seconds=1),
         clock=lambda: 0.0,
+        sleep=sleep,
     )
 
     assert await chain.search("question") == {"answer": "fallback", "sources": []}

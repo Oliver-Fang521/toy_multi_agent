@@ -657,6 +657,7 @@ class HostedOpenAIBackend:
         reasoning_effort: str,
         attachment_reader: AttachmentReader,
         timeout_seconds: float,
+        web_search_timeout_seconds: float | None = None,
     ) -> None:
         self._client = client
         self._model = model
@@ -664,7 +665,8 @@ class HostedOpenAIBackend:
         self._attachments = attachment_reader
         self._timeout_seconds = timeout_seconds
         self._web_search_timeout_seconds = min(
-            timeout_seconds, MAX_HOSTED_WEB_SEARCH_TIMEOUT_SECONDS
+            timeout_seconds if web_search_timeout_seconds is None else web_search_timeout_seconds,
+            MAX_HOSTED_WEB_SEARCH_TIMEOUT_SECONDS,
         )
         self._remote_file_ids: dict[Path, str] = {}
 
@@ -1159,6 +1161,11 @@ def _settings_from_env() -> MCPServerSettings:
     )
     search_circuit_cooldown = float(os.environ.get("GAIA_SEARCH_CIRCUIT_COOLDOWN", "30"))
     fake_backend = os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1"
+    fallback_provider_count = int(bool(serper_api_key)) + int(bool(serpapi_api_key))
+    hosted_web_search_timeout_seconds = min(
+        timeout_seconds / (fallback_provider_count + 1),
+        MAX_HOSTED_WEB_SEARCH_TIMEOUT_SECONDS,
+    )
     if fake_backend:
         backend: HostedBackend = FakeHostedBackend(api_key, hf_token, attachment_reader)
     else:
@@ -1169,6 +1176,7 @@ def _settings_from_env() -> MCPServerSettings:
             reasoning_effort=os.environ.get("GAIA_REASONING_EFFORT", "max"),
             attachment_reader=attachment_reader,
             timeout_seconds=timeout_seconds,
+            web_search_timeout_seconds=hosted_web_search_timeout_seconds,
         )
     search_provider: SearchProvider | None = None
     search_client: httpx.AsyncClient | None = None
@@ -1192,6 +1200,7 @@ def _settings_from_env() -> MCPServerSettings:
             provider_retry_policy,
             time.monotonic,
             circuit_cooldown_seconds=search_circuit_cooldown,
+            operation_timeout_seconds=timeout_seconds,
         )
     return MCPServerSettings(
         task_root=task_root,

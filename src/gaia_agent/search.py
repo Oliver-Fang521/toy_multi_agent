@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -53,6 +53,10 @@ class SearchUnavailableError(ToolCallError):
         self.attempt_count = max(1, attempt_count)
         self.circuit_open_count = max(0, circuit_open_count)
         self.fallback_attempted = fallback_attempted
+
+
+class SearchDeadlineExceeded(RuntimeError):
+    pass
 
 
 class SearchProviderResult(dict[str, Any]):
@@ -227,6 +231,12 @@ class OpenAISearchProvider:
             result = await self._backend.search(query)
         except SearchProviderError:
             raise
+        except TimeoutError:
+            raise SearchProviderError(
+                provider=self.provider,
+                category="timeout",
+                retryable=True,
+            ) from None
         except Exception as error:
             status = getattr(error, "status_code", None)
             if isinstance(status, int):
@@ -257,19 +267,33 @@ class SearchProviderChain:
         *,
         circuit_failure_threshold: int = 2,
         circuit_cooldown_seconds: float = 30.0,
+        operation_timeout_seconds: float | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._providers = tuple(providers)
         self._retry_policy = retry_policy
         self._clock = clock
         self._threshold = circuit_failure_threshold
         self._cooldown = circuit_cooldown_seconds
+        self._operation_timeout_seconds = operation_timeout_seconds
+        self._sleep = sleep
         self._circuits = {provider.provider: _Circuit() for provider in self._providers}
 
+    def _can_wait(self, deadline: float | None, delay: float) -> bool:
+        return deadline is None or deadline - self._clock() > delay
+
     async def search(self, query: str) -> dict[str, Any]:
+        deadline = (
+            None
+            if self._operation_timeout_seconds is None
+            else self._clock() + self._operation_timeout_seconds
+        )
         total_attempts = 0
         circuit_open_count = 0
         fallback_attempted = False
         for provider_index, provider in enumerate(self._providers):
+            if not self._can_wait(deadline, 0.0):
+                raise SearchDeadlineExceeded
             circuit = self._circuits[provider.provider]
             if circuit.open_until > self._clock():
                 circuit_open_count += 1
@@ -277,6 +301,8 @@ class SearchProviderChain:
             if provider_index > 0:
                 fallback_attempted = True
             for attempt in range(1, self._retry_policy.max_attempts + 1):
+                if not self._can_wait(deadline, 0.0):
+                    raise SearchDeadlineExceeded
                 total_attempts += 1
                 try:
                     result = await provider.search(query)
@@ -286,7 +312,10 @@ class SearchProviderChain:
                         circuit.open_until = 0.0
                         break
                     if attempt < self._retry_policy.max_attempts:
-                        await asyncio.sleep(retry_delay(self._retry_policy, attempt, lambda: 0.0))
+                        delay = retry_delay(self._retry_policy, attempt, lambda: 0.0)
+                        if not self._can_wait(deadline, delay):
+                            raise SearchDeadlineExceeded
+                        await self._sleep(delay)
                         continue
                     circuit.failures += 1
                     if circuit.failures >= self._threshold:

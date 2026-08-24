@@ -1828,6 +1828,43 @@ async def test_hosted_web_search_caps_only_its_response_timeout(
 
 
 @pytest.mark.asyncio
+async def test_hosted_web_search_reserves_configured_time_for_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = SimpleNamespace(
+        output_text="answer",
+        output=[],
+        usage=SimpleNamespace(
+            input_tokens=2,
+            output_tokens=1,
+            total_tokens=3,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+        ),
+    )
+    observed_timeouts: list[float] = []
+
+    async def capturing_wait_for(awaitable: Any, *, timeout: float) -> Any:
+        observed_timeouts.append(timeout)
+        return await awaitable
+
+    monkeypatch.setattr(mcp_server.asyncio, "wait_for", capturing_wait_for)
+    backend = HostedOpenAIBackend(
+        client=FakeHostedClient(response),
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        timeout_seconds=10.0,
+        web_search_timeout_seconds=5.0,
+    )
+
+    await backend.web_search("question")
+
+    assert observed_timeouts == [5.0]
+    assert observed_timeouts[0] < backend._timeout_seconds
+
+
+@pytest.mark.asyncio
 async def test_hosted_search_bounds_result_and_sources_while_preserving_usage(
     tmp_path: Path,
 ) -> None:
