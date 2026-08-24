@@ -24,6 +24,7 @@ from gaia_agent.models import (
 from gaia_agent.research_notebook import (
     NotebookEntry,
     ResearchNotebook,
+    _is_safe_source_url,
     _open_directory,
     select_evidence_cards,
 )
@@ -1012,7 +1013,7 @@ def test_evidence_link_cards_expose_only_bounded_authenticated_metadata(
             "answer": "Authenticated answer " + "x" * 5_000,
             "sources": [
                 {
-                    "url": "https://example.test/private/path?credential=secret",
+                    "url": "https://example.test/private/path?view=summary",
                     "title": "Primary title " + "t" * 1_000,
                 }
             ],
@@ -1030,6 +1031,7 @@ def test_evidence_link_cards_expose_only_bounded_authenticated_metadata(
     assert len(cards[0]["title"]) <= 256
     assert len(cards[0]["excerpt"]) <= 1_536
     encoded = json.dumps(cards)
+    assert "https://example.test/private/path?view=summary" not in encoded
     assert "password" not in encoded
     assert "credential" not in encoded
     assert "private diagnostic" not in encoded
@@ -1118,3 +1120,60 @@ def test_evidence_for_hashes_maps_only_usable_typed_non_source_results(
     ]
     assert all(item.source_url is None for item in evidence)
     assert "read_attachment" not in hashes_by_tool
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/fact?q=public#section-two",
+        "http://8.8.8.8/fact",
+        "https://[2606:4700:4700::1111]/fact",
+    ],
+)
+def test_safe_source_url_accepts_public_hosts_without_credentials(url: str) -> None:
+    assert _is_safe_source_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param("https://user:password@example.com/fact", id="userinfo"),
+        pytest.param("http://localhost/fact", id="localhost"),
+        pytest.param("http://api.localhost./fact", id="localhost-subdomain"),
+        pytest.param("http://127.0.0.1/fact", id="ipv4-loopback"),
+        pytest.param("http://10.0.0.1/fact", id="ipv4-private"),
+        pytest.param("http://169.254.10.20/fact", id="ipv4-link-local"),
+        pytest.param("http://224.0.0.1/fact", id="ipv4-multicast"),
+        pytest.param("http://192.0.2.1/fact", id="ipv4-reserved"),
+        pytest.param("http://0.0.0.0/fact", id="ipv4-unspecified"),
+        pytest.param("http://[::1]/fact", id="ipv6-loopback"),
+        pytest.param("http://[fc00::1]/fact", id="ipv6-private"),
+        pytest.param("http://[fe80::1]/fact", id="ipv6-link-local"),
+        pytest.param("http://[ff00::1]/fact", id="ipv6-multicast"),
+        pytest.param("http://[2001:db8::1]/fact", id="ipv6-reserved"),
+        pytest.param("http://[::]/fact", id="ipv6-unspecified"),
+        pytest.param("https://example.com/fact?token=value", id="query-token"),
+        pytest.param("https://example.com/fact?api%5Fkey=value", id="encoded-query-key"),
+        pytest.param(
+            "https://example.com/fact?X-Amz-Signature=value",
+            id="signature-variant",
+        ),
+        pytest.param("https://example.com/fact?apikey=value", id="compact-key-variant"),
+        pytest.param(
+            "https://example.com/fact?accessToken=value",
+            id="camel-token-variant",
+        ),
+        pytest.param(
+            "https://example.com/fact?clientSecret=value",
+            id="camel-secret-variant",
+        ),
+        pytest.param(
+            "https://example.com/fact?oauthSignature=value",
+            id="camel-signature-variant",
+        ),
+        pytest.param("https://example.com/fact#access_token=value", id="fragment-token"),
+        pytest.param("https://example.com/fact#auth%3Avalue", id="encoded-fragment-auth"),
+    ],
+)
+def test_safe_source_url_rejects_nonpublic_or_credential_bearing_urls(url: str) -> None:
+    assert _is_safe_source_url(url) is False

@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
+import re
 import secrets
 import stat
 import tempfile
@@ -15,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, unquote_plus, urlparse
 
 from gaia_agent.models import Evidence, StageCheckpoint
 
@@ -26,6 +28,24 @@ _LINKABLE_CARD_KEYS = frozenset(
     {"entry_hash", "tool_kind", "title", "domain", "excerpt"}
 )
 _SOURCE_TOOLS = frozenset({"web_search", "read_webpage"})
+_SENSITIVE_URL_FIELD_PARTS = frozenset(
+    {
+        "auth",
+        "authentication",
+        "authorization",
+        "bearer",
+        "credential",
+        "credentials",
+        "key",
+        "passwd",
+        "password",
+        "pwd",
+        "secret",
+        "sig",
+        "signature",
+        "token",
+    }
+)
 _ENTRY_SCHEMA_VERSION = 1
 _ENTRY_CONTRACT = "gaia.research-notebook.entry"
 _TRUST_ANCHOR_SCHEMA_VERSION = 1
@@ -247,12 +267,70 @@ def _evidence_from_entry(entry: NotebookEntry) -> Evidence | None:
 def _is_safe_source_url(value: str | None) -> bool:
     if not value:
         return False
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or _has_sensitive_url_component(parsed.query)
+        or _has_sensitive_url_component(parsed.fragment)
+    ):
+        return False
+    normalized_hostname = hostname.rstrip(".").casefold()
+    if normalized_hostname == "localhost" or normalized_hostname.endswith(".localhost"):
+        return False
+    try:
+        address = ipaddress.ip_address(normalized_hostname)
+    except ValueError:
+        return True
     return (
-        parsed.scheme in {"http", "https"}
-        and bool(parsed.hostname)
-        and parsed.username is None
-        and parsed.password is None
+        address.is_global
+        and not address.is_private
+        and not address.is_loopback
+        and not address.is_link_local
+        and not address.is_multicast
+        and not address.is_reserved
+        and not address.is_unspecified
+    )
+
+
+def _has_sensitive_url_component(value: str) -> bool:
+    if not value:
+        return False
+    decoded = value
+    for _ in range(2):
+        expanded = unquote_plus(decoded)
+        if expanded == decoded:
+            break
+        decoded = expanded
+    fields = [field for field, _ in parse_qsl(decoded, keep_blank_values=True)]
+    markers = [segment.split("=", 1)[0].split(":", 1)[0] for segment in re.split(r"[?&#;]", decoded)]
+    return any(_is_sensitive_url_field(field) for field in (*fields, *markers))
+
+
+def _is_sensitive_url_field(value: str) -> bool:
+    parts = tuple(re.findall(r"[a-z0-9]+", value.casefold()))
+    compact = "".join(parts)
+    return bool(parts) and (
+        any(part in _SENSITIVE_URL_FIELD_PARTS for part in parts)
+        or compact.endswith(
+            (
+                "accesstoken",
+                "apikey",
+                "credential",
+                "password",
+                "privatekey",
+                "secret",
+                "signature",
+                "token",
+            )
+        )
+        or compact in {"accesskey", "awsaccesskeyid", "authcode", "authorizationcode"}
     )
 
 

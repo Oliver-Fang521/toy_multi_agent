@@ -444,13 +444,8 @@ class EvidenceLinkerAgent:
                 "properties": {
                     "evidence_entry_hashes": {
                         "type": "array",
-                        "items": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": _MAX_EVIDENCE_LINK_HASH_CHARS,
-                        },
+                        "items": {"type": "string"},
                         "maxItems": self.max_cards,
-                        "uniqueItems": True,
                     }
                 },
                 "required": ["evidence_entry_hashes"],

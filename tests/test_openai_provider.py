@@ -18,9 +18,10 @@ from openai.types.responses import Response
 from pydantic import ValidationError
 
 from gaia_agent import mcp_server, providers
+from gaia_agent.agents import EvidenceLinkerAgent
 from gaia_agent.mcp_client import ToolExecutionError
 from gaia_agent.mcp_server import AttachmentReader, MCPServerSettings, build_server
-from gaia_agent.models import Usage
+from gaia_agent.models import GaiaTask, Usage
 from gaia_agent.observability import Observability, ObservabilityConfig
 from gaia_agent.orchestrator import _RepeatedToolCall, _ToolBudgetExhausted
 from gaia_agent.providers import ModelRequest, OpenAIProvider, ToolSpec
@@ -29,6 +30,48 @@ from gaia_agent.reliability import RetryPolicy
 
 def test_openai_provider_declares_native_vision_support() -> None:
     assert OpenAIProvider.supports_vision is True
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_schema_uses_openai_strict_supported_subset(
+    fake_responses_client,
+) -> None:
+    fake_responses_client.queue_text('{"evidence_entry_hashes":["known"]}')
+    provider = OpenAIProvider(fake_responses_client, "gpt-5.6-sol")
+    linker = EvidenceLinkerAgent(provider)
+    task = GaiaTask(
+        task_id="schema-task",
+        question="Which card supports the candidate?",
+        level=1,
+        final_answer="hidden",
+    )
+
+    selected = await linker.link(
+        task,
+        "candidate",
+        ({"entry_hash": "known", "excerpt": "support"},),
+    )
+
+    assert selected == ("known",)
+    assert fake_responses_client.requests[0]["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "gaia_response",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "evidence_entry_hashes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 12,
+                    }
+                },
+                "required": ["evidence_entry_hashes"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    }
 
 
 def _usage(input_tokens: int, output_tokens: int, reasoning_tokens: int) -> dict[str, Any]:
