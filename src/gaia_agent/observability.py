@@ -78,6 +78,23 @@ _SAFE_TERMINAL_ROUTES = frozenset(
 )
 _SAFE_ROOT_STAGES = frozenset({"plan", "act", "verify", "correct", "submit", "recovery"})
 _SAFE_RECOVERY_CODES = frozenset({"not_needed", "succeeded", "exhausted", "checkpoint"})
+_SAFE_RECOVERY_SOURCES = frozenset({"not_needed", "checkpoint", "retry"})
+_SAFE_STAGE_NAMES = frozenset({"planner", "specialist", "critic", "submit"})
+_SAFE_REMAINING_BUCKETS = frozenset({"ample", "low", "exhausted"})
+_SAFE_SPECIALISTS = frozenset({"lookup", "computation", "file", "visual"})
+_SAFE_TOOL_NAMES = frozenset(
+    {
+        "web_search",
+        "read_webpage",
+        "execute_python",
+        "read_attachment",
+        "transcribe_audio",
+        "submit_answer",
+    }
+)
+_SAFE_EVIDENCE_KINDS = frozenset({"source", "calculation", "file", "visual"})
+_SAFE_METADATA_STAGES = _SAFE_ROOT_STAGES | _SAFE_STAGE_NAMES
+_SAFE_SUMMARY_DECISIONS = _SAFE_CRITIC_VERDICTS | frozenset({"submit", "parsed", "unparsed"})
 _SAFE_CRITIC_FALLBACK_REASONS = frozenset(
     {
         "critic_repair_exhausted_degraded_approval",
@@ -114,6 +131,7 @@ _TASK_OUTCOME_KEYS = frozenset(
         "attempt_number",
         "recovery_count",
         "recovery_succeeded",
+        "recovery_source",
         "retry_reason",
         "retry_category",
         "terminal_route",
@@ -200,8 +218,20 @@ _SAFE_SUMMARY_KEYS = frozenset(
         "retry_category",
         "retry_decision",
         "recovery",
+        "recovery_source",
         "stages",
         "fallback_reason",
+        "stage",
+        "budget_seconds",
+        "elapsed_seconds",
+        "remaining_bucket",
+        "logical_call_count",
+        "global_call_count",
+        "executed_call_count",
+        "restored_call_count",
+        "provider",
+        "category",
+        "attempt_count",
     }
 )
 _CURRENT_TRACE: ContextVar[TaskTrace | None] = ContextVar("gaia_langfuse_trace", default=None)
@@ -299,6 +329,7 @@ class TaskTraceOutcome:
     attempt_number: int = 1
     recovery_count: int = 0
     recovery_succeeded: bool = False
+    recovery_source: str = "not_needed"
     retry_reason: str | None = None
     retry_category: str | None = None
     terminal_route: str = "terminal_failure"
@@ -324,6 +355,11 @@ class TaskTraceOutcome:
             "attempt_number": max(1, _bounded_count(self.attempt_number)),
             "recovery_count": _bounded_count(self.recovery_count),
             "recovery_succeeded": bool(self.recovery_succeeded),
+            "recovery_source": (
+                self.recovery_source
+                if self.recovery_source in _SAFE_RECOVERY_SOURCES
+                else "not_needed"
+            ),
             "retry_reason": (
                 self.retry_reason if self.retry_reason in _SAFE_RETRY_REASONS else None
             ),
@@ -405,6 +441,22 @@ def _sanitize_metadata(metadata: dict[str, object] | None) -> dict[str, object]:
         key = str(raw_key)
         if key not in _SAFE_METADATA_KEYS:
             continue
+        if key == "stage":
+            if value in _SAFE_METADATA_STAGES:
+                safe[key] = value
+            continue
+        if key == "specialist":
+            if value in _SAFE_SPECIALISTS:
+                safe[key] = value
+            continue
+        if key == "tool":
+            if value in _SAFE_TOOL_NAMES:
+                safe[key] = value
+            continue
+        if key == "verdict":
+            if value in _SAFE_CRITIC_VERDICTS:
+                safe[key] = value
+            continue
         if key in _TRACE_DECISION_KEYS:
             sanitized = _safe_trace_decision(key, value)
             if sanitized is not None:
@@ -483,6 +535,7 @@ def _sanitize_task_outcome(value: dict[str, object] | object) -> dict[str, objec
         attempt_number=raw.get("attempt_number", 1),
         recovery_count=raw.get("recovery_count", 0),
         recovery_succeeded=bool(raw.get("recovery_succeeded", False)),
+        recovery_source=str(raw.get("recovery_source", "not_needed")),
         retry_reason=(str(raw["retry_reason"]) if raw.get("retry_reason") is not None else None),
         retry_category=(
             str(raw["retry_category"]) if raw.get("retry_category") is not None else None
@@ -500,7 +553,40 @@ def _sanitize_summary(value: dict[str, object] | None) -> dict[str, object]:
         key = str(raw_key)
         if key not in _SAFE_SUMMARY_KEYS:
             continue
-        if isinstance(raw_value, bool):
+        if key == "stage":
+            if raw_value in _SAFE_STAGE_NAMES:
+                safe[key] = raw_value
+        elif key == "remaining_bucket":
+            if raw_value in _SAFE_REMAINING_BUCKETS:
+                safe[key] = raw_value
+        elif key == "provider":
+            if raw_value in _SAFE_TRACE_PROVIDERS:
+                safe[key] = raw_value
+        elif key == "category":
+            if raw_value in _SAFE_TRACE_CATEGORIES:
+                safe[key] = raw_value
+        elif key == "attempt_count":
+            if (
+                isinstance(raw_value, int)
+                and not isinstance(raw_value, bool)
+                and 1 <= raw_value <= _MAX_OUTCOME_COUNT
+            ):
+                safe[key] = raw_value
+        elif key in {"budget_seconds", "elapsed_seconds"}:
+            if (
+                isinstance(raw_value, (int, float))
+                and not isinstance(raw_value, bool)
+                and math.isfinite(raw_value)
+            ):
+                safe[key] = min(1_000_000_000.0, max(0.0, float(raw_value)))
+        elif key in {
+            "logical_call_count",
+            "global_call_count",
+            "executed_call_count",
+            "restored_call_count",
+        }:
+            safe[key] = _bounded_count(raw_value)
+        elif isinstance(raw_value, bool):
             safe[key] = raw_value
         elif isinstance(raw_value, int) and not isinstance(raw_value, bool):
             safe[key] = max(0, raw_value) if key.endswith(("_count", "_number")) else raw_value
@@ -514,6 +600,9 @@ def _sanitize_summary(value: dict[str, object] | None) -> dict[str, object]:
             elif key == "recovery":
                 if raw_value in _SAFE_RECOVERY_CODES:
                     safe[key] = raw_value
+            elif key == "recovery_source":
+                if raw_value in _SAFE_RECOVERY_SOURCES:
+                    safe[key] = raw_value
             elif key == "fallback_reason":
                 if raw_value in _SAFE_CRITIC_FALLBACK_REASONS:
                     safe[key] = raw_value
@@ -523,18 +612,32 @@ def _sanitize_summary(value: dict[str, object] | None) -> dict[str, object]:
                 )
                 if raw_value in allowed_routes:
                     safe[key] = raw_value
-            else:
-                safe[key] = raw_value[:_MAX_STRING_LENGTH]
+            elif key == "specialist":
+                if raw_value in _SAFE_SPECIALISTS:
+                    safe[key] = raw_value
+            elif (
+                key in {"verdict", "decision"}
+                and raw_value in _SAFE_SUMMARY_DECISIONS
+            ):
+                safe[key] = raw_value
         elif isinstance(raw_value, (list, tuple)):
             if key == "stages":
                 safe[key] = [
                     item for item in raw_value if isinstance(item, str) and item in _SAFE_ROOT_STAGES
                 ][:16]
-            else:
+            elif key == "specialists":
                 safe[key] = [
-                    item[:_MAX_STRING_LENGTH]
+                    item for item in raw_value if isinstance(item, str) and item in _SAFE_SPECIALISTS
+                ][:32]
+            elif key == "tool_names":
+                safe[key] = [
+                    item for item in raw_value if isinstance(item, str) and item in _SAFE_TOOL_NAMES
+                ][:32]
+            elif key == "evidence_kinds":
+                safe[key] = [
+                    item
                     for item in raw_value
-                    if isinstance(item, str)
+                    if isinstance(item, str) and item in _SAFE_EVIDENCE_KINDS
                 ][:32]
     return safe
 
@@ -621,12 +724,21 @@ class Span:
             return
         final_metadata = dict(metadata or {})
         final_metadata["status"] = status if status in _SAFE_STATUS_VALUES else "error"
+        final_summary = self._pending_summary if summary is None else summary
+        search_summary = {
+            key: final_metadata[key]
+            for key in ("provider", "category", "attempt_count", "fallback_used")
+            if key in final_metadata
+        }
+        if any(key in search_summary for key in ("provider", "category", "attempt_count")):
+            search_summary.setdefault("fallback_used", False)
+            final_summary = {**search_summary, **(final_summary or {})}
         self.update(
             metadata=final_metadata,
             usage=usage,
             input=input,
             output=output,
-            summary=self._pending_summary if summary is None else summary,
+            summary=final_summary,
         )
         self._pending_summary = None
         self._closed = True
@@ -822,6 +934,7 @@ class TaskTrace:
                 "attempt_number": output["attempt_number"],
                 "recovery_count": output["recovery_count"],
                 "recovery_succeeded": output["recovery_succeeded"],
+                "recovery_source": output["recovery_source"],
                 "retry_reason": output["retry_reason"],
                 "retry_category": output["retry_category"],
                 "terminal_route": output["terminal_route"],

@@ -726,6 +726,7 @@ class Orchestrator:
         state = graph_state["runtime"]
         task = graph_state["task"]
         self._audit("plan_started", {"task_id": task.task_id})
+        stage_started = asyncio.get_running_loop().time()
         with self._stage_span("planner", {"stage": "planner"}) as planner_span:
             try:
                 plan = await self._run_in_stage(
@@ -747,6 +748,11 @@ class Orchestrator:
                         ),
                         "fallback_used": bool(
                             getattr(self._planner, "last_fallback_used", False)
+                        ),
+                        **self._stage_operational_summary(
+                            graph_state["budgets"]["planner"],
+                            None,
+                            stage_started,
                         ),
                     }
                 )
@@ -1115,6 +1121,7 @@ class Orchestrator:
                 "step_number": state.step_count,
             },
         )
+        stage_started = asyncio.get_running_loop().time()
         with self._stage_span(
             "specialist",
             {
@@ -1143,6 +1150,7 @@ class Orchestrator:
                         "repair_attempted": bool(
                             getattr(specialist, "last_repair_attempted", False)
                         ),
+                        **self._stage_operational_summary(budget, tools, stage_started),
                     }
                 )
         trusted_evidence_ids = self._record_result(state, step, result)
@@ -1218,6 +1226,7 @@ class Orchestrator:
                 "has_candidate": state.candidate is not None,
             },
         )
+        stage_started = asyncio.get_running_loop().time()
         with self._stage_span(
             "critic",
             {
@@ -1255,6 +1264,7 @@ class Orchestrator:
                             "last_fallback_reason",
                             None,
                         ),
+                        **self._stage_operational_summary(budget, tools, stage_started),
                     }
                 )
         known_ids = {item.evidence_id for item in state.evidence}
@@ -1467,6 +1477,7 @@ class Orchestrator:
             "submit_started",
             {"evidence_ids": list(evidence_ids)},
         )
+        stage_started = asyncio.get_running_loop().time()
         with self._stage_span(
             "submit",
             {"stage": "submit", "evidence_count": len(evidence_ids)},
@@ -1482,6 +1493,7 @@ class Orchestrator:
                         "evidence_count": len(evidence_ids),
                         "candidate_present": True,
                         "tool_names": list(tools.scope_tool_names),
+                        **self._stage_operational_summary(budget, tools, stage_started),
                     }
                 )
         self._audit(
@@ -1574,6 +1586,37 @@ class Orchestrator:
                 payload=payload,
             )
         )
+
+    def _stage_operational_summary(
+        self,
+        budget: StageBudget,
+        tools: _BudgetedToolClient | None,
+        started: float,
+    ) -> dict[str, object]:
+        """Return bounded operational state without graph inputs or checkpoint data."""
+
+        elapsed = max(0.0, asyncio.get_running_loop().time() - started)
+        budget_seconds = self._stage_timeout_seconds(budget.name)
+        remaining = max(0.0, budget_seconds - elapsed)
+        remaining_bucket = (
+            "exhausted"
+            if remaining == 0.0
+            else "low"
+            if remaining <= budget_seconds * 0.25
+            else "ample"
+        )
+        return {
+            "stage": budget.name,
+            "budget_seconds": budget_seconds,
+            "elapsed_seconds": elapsed,
+            "remaining_bucket": remaining_bucket,
+            "logical_call_count": (
+                tools.stage_logical_call_count(budget.name) if tools is not None else 0
+            ),
+            "global_call_count": tools.logical_call_count if tools is not None else 0,
+            "executed_call_count": tools.executed_call_count if tools is not None else 0,
+            "restored_call_count": tools.restored_call_count if tools is not None else 0,
+        }
 
     def _stage_span(self, name: str, metadata: dict[str, object]) -> Any:
         if self._trace is None:

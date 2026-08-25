@@ -318,7 +318,7 @@ class EvaluationRunner:
                         checkpoint_restored=bool(
                             task_run
                             and any(
-                                event.event_type == "tool_call_restored"
+                                event.event_type == "checkpoint_restored"
                                 for event in task_run.audit_events
                             )
                         ),
@@ -1278,6 +1278,13 @@ def _task_trace_outcome(
     checkpoint_restored: bool,
     audit_events: Sequence[AuditEvent] = (),
 ) -> TaskTraceOutcome:
+    recovery_source = (
+        "checkpoint"
+        if checkpoint_restored
+        else "retry"
+        if prediction.recovery_count
+        else "not_needed"
+    )
     terminal_route = (
         "checkpoint_restored"
         if checkpoint_restored
@@ -1297,6 +1304,7 @@ def _task_trace_outcome(
         attempt_number=prediction.attempt_number,
         recovery_count=prediction.recovery_count,
         recovery_succeeded=prediction.recovery_succeeded,
+        recovery_source=recovery_source,
         retry_reason=prediction.retry_reason,
         retry_category=prediction.retry_category,
         terminal_route=terminal_route,

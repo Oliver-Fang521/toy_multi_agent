@@ -322,6 +322,7 @@ async def test_offline_ten_task_trace_reliability_simulation(tmp_path: Path) -> 
         "attempt_number",
         "recovery_count",
         "recovery_succeeded",
+        "recovery_source",
         "retry_reason",
         "retry_category",
         "terminal_route",
@@ -336,6 +337,7 @@ async def test_offline_ten_task_trace_reliability_simulation(tmp_path: Path) -> 
         and output["correct"] is True
         and output["attempt_number"] == 1
         and output["recovery_count"] == 0
+        and output["recovery_source"] == "not_needed"
         and output["terminal_route"] == "submit"
         and output["reasoning_summary"]
         == {"route": "submit", "recovery": "not_needed", "stages": ["verify", "submit"]}

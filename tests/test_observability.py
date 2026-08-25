@@ -64,6 +64,180 @@ class _FakeClient:
             raise RuntimeError("transport unavailable")
 
 
+def _assert_payload_excludes(payload: object, forbidden: set[str]) -> None:
+    """Assert every telemetry value remains free of private test sentinels."""
+
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            _assert_payload_excludes(key, forbidden)
+            _assert_payload_excludes(value, forbidden)
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            _assert_payload_excludes(value, forbidden)
+    elif isinstance(payload, str):
+        assert not any(sentinel in payload for sentinel in forbidden)
+
+
+def test_langfuse_summaries_keep_only_bounded_stage_search_and_recovery_metadata() -> None:
+    """Changing the summary allowlist to pass content or omit operational recovery data is a bug."""
+
+    client = _FakeClient()
+    trace = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+    ).start_task(
+        "task-safe-operational-summary",
+        level=2,
+        model="test-model",
+        reasoning_effort="max",
+        evaluation_mode="test",
+    )
+    private = {
+        "QUESTION-SENTINEL",
+        "ANSWER-SENTINEL",
+        "CANDIDATE-SENTINEL",
+        "PROMPT-SENTINEL",
+        "https://private.example/SENTINEL",
+        "EVIDENCE-EXCERPT-SENTINEL",
+        "RAW-ERROR-SENTINEL",
+        "CHECKPOINT-PAYLOAD-SENTINEL",
+        "/private/checkpoint/SENTINEL",
+        "NOTEBOOK-CONTENT-SENTINEL",
+        "SECRET-VALUE-SENTINEL",
+    }
+
+    stage = trace.span(
+        "specialist",
+        {
+            "stage": "QUESTION-SENTINEL",
+            "specialist": "CANDIDATE-SENTINEL",
+            "tool": "https://private.example/SENTINEL",
+        },
+    )
+    stage.end(
+        status="ok",
+        summary={
+            "stage": "specialist",
+            "budget_seconds": 120.0,
+            "elapsed_seconds": 91.5,
+            "remaining_bucket": "low",
+            "logical_call_count": 4,
+            "global_call_count": 7,
+            "executed_call_count": 3,
+            "restored_call_count": 1,
+            "question": "QUESTION-SENTINEL",
+            "answer": "ANSWER-SENTINEL",
+            "candidate": "CANDIDATE-SENTINEL",
+            "prompt": "PROMPT-SENTINEL",
+            "url": "https://private.example/SENTINEL",
+            "evidence": "EVIDENCE-EXCERPT-SENTINEL",
+            "error": "RAW-ERROR-SENTINEL",
+            "checkpoint": "CHECKPOINT-PAYLOAD-SENTINEL",
+            "checkpoint_path": "/private/checkpoint/SENTINEL",
+            "notebook": "NOTEBOOK-CONTENT-SENTINEL",
+            "secret": "SECRET-VALUE-SENTINEL",
+        },
+    )
+    search = trace.span("mcp-tool", {"tool": "web_search"})
+    search.end(
+        status="error",
+        metadata={
+            "provider": "serper",
+            "category": "timeout",
+            "attempt_count": 2,
+            "fallback_used": True,
+            "error": "RAW-ERROR-SENTINEL",
+        },
+    )
+    trace.finish(
+        TaskTraceOutcome(
+            answer_present=True,
+            evidence_count=1,
+            critic_verdict="approve",
+            error_category=None,
+            correct=True,
+            checkpoint_restored=True,
+            recovery_source="checkpoint",
+            terminal_route="checkpoint_restored",
+        )
+    )
+
+    assert client.observations[1].updates[-1]["output"] == {
+        "reasoning_summary": {
+            "stage": "specialist",
+            "budget_seconds": 120.0,
+            "elapsed_seconds": 91.5,
+            "remaining_bucket": "low",
+            "logical_call_count": 4,
+            "global_call_count": 7,
+            "executed_call_count": 3,
+            "restored_call_count": 1,
+        }
+    }
+    assert client.observations[2].updates[-1]["output"] == {
+        "reasoning_summary": {
+            "provider": "serper",
+            "category": "timeout",
+            "attempt_count": 2,
+            "fallback_used": True,
+        }
+    }
+    root_output = client.observations[0].updates[-1]["output"]
+    assert root_output["checkpoint_restored"] is True
+    assert root_output["recovery_source"] == "checkpoint"
+    _assert_payload_excludes(
+        [(observation.kwargs, observation.updates) for observation in client.observations],
+        private,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_marks_root_checkpoint_recovery_from_the_checkpoint_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing the restored-checkpoint event with a tool-cache event is a telemetry bug."""
+
+    from gaia_agent import runner as runner_module
+    from gaia_agent.config import RunConfig
+
+    tasks = [
+        GaiaTask(task_id=f"checkpoint-trace-{level}", question="private", level=level, final_answer="a")
+        for level in (1, 2, 3)
+    ]
+
+    class _Orchestrator:
+        audit_events = (type("_CheckpointEvent", (), {"event_type": "checkpoint_restored"})(),)
+
+        async def run(self, task: GaiaTask) -> TaskPrediction:
+            return TaskPrediction(
+                task_id=task.task_id,
+                level=task.level,
+                answer="a",
+                critic_verdict="approve",
+            )
+
+    client = _FakeClient()
+    monkeypatch.setattr(runner_module, "sample_stratified", lambda *_args: tasks)
+    monkeypatch.setattr(runner_module, "question_scorer", lambda *_args: True)
+    await EvaluationRunner(
+        config=RunConfig(
+            openai_api_key="sk-test",
+            hf_token="hf-test",
+            sample_size=3,
+            output_dir=tmp_path / "run",
+        ),
+        dataset_loader=lambda _config: (tasks, "revision"),
+        orchestrator_factory=lambda _task: _Orchestrator(),
+        observability=Observability(
+            ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+        ),
+    )._run()
+
+    root_output = client.observations[0].updates[-1]["output"]
+    assert root_output["checkpoint_restored"] is True
+    assert root_output["recovery_source"] == "checkpoint"
+
+
 def test_observability_defaults_to_noop_without_both_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -501,6 +675,7 @@ async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
         "attempt_number": 1,
         "recovery_count": 0,
         "recovery_succeeded": False,
+        "recovery_source": "not_needed",
         "retry_reason": None,
         "retry_category": None,
         "terminal_route": "submit",
@@ -782,6 +957,7 @@ def test_task_trace_outcome_bounds_counts_and_categories() -> None:
         "attempt_number": 1,
         "recovery_count": 0,
         "recovery_succeeded": False,
+        "recovery_source": "not_needed",
         "retry_reason": None,
         "retry_category": None,
         "terminal_route": "terminal_failure",

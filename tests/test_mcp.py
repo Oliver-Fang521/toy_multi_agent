@@ -754,7 +754,16 @@ async def test_mcp_failure_span_records_only_bounded_structured_failure_metadata
         "fallback_attempted": True,
         "status": "error",
     }
-    assert span.updates[-1]["output"] == {"result_key_count": 0, "result_keys": []}
+    assert span.updates[-1]["output"] == {
+        "result_key_count": 0,
+        "result_keys": [],
+        "reasoning_summary": {
+            "provider": "serper",
+            "category": "http_status",
+            "attempt_count": 3,
+            "fallback_used": False,
+        },
+    }
     assert secret not in repr(span.kwargs)
     assert secret not in repr(span.updates)
     assert "private.test" not in repr(span.updates)
