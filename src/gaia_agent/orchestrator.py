@@ -192,6 +192,7 @@ class _BudgetedToolClient:
         self._audit = audit
         self._notebook = notebook
         self._scope = "unscoped"
+        self._scope_logical_call_count = 0
         self._stage_budget: StageBudget | None = None
         self._stage_logical_call_counts: dict[str, int] = defaultdict(int)
         self._scope_tool_names: set[str] = set()
@@ -220,6 +221,7 @@ class _BudgetedToolClient:
         if not scope.strip():
             raise ValueError("tool-call scope must be non-empty")
         self._scope = scope
+        self._scope_logical_call_count = 0
         self._stage_budget = StageBudget(
             name=stage,
             deadline=deadline,
@@ -233,6 +235,12 @@ class _BudgetedToolClient:
 
     def stage_logical_call_count(self, stage: str) -> int:
         return self._stage_logical_call_counts[stage]
+
+    @property
+    def scope_logical_call_count(self) -> int:
+        """Logical calls in the active scope, for non-budget reporting only."""
+
+        return self._scope_logical_call_count
 
     def restore_logical_call_counts(
         self,
@@ -342,6 +350,7 @@ class _BudgetedToolClient:
     def _record_logical_call(self) -> None:
         self.logical_call_count += 1
         self.call_count = self.logical_call_count
+        self._scope_logical_call_count += 1
         if self._stage_budget is not None:
             self._stage_logical_call_counts[self._stage_budget.name] += 1
 
@@ -1645,7 +1654,11 @@ class Orchestrator:
         """Return bounded operational state without graph inputs or checkpoint data."""
 
         del started
-        budget_seconds = budget.budget_seconds or self._stage_timeout_seconds(budget.name)
+        budget_seconds = (
+            budget.budget_seconds
+            if budget.budget_seconds is not None
+            else self._stage_timeout_seconds(budget.name)
+        )
         stage_started = budget.started_at
         if stage_started is None:
             stage_started = (
@@ -1668,7 +1681,11 @@ class Orchestrator:
             "elapsed_seconds": elapsed,
             "remaining_bucket": remaining_bucket,
             "logical_call_count": (
-                tools.stage_logical_call_count(budget.name) if tools is not None else 0
+                0
+                if tools is None
+                else tools.scope_logical_call_count
+                if budget.name == "submit"
+                else tools.stage_logical_call_count(budget.name)
             ),
             "global_call_count": tools.logical_call_count if tools is not None else 0,
             "executed_call_count": tools.executed_call_count if tools is not None else 0,

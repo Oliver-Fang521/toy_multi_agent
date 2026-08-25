@@ -23,8 +23,8 @@
 - Full suite: `uv run pytest -q` — PASS.
 - Static/privacy formatting checks: `uv run ruff check src tests` and `git diff --check` — PASS.
 
-The recursive observability test uses only dummy sentinel strings and confirms they are absent from
-all recorded trace payloads, including question/answer/candidate/prompt/URL/evidence/error/
+The original direct-adapter recursive observability test uses only dummy sentinel strings and
+checks its recorded trace payloads for question/answer/candidate/prompt/URL/evidence/error/
 checkpoint/notebook/secret categories.
 
 ## Scope notes
@@ -47,3 +47,23 @@ OpenAI, and DeepSeek span closure, submit-stage labeling, and checkpoint route o
   its `finally` path with a bounded status, stage accounting is tied to the shared absolute budget
   envelope, submit has its own stage label and remaining critic envelope, and root route/recovery
   metadata are orthogonal.
+
+## Fix round 2
+
+- RED: a real successful Submit span reported `logical_call_count=0`, because Submit correctly
+  charged the Critic budget but the operational summary looked up an unpopulated `submit` budget
+  namespace. A zero-second submit envelope also fell back to the configured Critic timeout through
+  truthiness. Focused RED: `uv run pytest tests/test_orchestrator.py -k 'publishes_safe_reasoning_summaries or submit_summary_preserves_zero_remaining_budget' -q`.
+- GREEN: Submit now reports the active scope's logical calls for telemetry only, while retaining
+  the pre-existing Critic/global counters for all enforcement. Explicit `None` handling preserves
+  `budget_seconds=0.0`; failure and cancellation spans publish the same bounded zero-budget
+  summary.
+- Added a deterministic no-network production-path privacy harness. It drives real
+  `EvaluationRunner` → `Orchestrator` success, authenticated checkpoint restore, terminal
+  failure, and cancellation paths using boundary fakes, and separately drives a real
+  `SearchProviderChain` fallback through `MCPToolClient` and the observability adapter. It records
+  every trace/span input, output, metadata, and reasoning summary, asserts expected safe summaries
+  are present, and recursively rejects the exact dummy question, answers, prompts, URLs, evidence,
+  exception, checkpoint/notebook, HMAC/path, filename, and configured credential sentinels plus
+  forbidden raw structural fields. This covers those explicit deterministic test paths; it does
+  not claim live services or controller-owned scans.

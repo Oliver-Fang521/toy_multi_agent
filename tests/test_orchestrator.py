@@ -6,12 +6,13 @@ from collections import deque
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from datetime import datetime
 from pathlib import Path
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any, Self
 
 import pytest
 
 import gaia_agent.orchestrator as orchestrator_module
+from gaia_agent import runner as runner_module
 from gaia_agent.agents import StageProtocolError, StageValidationCode
 from gaia_agent.config import RunConfig
 from gaia_agent.mcp_client import AttachmentPolicyError, MCPToolClient, ToolExecutionError
@@ -32,14 +33,17 @@ from gaia_agent.models import (
 from gaia_agent.observability import Observability, ObservabilityConfig
 from gaia_agent.orchestrator import (
     Orchestrator,
+    StageBudget,
     _BudgetedToolClient,
     _TaskState,
     _ToolBudgetExhausted,
     choose_majority,
 )
 from gaia_agent.providers import ToolSpec
-from gaia_agent.reliability import ProviderTransientExhaustedError
+from gaia_agent.reliability import ProviderTransientExhaustedError, RetryPolicy
 from gaia_agent.research_notebook import ResearchNotebook
+from gaia_agent.runner import EvaluationRunner
+from gaia_agent.search import SearchProviderChain, SearchProviderError
 
 
 class FakePlanner:
@@ -1705,6 +1709,12 @@ async def test_orchestrator_publishes_safe_reasoning_summaries() -> None:
         if observation.name == "submit"
     )
     assert submit_summary["stage"] == "submit"
+    # Submit consumes the critic envelope for enforcement, but its operational
+    # summary must report the one actual submit invocation rather than looking
+    # up a nonexistent submit budget namespace.
+    assert submit_summary["logical_call_count"] == 1
+    assert submit_summary["global_call_count"] == 1
+    assert submit_summary["executed_call_count"] == 1
     assert {
         "budget_seconds",
         "elapsed_seconds",
@@ -1713,6 +1723,527 @@ async def test_orchestrator_publishes_safe_reasoning_summaries() -> None:
         "global_call_count",
     }.issubset(submit_summary)
     assert all("Marie Curie" not in repr(summary) for summary in summaries)
+
+
+@pytest.mark.asyncio
+async def test_submit_summary_preserves_zero_remaining_budget() -> None:
+    orchestrator = _orchestrator(
+        planner=FakePlanner([], _plan(SpecialistName.LOOKUP)),
+        specialists={},
+        critic=FakeCritic([], []),
+        tools=FakeTools([]),
+    )
+
+    summary = orchestrator._stage_operational_summary(
+        StageBudget(
+            name="submit",
+            deadline=None,
+            max_calls=1,
+            started_at=asyncio.get_running_loop().time(),
+            budget_seconds=0.0,
+        ),
+        None,
+        asyncio.get_running_loop().time(),
+    )
+
+    assert summary["budget_seconds"] == 0.0
+    assert summary["elapsed_seconds"] >= 0.0
+    assert summary["remaining_bucket"] == "exhausted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["failure", "cancellation"])
+async def test_submit_zero_budget_summary_is_safe_on_failure_and_cancellation(
+    outcome: str,
+) -> None:
+    class Observation:
+        def __init__(self) -> None:
+            self.updates: list[dict[str, Any]] = []
+
+        def update(self, **kwargs: Any) -> None:
+            self.updates.append(kwargs)
+
+    class Context(AbstractContextManager[Observation]):
+        def __init__(self, observation: Observation) -> None:
+            self.observation = observation
+
+        def __enter__(self) -> Observation:
+            return self.observation
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class Client:
+        def __init__(self) -> None:
+            self.observations: list[Observation] = []
+
+        def start_as_current_observation(self, **_kwargs: Any) -> Context:
+            observation = Observation()
+            self.observations.append(observation)
+            return Context(observation)
+
+    started = asyncio.Event()
+
+    class SubmitBoundary:
+        tool_specs: tuple[ToolSpec, ...] = ()
+
+        async def call(self, _name: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            if outcome == "failure":
+                raise ToolExecutionError("private failure")
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    client = Client()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"), client=client
+    )
+    trace = observability.start_task(
+        "submit-zero-budget", level=1, model="test", reasoning_effort="low", evaluation_mode="test"
+    )
+    orchestrator = Orchestrator(
+        planner=FakePlanner([], _plan(SpecialistName.LOOKUP)),
+        specialists={},
+        critic=FakeCritic([], []),
+        tool_client_factory=FakeToolFactory(FakeTools([])),
+        config=_config(),
+        observability=observability,
+    )
+    # `_trace` is normally captured at the beginning of `run`; this unit path
+    # invokes Submit directly to hold a zero-second envelope deterministically.
+    orchestrator._trace = observability.current_trace()
+    tools = _BudgetedToolClient(SubmitBoundary(), max_calls=1, audit=lambda *_: None)
+    budget = StageBudget(name="critic", deadline=None, max_calls=1)
+    summary_budget = StageBudget(
+        name="submit",
+        deadline=None,
+        max_calls=1,
+        started_at=asyncio.get_running_loop().time(),
+        budget_seconds=0.0,
+    )
+    submission = asyncio.create_task(
+        orchestrator._submit(
+            _TaskState(candidate="private candidate"),
+            _task(),
+            _decision("approve", ()),
+            tools,
+            budget=budget,
+            summary_budget=summary_budget,
+        )
+    )
+    if outcome == "failure":
+        with pytest.raises(ToolExecutionError):
+            await submission
+    else:
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        submission.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await submission
+    trace.close()
+
+    submit_updates = [update for update in client.observations[1].updates if "output" in update]
+    summary = submit_updates[-1]["output"]["reasoning_summary"]
+    assert summary["stage"] == "submit"
+    assert summary["budget_seconds"] == 0.0
+    assert summary["elapsed_seconds"] >= 0.0
+    assert summary["remaining_bucket"] == "exhausted"
+
+
+@pytest.mark.asyncio
+async def test_runner_orchestrator_telemetry_never_records_production_path_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production runner/orchestrator paths emit summaries, never fake-backend content."""
+
+    sentinels = {
+        "QUESTION-SENTINEL",
+        "FINAL-ANSWER-SENTINEL",
+        "CANDIDATE-SENTINEL",
+        "PROMPT-SENTINEL",
+        "https://public.example/PUBLIC-URL-SENTINEL",
+        "https://private.example/PRIVATE-URL-SENTINEL",
+        "EVIDENCE-EXCERPT-SENTINEL",
+        "RAW-EXCEPTION-SENTINEL",
+        "CHECKPOINT-CONTENT-SENTINEL",
+        "CHECKPOINT-PATH-SENTINEL",
+        "CHECKPOINT-HMAC-SENTINEL",
+        "NOTEBOOK-CONTENT-SENTINEL",
+        "NOTEBOOK-FILENAME-SENTINEL",
+        "sk-test-openai-sentinel",
+        "hf-test-sentinel",
+        "serper-test-sentinel",
+        "langfuse-public-sentinel",
+        "langfuse-secret-sentinel",
+    }
+    forbidden_keys = {
+        "question",
+        "answer",
+        "candidate",
+        "prompt",
+        "url",
+        "evidence",
+        "error",
+        "exception",
+        "checkpoint",
+        "checkpoint_path",
+        "notebook",
+        "hmac",
+        "content",
+        "filename",
+    }
+
+    class RecordingObservation:
+        def __init__(self, *, name: str, as_type: str, kwargs: dict[str, Any]) -> None:
+            self.name = name
+            self.as_type = as_type
+            self.kwargs = kwargs
+            self.updates: list[dict[str, Any]] = []
+            self.ended = False
+
+        def update(self, **kwargs: Any) -> None:
+            self.updates.append(kwargs)
+
+        def end(self, **kwargs: Any) -> None:
+            self.ended = True
+            if kwargs:
+                self.updates.append(kwargs)
+
+    class RecordingContext(AbstractContextManager[RecordingObservation]):
+        def __init__(self, observation: RecordingObservation) -> None:
+            self.observation = observation
+
+        def __enter__(self) -> RecordingObservation:
+            return self.observation
+
+        def __exit__(self, *_args: object) -> None:
+            self.observation.ended = True
+
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.observations: list[RecordingObservation] = []
+            self.flush_count = 0
+
+        def start_as_current_observation(
+            self, *, name: str, as_type: str, **kwargs: Any
+        ) -> RecordingContext:
+            observation = RecordingObservation(name=name, as_type=as_type, kwargs=kwargs)
+            self.observations.append(observation)
+            return RecordingContext(observation)
+
+        def flush(self) -> None:
+            self.flush_count += 1
+
+    def assert_private_values_absent(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                assert key not in forbidden_keys
+                assert_private_values_absent(key)
+                assert_private_values_absent(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                assert_private_values_absent(item)
+        elif isinstance(value, str):
+            assert not any(sentinel in value for sentinel in sentinels)
+
+    private_root = tmp_path / "NOTEBOOK-FILENAME-SENTINEL"
+    tasks = [
+        GaiaTask(
+            task_id=f"telemetry-{kind}",
+            question="QUESTION-SENTINEL",
+            level=level,
+            final_answer="FINAL-ANSWER-SENTINEL",
+        )
+        for level, kind in ((1, "success"), (2, "checkpoint"), (3, "failure"))
+    ]
+    recorder = RecordingClient()
+    observability = Observability(
+        ObservabilityConfig(
+            enabled=True,
+            public_key="langfuse-public-sentinel",
+            secret_key="langfuse-secret-sentinel",
+        ),
+        client=recorder,
+    )
+    config = _config(
+        openai_api_key="sk-test-openai-sentinel",
+        hf_token="hf-test-sentinel",
+        output_dir=tmp_path / "run",
+        quality_policy="benchmark",
+    )
+    saved_checkpoints: set[str] = set()
+
+    class PrivacyTools(FakeTools):
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            await super().call(name, arguments)
+            if name == "web_search":
+                return {
+                    "answer": "CANDIDATE-SENTINEL",
+                    "sources": [
+                        {
+                            "url": "https://private.example/PRIVATE-URL-SENTINEL",
+                            "title": "EVIDENCE-EXCERPT-SENTINEL",
+                        }
+                    ],
+                }
+            return {
+                "answer": str(arguments["answer"]),
+                "evidence_ids": list(arguments["evidence_ids"]),
+            }
+
+    def factory(task: GaiaTask, vote_namespace: str) -> Orchestrator:
+        del vote_namespace
+        calls: list[str] = []
+        plan = AgentPlan(
+            restatement="PROMPT-SENTINEL",
+            steps=(PlanStep(specialist=SpecialistName.LOOKUP, instruction="PROMPT-SENTINEL"),),
+        )
+        notebook: ResearchNotebook | None = None
+        if task.task_id.endswith("checkpoint"):
+            notebook = ResearchNotebook(
+                private_root / "CHECKPOINT-PATH-SENTINEL",
+                task.task_id,
+                run_generation="CHECKPOINT-HMAC-SENTINEL",
+            )
+            if task.task_id not in saved_checkpoints:
+                decision = CriticDecision(
+                    verdict="approve",
+                    feedback="NOTEBOOK-CONTENT-SENTINEL",
+                    checked_evidence_ids=("evidence-0001",),
+                )
+                checkpoint = _checkpoint(
+                    cursor="submit",
+                    plan=plan,
+                    candidate="CHECKPOINT-CONTENT-SENTINEL",
+                    decision=decision,
+                ).model_copy(
+                    update={
+                        "evidence": (
+                            Evidence(
+                                evidence_id="evidence-0001",
+                                kind="source",
+                                summary="EVIDENCE-EXCERPT-SENTINEL",
+                                source_url="https://private.example/PRIVATE-URL-SENTINEL",
+                            ),
+                        ),
+                        "candidate_origins": {1: "CHECKPOINT-CONTENT-SENTINEL"},
+                    }
+                )
+                notebook.save_stage_checkpoint(checkpoint)
+                saved_checkpoints.add(task.task_id)
+        planner = FakePlanner(
+            calls,
+            plan,
+            error=(RuntimeError("RAW-EXCEPTION-SENTINEL") if task.task_id.endswith("failure") else None),
+        )
+        source = Evidence(
+            evidence_id="provider-evidence",
+            kind="source",
+            summary="EVIDENCE-EXCERPT-SENTINEL",
+            source_url="https://public.example/PUBLIC-URL-SENTINEL",
+        )
+        lookup = FakeSpecialist(
+            SpecialistName.LOOKUP,
+            calls,
+            [
+                AgentResult(
+                    specialist=SpecialistName.LOOKUP,
+                    evidence=(source,),
+                    candidate_answer="CANDIDATE-SENTINEL",
+                )
+            ],
+            tool_calls=[("web_search", {"query": "QUESTION-SENTINEL"})],
+        )
+        return Orchestrator(
+            planner=planner,
+            specialists={SpecialistName.LOOKUP: lookup},
+            critic=FakeCritic(calls, [_decision("approve", ("evidence-0001",))]),
+            tool_client_factory=FakeToolFactory(PrivacyTools(calls)),
+            config=config,
+            observability=observability,
+            notebook=notebook,
+        )
+
+    monkeypatch.setattr(runner_module, "sample_stratified", lambda *_args: tasks)
+    monkeypatch.setattr(runner_module, "question_scorer", lambda *_args: True)
+    runner = EvaluationRunner(
+        config=config,
+        dataset_loader=lambda _config: (tasks, "revision"),
+        orchestrator_factory=factory,
+        observability=observability,
+    )
+    await runner.run()
+
+    # Exercise the real MCP client span as a no-network search fallback boundary.
+    class TimedOutSearch:
+        provider = "openai"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            assert query == "QUESTION-SENTINEL"
+            raise SearchProviderError(
+                provider=self.provider, category="timeout", retryable=True
+            )
+
+    class SerperSearch:
+        provider = "serper"
+        api_key = "serper-test-sentinel"
+
+        async def search(self, query: str) -> dict[str, Any]:
+            assert query == "QUESTION-SENTINEL"
+            assert self.api_key == "serper-test-sentinel"
+            return {
+                "answer": "CANDIDATE-SENTINEL",
+                "sources": [
+                    {
+                        "url": "https://private.example/PRIVATE-URL-SENTINEL",
+                        "title": "EVIDENCE-EXCERPT-SENTINEL",
+                    }
+                ],
+            }
+
+    search_chain = SearchProviderChain(
+        (TimedOutSearch(), SerperSearch()),
+        RetryPolicy(max_attempts=1, base_delay_seconds=0.01),
+        clock=lambda: 0.0,
+    )
+
+    class SearchBoundary:
+        async def call_tool(self, _name: str, arguments: dict[str, Any], **_kwargs: Any) -> Any:
+            result = await search_chain.search(arguments["query"])
+            return SimpleNamespace(
+                is_error=False,
+                content=[],
+                structured_content=dict(result),
+                meta={
+                    "gaia.trace": {
+                        "provider": result.provider,
+                        "category": result.category,
+                        "attempt_count": result.attempt_count,
+                        "fallback_used": result.fallback_used,
+                    }
+                },
+            )
+
+    fallback_trace = observability.start_task(
+        "fallback-telemetry",
+        level=1,
+        model="test-model",
+        reasoning_effort="low",
+        evaluation_mode="test",
+    )
+    mcp = MCPToolClient(
+        task_root=tmp_path,
+        config=config,
+        allowed={"web_search"},
+        observability=observability,
+    )
+    mcp._client = SearchBoundary()
+    await mcp.call("web_search", {"query": "QUESTION-SENTINEL"})
+    fallback_trace.close()
+
+    assert recorder.flush_count == 1
+    assert recorder.observations
+    assert {"planner", "specialist", "critic", "submit", "mcp-tool"}.issubset(
+        {observation.name for observation in recorder.observations}
+    )
+    root_outputs = [
+        update["output"]
+        for observation in recorder.observations
+        if observation.name == "gaia-task"
+        for update in observation.updates
+        if "output" in update
+    ]
+    assert any(output.get("checkpoint_restored") is True for output in root_outputs)
+    assert any(output.get("terminal_route") == "terminal_failure" for output in root_outputs)
+    assert any(
+        update.get("output", {}).get("reasoning_summary", {}).get("stage") == "submit"
+        for observation in recorder.observations
+        for update in observation.updates
+    )
+    assert any(
+        update.get("output", {}).get("reasoning_summary", {}).get("provider") == "serper"
+        and update["output"]["reasoning_summary"].get("category") == "timeout"
+        for observation in recorder.observations
+        for update in observation.updates
+    )
+    for observation in recorder.observations:
+        assert_private_values_absent((observation.kwargs, observation.updates))
+
+    # Cancellation crosses the actual runner -> orchestrator stage span path as
+    # well; it must close and flush without retaining the blocked planner input.
+    cancel_recorder = RecordingClient()
+    cancel_observability = Observability(
+        ObservabilityConfig(
+            enabled=True,
+            public_key="langfuse-public-sentinel",
+            secret_key="langfuse-secret-sentinel",
+        ),
+        client=cancel_recorder,
+    )
+    planner_started = asyncio.Event()
+
+    class BlockingPlanner(FakePlanner):
+        async def plan(self, task: GaiaTask) -> AgentPlan:
+            self.tasks.append(task)
+            self.calls.append("planner")
+            planner_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    def cancelling_factory(task: GaiaTask, vote_namespace: str) -> Orchestrator:
+        del vote_namespace
+        calls: list[str] = []
+        return Orchestrator(
+            planner=BlockingPlanner(
+                calls,
+                AgentPlan(
+                    restatement="PROMPT-SENTINEL",
+                    steps=(
+                        PlanStep(specialist=SpecialistName.LOOKUP, instruction="PROMPT-SENTINEL"),
+                    ),
+                ),
+            ),
+            specialists={},
+            critic=FakeCritic(calls, []),
+            tool_client_factory=FakeToolFactory(PrivacyTools(calls)),
+            config=_config(
+                openai_api_key="sk-test-openai-sentinel",
+                hf_token="hf-test-sentinel",
+                output_dir=tmp_path / "cancel-run",
+            ),
+            observability=cancel_observability,
+        )
+
+    cancelling_runner = EvaluationRunner(
+        config=_config(
+            openai_api_key="sk-test-openai-sentinel",
+            hf_token="hf-test-sentinel",
+            output_dir=tmp_path / "cancel-run",
+        ),
+        dataset_loader=lambda _config: (tasks, "cancel-revision"),
+        orchestrator_factory=cancelling_factory,
+        observability=cancel_observability,
+    )
+    cancellation = asyncio.create_task(cancelling_runner.run())
+    await asyncio.wait_for(planner_started.wait(), timeout=0.1)
+    cancellation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancellation
+
+    planner_updates = [
+        update
+        for observation in cancel_recorder.observations
+        if observation.name == "planner"
+        for update in observation.updates
+    ]
+    assert any(
+        update.get("metadata", {}).get("status") == "cancelled"
+        and update.get("output", {}).get("reasoning_summary", {}).get("stage") == "planner"
+        for update in planner_updates
+    )
+    assert cancel_recorder.flush_count == 1
+    for observation in cancel_recorder.observations:
+        assert_private_values_absent((observation.kwargs, observation.updates))
 
 
 @pytest.mark.asyncio
