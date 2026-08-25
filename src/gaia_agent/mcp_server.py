@@ -937,6 +937,7 @@ def _result_trace_metadata(result: dict[str, Any]) -> dict[str, Any]:
         return _safe_trace_metadata(
             {
                 "provider": result.provider,
+                "category": result.category,
                 "attempt_count": result.attempt_count,
                 "circuit_open_count": result.circuit_open_count,
                 "fallback_used": result.fallback_used,

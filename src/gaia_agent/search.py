@@ -68,12 +68,14 @@ class SearchProviderResult(dict[str, Any]):
         attempt_count: int,
         circuit_open_count: int,
         fallback_used: bool,
+        category: str | None = None,
     ) -> None:
         super().__init__(payload)
         self.provider = provider
         self.attempt_count = attempt_count
         self.circuit_open_count = circuit_open_count
         self.fallback_used = fallback_used
+        self.category = category
 
 
 def _source(entry: Any) -> dict[str, str | None] | None:
@@ -314,6 +316,7 @@ class SearchProviderChain:
         total_attempts = 0
         circuit_open_count = 0
         fallback_attempted = False
+        fallback_category: str | None = None
         for provider_index, provider in enumerate(self._providers):
             if not self._can_wait(deadline, 0.0):
                 raise SearchDeadlineExceeded
@@ -330,6 +333,7 @@ class SearchProviderChain:
                 try:
                     result = await self._search_with_deadline(provider, query, deadline)
                 except SearchProviderError as error:
+                    fallback_category = error.category
                     if not error.retryable:
                         circuit.failures = 0
                         circuit.open_until = 0.0
@@ -353,6 +357,7 @@ class SearchProviderChain:
                         attempt_count=total_attempts,
                         circuit_open_count=circuit_open_count,
                         fallback_used=provider_index > 0,
+                        category=fallback_category if provider_index > 0 else None,
                     )
         raise SearchUnavailableError(
             total_attempts,

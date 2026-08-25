@@ -273,7 +273,13 @@ class EvaluationRunner:
                 evaluation_mode=self._evaluation_mode,
             )
             if persisted_prediction is not None:
-                trace.finish(_task_trace_outcome(persisted_prediction, checkpoint_restored=True))
+                trace.finish(
+                    _task_trace_outcome(
+                        persisted_prediction,
+                        checkpoint_restored=False,
+                        recovery_source="public_result",
+                    )
+                )
                 continue
             task_run: _TaskRun | None = None
             prediction: TaskPrediction | None = None
@@ -1276,9 +1282,10 @@ def _task_trace_outcome(
     prediction: TaskPrediction,
     *,
     checkpoint_restored: bool,
+    recovery_source: str | None = None,
     audit_events: Sequence[AuditEvent] = (),
 ) -> TaskTraceOutcome:
-    recovery_source = (
+    source = recovery_source or (
         "checkpoint"
         if checkpoint_restored
         else "retry"
@@ -1286,9 +1293,7 @@ def _task_trace_outcome(
         else "not_needed"
     )
     terminal_route = (
-        "checkpoint_restored"
-        if checkpoint_restored
-        else "terminal_failure"
+        "terminal_failure"
         if prediction.error_category is not None
         else "recovered_submit"
         if prediction.recovery_succeeded
@@ -1304,7 +1309,7 @@ def _task_trace_outcome(
         attempt_number=prediction.attempt_number,
         recovery_count=prediction.recovery_count,
         recovery_succeeded=prediction.recovery_succeeded,
-        recovery_source=recovery_source,
+        recovery_source=source,
         retry_reason=prediction.retry_reason,
         retry_category=prediction.retry_category,
         terminal_route=terminal_route,

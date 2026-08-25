@@ -7,6 +7,7 @@ is isolated so a telemetry outage cannot alter a prediction or its error categor
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
@@ -78,7 +79,7 @@ _SAFE_TERMINAL_ROUTES = frozenset(
 )
 _SAFE_ROOT_STAGES = frozenset({"plan", "act", "verify", "correct", "submit", "recovery"})
 _SAFE_RECOVERY_CODES = frozenset({"not_needed", "succeeded", "exhausted", "checkpoint"})
-_SAFE_RECOVERY_SOURCES = frozenset({"not_needed", "checkpoint", "retry"})
+_SAFE_RECOVERY_SOURCES = frozenset({"not_needed", "checkpoint", "retry", "public_result"})
 _SAFE_STAGE_NAMES = frozenset({"planner", "specialist", "critic", "submit"})
 _SAFE_REMAINING_BUCKETS = frozenset({"ample", "low", "exhausted"})
 _SAFE_SPECIALISTS = frozenset({"lookup", "computation", "file", "visual"})
@@ -655,7 +656,7 @@ class Span:
         self._context_manager = context_manager
         self._observation: Any | None = None
         self._closed = False
-        self._pending_summary: dict[str, object] | None = None
+        self._pending_summary: dict[str, object] | Callable[[], dict[str, object]] | None = None
         self._on_end = on_end
         self._cost_details = cost_details
         self._started_at = time.monotonic()
@@ -706,9 +707,20 @@ class Span:
         except Exception:
             logger.debug("Langfuse observation update failed", exc_info=True)
 
-    def set_summary(self, summary: dict[str, object] | None) -> None:
+    def set_summary(
+        self,
+        summary: dict[str, object] | Callable[[], dict[str, object]] | None,
+    ) -> None:
         """Publish a safe summary when this context-managed span exits."""
-        self._pending_summary = dict(summary or {})
+        self._pending_summary = summary if callable(summary) else dict(summary or {})
+
+    def _pending_summary_value(self) -> dict[str, object]:
+        if callable(self._pending_summary):
+            try:
+                return self._pending_summary()
+            except Exception:  # noqa: BLE001 - telemetry summary callbacks must not affect a task
+                return {}
+        return self._pending_summary or {}
 
     def end(
         self,
@@ -724,7 +736,7 @@ class Span:
             return
         final_metadata = dict(metadata or {})
         final_metadata["status"] = status if status in _SAFE_STATUS_VALUES else "error"
-        final_summary = self._pending_summary if summary is None else summary
+        final_summary = self._pending_summary_value() if summary is None else summary
         search_summary = {
             key: final_metadata[key]
             for key in ("provider", "category", "attempt_count", "fallback_used")
@@ -763,7 +775,14 @@ class Span:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self.end(status="error" if exc_type else "ok", summary=self._pending_summary)
+        status = (
+            "cancelled"
+            if exc_type is not None and issubclass(exc_type, asyncio.CancelledError)
+            else "error"
+            if exc_type
+            else "ok"
+        )
+        self.end(status=status, summary=self._pending_summary_value())
 
 
 class TaskTrace:

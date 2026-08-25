@@ -218,37 +218,37 @@ class MCPToolClient:
             if trace is not None
             else None
         )
+        span_status = "cancelled"
+        span_metadata: dict[str, Any] = {}
+        span_output: dict[str, object] = {"result_key_count": 0, "result_keys": []}
         try:
             result = await self._call_impl(name, arguments)
-        except Exception as error:
-            if span is not None:
-                metadata: dict[str, Any] = {"error_type": type(error).__name__}
-                metadata.update(_safe_tool_failure_trace(error))
-                span.end(
-                    status="error",
-                    metadata=metadata,
-                    output={"result_key_count": 0, "result_keys": []},
-                )
+        except asyncio.CancelledError:
             raise
-        if span is not None:
+        except Exception as error:
+            span_status = "error"
+            span_metadata = {"error_type": type(error).__name__}
+            span_metadata.update(_safe_tool_failure_trace(error))
+            raise
+        else:
             result_keys = _public_tool_trace_keys(
                 name,
                 result,
                 allowed_by_tool=_PUBLIC_TOOL_TRACE_RESULT_KEYS,
             )
-            metadata = {"result_key_count": len(result_keys)}
-            metadata.update(getattr(result, "trace_metadata", {}))
+            span_status = "ok"
+            span_metadata = {"result_key_count": len(result_keys)}
+            span_metadata.update(getattr(result, "trace_metadata", {}))
             if result.get("fallback") == "search":
-                metadata["fallback_used"] = True
-            span.end(
-                status="ok",
-                metadata=metadata,
-                output={
-                    "result_key_count": len(result_keys),
-                    "result_keys": result_keys,
-                },
-            )
-        return result
+                span_metadata["fallback_used"] = True
+            span_output = {
+                "result_key_count": len(result_keys),
+                "result_keys": result_keys,
+            }
+            return result
+        finally:
+            if span is not None:
+                span.end(status=span_status, metadata=span_metadata, output=span_output)
 
     async def _call_impl(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if self._client is None:

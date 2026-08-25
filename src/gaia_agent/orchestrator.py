@@ -109,9 +109,11 @@ class _AttachmentUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class StageBudget:
-    name: Literal["planner", "specialist", "critic"]
+    name: Literal["planner", "specialist", "critic", "submit"]
     deadline: float | None
     max_calls: int
+    started_at: float | None = None
+    budget_seconds: float | None = None
 
 
 class StageBudgetExceeded(RuntimeError):
@@ -728,6 +730,12 @@ class Orchestrator:
         self._audit("plan_started", {"task_id": task.task_id})
         stage_started = asyncio.get_running_loop().time()
         with self._stage_span("planner", {"stage": "planner"}) as planner_span:
+            if planner_span is not None:
+                planner_span.set_summary(
+                    lambda: self._stage_operational_summary(
+                        graph_state["budgets"]["planner"], None, stage_started
+                    )
+                )
             try:
                 plan = await self._run_in_stage(
                     graph_state["budgets"]["planner"],
@@ -1016,6 +1024,14 @@ class Orchestrator:
         if decision is None:
             raise ValueError("graph submit node requires a critic decision")
         budget = graph_state["budgets"]["critic"]
+        now = asyncio.get_running_loop().time()
+        submit_budget = StageBudget(
+            name="submit",
+            deadline=budget.deadline,
+            max_calls=budget.max_calls,
+            started_at=now,
+            budget_seconds=(max(0.0, budget.deadline - now) if budget.deadline is not None else 0.0),
+        )
         prediction = await self._run_in_stage(
             budget,
             lambda: self._submit(
@@ -1024,6 +1040,7 @@ class Orchestrator:
                 decision,
                 graph_state["tools"],
                 budget=budget,
+                summary_budget=submit_budget,
             ),
             graph_state["stage_runtime"],
         )
@@ -1130,6 +1147,10 @@ class Orchestrator:
                 "step_number": state.step_count,
             },
         ) as specialist_span:
+            if specialist_span is not None:
+                specialist_span.set_summary(
+                    lambda: self._stage_operational_summary(budget, tools, stage_started)
+                )
             try:
                 result = await self._run_in_stage(
                     budget,
@@ -1235,6 +1256,10 @@ class Orchestrator:
                 "has_candidate": state.candidate is not None,
             },
         ) as critic_span:
+            if critic_span is not None:
+                critic_span.set_summary(
+                    lambda: self._stage_operational_summary(budget, tools, stage_started)
+                )
             try:
                 decision = await self._run_in_stage(
                     budget,
@@ -1463,6 +1488,7 @@ class Orchestrator:
         tools: _BudgetedToolClient,
         *,
         budget: StageBudget,
+        summary_budget: StageBudget | None = None,
     ) -> TaskPrediction:
         if state.candidate is None:
             raise ValueError("cannot submit a missing candidate")
@@ -1482,6 +1508,14 @@ class Orchestrator:
             "submit",
             {"stage": "submit", "evidence_count": len(evidence_ids)},
         ) as submit_span:
+            if submit_span is not None:
+                submit_span.set_summary(
+                    lambda: self._stage_operational_summary(
+                        summary_budget or budget,
+                        tools,
+                        stage_started,
+                    )
+                )
             await tools.call(
                 "submit_answer",
                 {"answer": state.candidate, "evidence_ids": list(evidence_ids)},
@@ -1493,7 +1527,11 @@ class Orchestrator:
                         "evidence_count": len(evidence_ids),
                         "candidate_present": True,
                         "tool_names": list(tools.scope_tool_names),
-                        **self._stage_operational_summary(budget, tools, stage_started),
+                        **self._stage_operational_summary(
+                            summary_budget or budget,
+                            tools,
+                            stage_started,
+                        ),
                     }
                 )
         self._audit(
@@ -1514,16 +1552,26 @@ class Orchestrator:
         specialist_deadline = planner_deadline + self._config.specialist_timeout_seconds
         critic_deadline = specialist_deadline + self._config.critic_timeout_seconds
         return {
-            "planner": StageBudget("planner", planner_deadline, 0),
+            "planner": StageBudget(
+                "planner",
+                planner_deadline,
+                0,
+                started_at=started,
+                budget_seconds=self._config.planner_timeout_seconds,
+            ),
             "specialist": StageBudget(
                 "specialist",
                 specialist_deadline,
                 self._config.specialist_max_tool_calls,
+                started_at=planner_deadline,
+                budget_seconds=self._config.specialist_timeout_seconds,
             ),
             "critic": StageBudget(
                 "critic",
                 critic_deadline,
                 self._config.critic_max_tool_calls,
+                started_at=specialist_deadline,
+                budget_seconds=self._config.critic_timeout_seconds,
             ),
         }
 
@@ -1532,6 +1580,7 @@ class Orchestrator:
             "planner": self._config.planner_timeout_seconds,
             "specialist": self._config.specialist_timeout_seconds,
             "critic": self._config.critic_timeout_seconds,
+            "submit": self._config.critic_timeout_seconds,
         }[stage]
 
     async def _run_in_stage(
@@ -1595,8 +1644,16 @@ class Orchestrator:
     ) -> dict[str, object]:
         """Return bounded operational state without graph inputs or checkpoint data."""
 
-        elapsed = max(0.0, asyncio.get_running_loop().time() - started)
-        budget_seconds = self._stage_timeout_seconds(budget.name)
+        del started
+        budget_seconds = budget.budget_seconds or self._stage_timeout_seconds(budget.name)
+        stage_started = budget.started_at
+        if stage_started is None:
+            stage_started = (
+                budget.deadline - budget_seconds
+                if budget.deadline is not None
+                else asyncio.get_running_loop().time()
+            )
+        elapsed = max(0.0, asyncio.get_running_loop().time() - stage_started)
         remaining = max(0.0, budget_seconds - elapsed)
         remaining_bucket = (
             "exhausted"
@@ -1633,6 +1690,8 @@ def _evidence_repair_budget(critic_budget: StageBudget) -> StageBudget:
         name="critic",
         deadline=now + remaining / 2,
         max_calls=critic_budget.max_calls,
+        started_at=critic_budget.started_at,
+        budget_seconds=critic_budget.budget_seconds,
     )
 
 

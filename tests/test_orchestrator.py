@@ -1699,6 +1699,19 @@ async def test_orchestrator_publishes_safe_reasoning_summaries() -> None:
         for summary in summaries
     )
     assert any(summary.get("decision") == "submit" for summary in summaries)
+    submit_summary = next(
+        observation.updates[-1]["output"]["reasoning_summary"]
+        for observation in client.observations
+        if observation.name == "submit"
+    )
+    assert submit_summary["stage"] == "submit"
+    assert {
+        "budget_seconds",
+        "elapsed_seconds",
+        "remaining_bucket",
+        "logical_call_count",
+        "global_call_count",
+    }.issubset(submit_summary)
     assert all("Marie Curie" not in repr(summary) for summary in summaries)
 
 

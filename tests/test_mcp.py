@@ -94,6 +94,7 @@ async def test_settings_chain_classifies_transient_openai_failure_and_uses_serpe
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("HF_TOKEN", "")
     monkeypatch.setenv("SERPER_API_KEY", "serper-key")
+    monkeypatch.setenv("GAIA_PROVIDER_MAX_ATTEMPTS", "1")
     monkeypatch.delenv("GAIA_MCP_FAKE_BACKEND", raising=False)
     monkeypatch.setattr(mcp_server, "AsyncOpenAI", lambda **kwargs: SimpleNamespace())
     monkeypatch.setattr(mcp_server, "HostedOpenAIBackend", lambda **kwargs: FailingOpenAIBackend())
@@ -104,10 +105,15 @@ async def test_settings_chain_classifies_transient_openai_failure_and_uses_serpe
     settings = mcp_server._settings_from_env()
     try:
         assert settings.search_provider is not None
-        assert await settings.search_provider.search("question") == {
+        result = await settings.search_provider.search("question")
+        assert result == {
             "answer": "fallback",
             "sources": [],
         }
+        assert result.provider == "serper"
+        assert result.category == "timeout"
+        assert result.attempt_count == 2
+        assert result.fallback_used is True
     finally:
         await settings.aclose()
 
@@ -515,6 +521,39 @@ class _TraceClient:
         observation = _TraceObservation(name, {"as_type": as_type, **kwargs})
         self.observations.append(observation)
         return _TraceContext(observation)
+
+
+@pytest.mark.asyncio
+async def test_mcp_cancelled_call_closes_its_span(tmp_path: Path, run_config: RunConfig) -> None:
+    """Cancellation must close the real telemetry span once without a raw error."""
+
+    started = asyncio.Event()
+
+    class BlockingClient:
+        async def call_tool(self, *_args: Any, **_kwargs: Any) -> Any:
+            started.set()
+            await asyncio.Event().wait()
+
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "cancel-mcp", level=1, model="test", reasoning_effort="low", evaluation_mode="test"
+    )
+    client = MCPToolClient(
+        task_root=tmp_path, config=run_config, allowed={"web_search"}, observability=observability
+    )
+    client._client = BlockingClient()
+    call = asyncio.create_task(client.call("web_search", {"query": "private"}))
+    await asyncio.wait_for(started.wait(), timeout=0.05)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    assert trace_client.observations[-1].updates[-1]["metadata"]["status"] == "cancelled"
+    trace.close()
 
 
 @pytest.mark.asyncio

@@ -841,7 +841,9 @@ async def test_runner_root_records_recovered_attempt_and_resume_reuses_that_numb
         item for item in resumed_client.observations if item.name == "gaia-task"
     )
     assert resumed_root.kwargs["metadata"]["attempt_number"] == 2
-    assert resumed_root.updates[-1]["output"]["terminal_route"] == "checkpoint_restored"
+    assert resumed_root.updates[-1]["output"]["terminal_route"] == "recovered_submit"
+    assert resumed_root.updates[-1]["output"]["checkpoint_restored"] is False
+    assert resumed_root.updates[-1]["output"]["recovery_source"] == "public_result"
 
 
 @pytest.mark.asyncio
@@ -962,3 +964,25 @@ def test_task_trace_outcome_bounds_counts_and_categories() -> None:
         "retry_category": None,
         "terminal_route": "terminal_failure",
     }
+
+
+def test_restored_checkpoint_failure_keeps_terminal_route_and_recovery_orthogonal() -> None:
+    """A restored checkpoint does not turn a later timeout into a successful route."""
+
+    from gaia_agent.models import TerminalErrorCategory
+    from gaia_agent.runner import _task_trace_outcome
+
+    output = _task_trace_outcome(
+        TaskPrediction(
+            task_id="checkpoint-timeout",
+            level=2,
+            answer=None,
+            critic_verdict="not_run",
+            error_category=TerminalErrorCategory.TIMEOUT,
+        ),
+        checkpoint_restored=True,
+    ).as_output()
+
+    assert output["terminal_route"] == "terminal_failure"
+    assert output["checkpoint_restored"] is True
+    assert output["recovery_source"] == "checkpoint"

@@ -992,7 +992,19 @@ async def test_openai_provider_publishes_completed_usage_before_cancelled_tool_c
             raise AssertionError("unreachable")
 
     observed_usage: list[Usage] = []
-    provider = OpenAIProvider(fake_responses_client, "gpt-5.6-sol")
+    trace_client = _TraceClient()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "cancel-openai",
+        level=1,
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        evaluation_mode="test",
+    )
+    provider = OpenAIProvider(fake_responses_client, "gpt-5.6-sol", observability=observability)
     invocation = asyncio.create_task(
         provider.complete(
             model_request(),
@@ -1012,6 +1024,9 @@ async def test_openai_provider_publishes_completed_usage_before_cancelled_tool_c
     assert observed_usage == [
         Usage(input_tokens=5, output_tokens=2, reasoning_tokens=1, total_tokens=7)
     ]
+    generation = trace_client.observations[-1]
+    assert generation.updates[-1]["metadata"]["status"] == "cancelled"
+    trace.close()
 
 
 @pytest.mark.asyncio

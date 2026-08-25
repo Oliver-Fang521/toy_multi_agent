@@ -32,3 +32,18 @@ checkpoint/notebook/secret categories.
 - No `.env`, real credentials, live GAIA/API calls, fake-backend scans, or public-result scans were
   performed; those remain controller-owned.
 - The parked fully-positional custom-provider dispatcher edge was not touched.
+
+## Fix round 1
+
+The original report overstated the privacy proof: its recursive sentinel test exercised direct
+adapter calls, not every requested production emission path. This round adds production-path
+regressions for the normalized OpenAI-timeout-to-Serper fallback metadata, cancellation-safe MCP,
+OpenAI, and DeepSeek span closure, submit-stage labeling, and checkpoint route orthogonality.
+
+- RED: the fallback result lacked a safe cause category; the three cancellation tests left their
+  spans open; submit was labeled `critic`; restored-then-timeout reported
+  `checkpoint_restored` as the terminal route; and public-result reuse claimed checkpoint restore.
+- GREEN: fallback results retain only the normalized cause category, every affected span closes in
+  its `finally` path with a bounded status, stage accounting is tied to the shared absolute budget
+  envelope, submit has its own stage label and remaining critic envelope, and root route/recovery
+  metadata are orthogonal.

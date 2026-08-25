@@ -284,8 +284,13 @@ async def test_deepseek_provider_publishes_completed_usage_before_cancelled_tool
             raise AssertionError("unreachable")
 
     observed_usage: list[Usage] = []
+    recorder = _RecordingObservability()
     invocation = asyncio.create_task(
-        DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(
+        DeepSeekProvider(
+            fake_chat_client,
+            "deepseek-v4-flash",
+            observability=recorder,
+        ).complete(
             model_request(),
             BlockingExecutor(),
             usage_observer=observed_usage.append,
@@ -303,6 +308,7 @@ async def test_deepseek_provider_publishes_completed_usage_before_cancelled_tool
     assert observed_usage == [
         Usage(input_tokens=6, output_tokens=3, reasoning_tokens=2, total_tokens=9)
     ]
+    assert recorder.trace.generation_span.ended[-1]["status"] == "cancelled"
 
 
 @pytest.mark.asyncio

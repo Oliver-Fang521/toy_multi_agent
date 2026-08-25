@@ -237,44 +237,45 @@ class DeepSeekProvider:
             if trace is not None
             else None
         )
+        span_status = "cancelled"
+        span_metadata: dict[str, object] = {}
+        span_summary: dict[str, object] = {}
+        span_usage: Usage | None = None
         try:
-            try:
-                response = await self._complete(
-                    request,
-                    executor,
-                    usage_observer=usage_observer,
-                )
-            except Exception as error:
-                if generation is not None:
-                    generation.end(
-                        status="error",
-                        metadata={
-                            "error_type": type(error).__name__,
-                            **retry_metadata.as_dict(),
-                        },
-                        summary=retry_metadata.as_dict(),
-                    )
-                raise
-            if generation is not None:
-                generation.end(
-                    status="ok",
-                    metadata={
-                        "parsed": response.parsed is not None,
-                        "refused": bool(response.output_text and response.parsed is None),
-                        "tool_call_count": len(response.tool_events),
-                        **retry_metadata.as_dict(),
-                    },
-                    summary={
-                        "decision": "parsed" if response.parsed is not None else "unparsed",
-                        "parsed": response.parsed is not None,
-                        "refused": bool(response.output_text and response.parsed is None),
-                        "tool_call_count": len(response.tool_events),
-                        **retry_metadata.as_dict(),
-                    },
-                    usage=response.usage,
-                )
+            response = await self._complete(
+                request,
+                executor,
+                usage_observer=usage_observer,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            span_status = "error"
+            span_metadata = {"error_type": type(error).__name__, **retry_metadata.as_dict()}
+            span_summary = retry_metadata.as_dict()
+            raise
+        else:
+            span_status = "ok"
+            span_metadata = {
+                "parsed": response.parsed is not None,
+                "refused": bool(response.output_text and response.parsed is None),
+                "tool_call_count": len(response.tool_events),
+                **retry_metadata.as_dict(),
+            }
+            span_summary = {
+                "decision": "parsed" if response.parsed is not None else "unparsed",
+                **span_metadata,
+            }
+            span_usage = response.usage
             return response
         finally:
+            if generation is not None:
+                generation.end(
+                    status=span_status,
+                    metadata=span_metadata,
+                    summary=span_summary,
+                    usage=span_usage,
+                )
             _CURRENT_RETRY_METADATA.reset(retry_token)
 
     async def _complete(
