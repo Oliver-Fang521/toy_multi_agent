@@ -281,7 +281,10 @@ class _OfflineProvider:
         self,
         request: ModelRequest,
         executor: Any | None = None,
+        *,
+        usage_observer: Any | None = None,
     ) -> ModelResponse:
+        del usage_observer
         context = _request_context(request)
         if request.instructions == PlannerAgent.instructions:
             return ModelResponse(
@@ -333,7 +336,10 @@ class _ReliabilityAuditProvider:
         self,
         request: ModelRequest,
         executor: Any | None = None,
+        *,
+        usage_observer: Any | None = None,
     ) -> ModelResponse:
+        del usage_observer
         context = _request_context(request)
         if request.instructions == PlannerAgent.instructions:
             steps = {
@@ -2007,6 +2013,113 @@ async def test_real_cancelled_resume_refreshes_before_slow_tool_teardown(
 
 
 @pytest.mark.asyncio
+async def test_real_critic_publishes_malformed_turn_usage_before_cancelled_local_repair(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(_verify_checkpoint(usage_tokens=7))
+    repair_started = asyncio.Event()
+    repair_cancelled = asyncio.Event()
+
+    class MalformedThenBlockingProvider:
+        supports_vision = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            request: ModelRequest,
+            executor: Any | None = None,
+            *,
+            usage_observer: Any | None = None,
+        ) -> ModelResponse:
+            self.calls += 1
+            if self.calls == 1:
+                response = ModelResponse(
+                    parsed={"malformed": True},
+                    usage=Usage(input_tokens=5, total_tokens=5),
+                )
+                if usage_observer is not None:
+                    usage_observer(response.usage)
+                return response
+            assert request.allowed_tools == ()
+            assert executor is None
+            repair_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                repair_cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+    provider = MalformedThenBlockingProvider()
+    critic = CriticAgent(provider)
+    critic_tool_specs = tuple(
+        ToolSpec(
+            name=name,
+            description=name,
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        )
+        for name in sorted(CriticAgent.allowed_tool_names)
+    )
+    orchestrator = Orchestrator(
+        planner=_NeverPlanner(),
+        specialists={SpecialistName.LOOKUP: _NeverSpecialist()},
+        critic=critic,
+        tool_client_factory=lambda _task: _RunnerTools(
+            [], tool_specs=critic_tool_specs
+        ),
+        config=_config(
+            tmp_path,
+            timeout_seconds=0.40,
+            planner_timeout_seconds=0.04,
+            specialist_timeout_seconds=0.12,
+            critic_timeout_seconds=0.10,
+        ),
+        notebook=notebook,
+    )
+    runner = EvaluationRunner(
+        config=_config(
+            tmp_path,
+            timeout_seconds=0.03,
+            planner_timeout_seconds=0.006,
+            specialist_timeout_seconds=0.018,
+            critic_timeout_seconds=0.006,
+        ),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=lambda _task, _vote_namespace: orchestrator,
+    )
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+    immediate_checkpoint = notebook.load_stage_checkpoint()
+
+    assert repair_started.is_set()
+    assert repair_cancelled.is_set()
+    assert provider.calls == 2
+    assert critic.last_usage == Usage(input_tokens=5, total_tokens=5)
+    assert result.prediction.error_category == TerminalErrorCategory.TIMEOUT
+    assert result.prediction.usage == Usage(input_tokens=12, total_tokens=12)
+    assert immediate_checkpoint is not None
+    assert immediate_checkpoint.usage == Usage(input_tokens=12, total_tokens=12)
+
+    await asyncio.sleep(0.02)
+    final_checkpoint = notebook.load_stage_checkpoint()
+    assert final_checkpoint is not None
+    assert final_checkpoint.usage == immediate_checkpoint.usage
+    assert critic.last_usage == Usage(input_tokens=5, total_tokens=5)
+
+
+@pytest.mark.asyncio
 async def test_runner_critic_budget_exhaustion_at_verify_is_terminal(
     tmp_path: Path,
 ) -> None:
@@ -2573,7 +2686,10 @@ async def test_real_detached_orchestrator_cannot_start_provider_call_after_vote_
             self,
             request: ModelRequest,
             executor: Any | None = None,
+            *,
+            usage_observer: Any | None = None,
         ) -> ModelResponse:
+            del usage_observer
             provider_calls.append(request.instructions)
             return ModelResponse(parsed={})
 

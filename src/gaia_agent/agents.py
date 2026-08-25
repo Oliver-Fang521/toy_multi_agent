@@ -23,7 +23,7 @@ from gaia_agent.models import (
     SpecialistName,
     Usage,
 )
-from gaia_agent.providers import ModelProvider, ModelRequest
+from gaia_agent.providers import ModelProvider, ModelRequest, UsageObserver
 from gaia_agent.research_notebook import NotebookEntry, select_evidence_cards
 
 if TYPE_CHECKING:
@@ -123,6 +123,18 @@ def _add_usage(left: Usage, right: Usage) -> Usage:
     )
 
 
+def _usage_observer(
+    storage: ContextVar[Usage | None],
+    publish: Callable[[Usage], None],
+) -> UsageObserver:
+    def observe(usage: Usage) -> None:
+        cumulative = _add_usage(storage.get() or Usage(), usage)
+        storage.set(cumulative)
+        publish(cumulative)
+
+    return observe
+
+
 def _repair_request(request: ModelRequest) -> ModelRequest:
     return request.model_copy(
         update={
@@ -190,13 +202,18 @@ async def _complete_with_local_repair(
     parser: Callable[[Any], _Parsed],
     *,
     executor: MCPToolClient | None = None,
+    usage_observer: UsageObserver,
 ) -> tuple[_Parsed, Usage, bool]:
     """Complete one stage, repairing one malformed structured response in place.
 
     The repair call is deliberately tool-free. A malformed response is a protocol
     failure, not evidence that the stage needs a second research trajectory.
     """
-    response = await provider.complete(request, executor)
+    response = await provider.complete(
+        request,
+        executor,
+        usage_observer=usage_observer,
+    )
     try:
         return parser(response), response.usage, False
     except AttachmentPolicyError:
@@ -217,7 +234,10 @@ async def _complete_with_local_repair(
         if response.parsed is not None
         else _repair_request(request)
     )
-    repaired = await provider.complete(repair_request)
+    repaired = await provider.complete(
+        repair_request,
+        usage_observer=usage_observer,
+    )
     aggregate_usage = _add_usage(response.usage, repaired.usage)
     try:
         parsed = parser(repaired)
@@ -280,6 +300,7 @@ class PlannerAgent:
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"planner_usage_{id(self)}", default=None
         )
+        self._published_usage = Usage()
         self._last_repair: ContextVar[bool] = ContextVar(
             f"planner_repair_{id(self)}", default=False
         )
@@ -289,7 +310,7 @@ class PlannerAgent:
 
     @property
     def last_usage(self) -> Usage:
-        return self._last_usage.get() or Usage()
+        return self._last_usage.get() or self._published_usage
 
     @property
     def last_repair_attempted(self) -> bool:
@@ -301,6 +322,7 @@ class PlannerAgent:
 
     async def plan(self, task: GaiaTask) -> AgentPlan:
         self._last_usage.set(Usage())
+        self._published_usage = Usage()
         self._last_repair.set(False)
         self._last_fallback.set(False)
         attachment = _attachment_metadata(task)
@@ -364,9 +386,14 @@ class PlannerAgent:
                 self.provider,
                 request,
                 parse,
+                usage_observer=_usage_observer(
+                    self._last_usage,
+                    lambda usage: setattr(self, "_published_usage", usage),
+                ),
             )
         except StageProtocolError as error:
             self._last_usage.set(error.usage)
+            self._published_usage = error.usage
             if not error.repairable:
                 raise
             # Planning is a routing concern. If the model cannot satisfy the
@@ -376,6 +403,7 @@ class PlannerAgent:
             return normalize_plan(_fallback_plan(task, self.provider), task, self.provider)
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
+        self._published_usage = usage
         return plan
 
 
@@ -409,10 +437,11 @@ class EvidenceLinkerAgent:
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"evidence_linker_usage_{id(self)}", default=None
         )
+        self._published_usage = Usage()
 
     @property
     def last_usage(self) -> Usage:
-        return self._last_usage.get() or Usage()
+        return self._last_usage.get() or self._published_usage
 
     async def link(
         self,
@@ -421,6 +450,7 @@ class EvidenceLinkerAgent:
         cards: Sequence[Mapping[str, Any]],
     ) -> tuple[str, ...]:
         self._last_usage.set(Usage())
+        self._published_usage = Usage()
         context = _bounded_evidence_link_context(
             task,
             candidate,
@@ -456,8 +486,15 @@ class EvidenceLinkerAgent:
             max_tool_calls=0,
             reasoning_effort=self.reasoning_effort,
         )
-        response = await self.provider.complete(request)
+        response = await self.provider.complete(
+            request,
+            usage_observer=_usage_observer(
+                self._last_usage,
+                lambda usage: setattr(self, "_published_usage", usage),
+            ),
+        )
         self._last_usage.set(response.usage)
+        self._published_usage = response.usage
         parsed = response.parsed
         if not isinstance(parsed, dict) or set(parsed) != {"evidence_entry_hashes"}:
             return ()
@@ -501,13 +538,14 @@ class SpecialistAgent:
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"specialist_usage_{id(self)}", default=None
         )
+        self._published_usage = Usage()
         self._last_repair: ContextVar[bool] = ContextVar(
             f"specialist_repair_{id(self)}", default=False
         )
 
     @property
     def last_usage(self) -> Usage:
-        return self._last_usage.get() or Usage()
+        return self._last_usage.get() or self._published_usage
 
     @property
     def last_repair_attempted(self) -> bool:
@@ -521,6 +559,7 @@ class SpecialistAgent:
         tools: MCPToolClient,
     ) -> AgentResult:
         self._last_usage.set(Usage())
+        self._published_usage = Usage()
         self._last_repair.set(False)
         if step.specialist != self.name:
             raise ValueError(
@@ -594,13 +633,19 @@ class SpecialistAgent:
                 request,
                 parse,
                 executor=tools,
+                usage_observer=_usage_observer(
+                    self._last_usage,
+                    lambda usage: setattr(self, "_published_usage", usage),
+                ),
             )
         except StageProtocolError as error:
             self._last_usage.set(error.usage)
+            self._published_usage = error.usage
             self._last_repair.set(error.repairable)
             raise
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
+        self._published_usage = usage
         return result.model_copy(update={"usage": usage})
 
 
@@ -694,6 +739,7 @@ class CriticAgent:
         self._last_usage: ContextVar[Usage | None] = ContextVar(
             f"critic_usage_{id(self)}", default=None
         )
+        self._published_usage = Usage()
         self._last_repair: ContextVar[bool] = ContextVar(
             f"critic_repair_{id(self)}", default=False
         )
@@ -703,7 +749,7 @@ class CriticAgent:
 
     @property
     def last_usage(self) -> Usage:
-        return self._last_usage.get() or Usage()
+        return self._last_usage.get() or self._published_usage
 
     @property
     def last_repair_attempted(self) -> bool:
@@ -721,6 +767,7 @@ class CriticAgent:
         tools: MCPToolClient,
     ) -> CriticDecision:
         self._last_usage.set(Usage())
+        self._published_usage = Usage()
         self._last_repair.set(False)
         self._last_fallback_reason.set(None)
         allowed_tools = tuple(
@@ -821,9 +868,14 @@ class CriticAgent:
                 request,
                 parse,
                 executor=tools,
+                usage_observer=_usage_observer(
+                    self._last_usage,
+                    lambda usage: setattr(self, "_published_usage", usage),
+                ),
             )
         except StageProtocolError as error:
             self._last_usage.set(error.usage)
+            self._published_usage = error.usage
             if not error.repairable:
                 raise
             if error.code != StageValidationCode.SCHEMA:
@@ -838,6 +890,7 @@ class CriticAgent:
             return decision
         self._last_repair.set(repaired)
         self._last_usage.set(usage)
+        self._published_usage = usage
         return decision
 
 

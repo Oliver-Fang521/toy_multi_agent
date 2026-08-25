@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from typing import Any, Literal, Protocol
 
 from pydantic import Field, field_validator
@@ -118,10 +119,17 @@ class ToolExecutor(Protocol):
         raise NotImplementedError
 
 
+UsageObserver = Callable[[Usage], None]
+
+
 class ModelProvider(Protocol):
     supports_vision: bool
 
     async def complete(
-        self, request: ModelRequest, executor: ToolExecutor | None = None
+        self,
+        request: ModelRequest,
+        executor: ToolExecutor | None = None,
+        *,
+        usage_observer: UsageObserver | None = None,
     ) -> ModelResponse:
         raise NotImplementedError

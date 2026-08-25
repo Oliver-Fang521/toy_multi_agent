@@ -414,7 +414,11 @@ async def test_planner_usage_is_isolated_between_concurrent_calls(task) -> None:
 
     class InterleavingProvider:
         async def complete(
-            self, request: ModelRequest, executor: object | None = None
+            self,
+            request: ModelRequest,
+            executor: object | None = None,
+            *,
+            usage_observer: Any | None = None,
         ) -> ModelResponse:
             context = json.loads(request.input_items[0]["content"][0]["text"])
             if context["task_id"] == "first":
@@ -423,13 +427,16 @@ async def test_planner_usage_is_isolated_between_concurrent_calls(task) -> None:
             else:
                 release_first.set()
                 usage = Usage(output_tokens=5, total_tokens=5)
-            return ModelResponse(
+            response = ModelResponse(
                 parsed={
                     "restatement": "Use lookup",
                     "steps": [{"specialist": "lookup", "instruction": "Find a source"}],
                 },
                 usage=usage,
             )
+            if usage_observer is not None:
+                usage_observer(response.usage)
+            return response
 
     planner = PlannerAgent(InterleavingProvider())
 
@@ -548,6 +555,10 @@ async def test_specialist_repairs_a_parsed_result_with_the_wrong_role(
     assert result.candidate_answer == "Marie Curie"
     assert result.usage == Usage(input_tokens=3, output_tokens=5, total_tokens=8)
     assert agent.last_usage == result.usage
+    assert fake_provider.emitted_usages == [
+        Usage(input_tokens=3, total_tokens=3),
+        Usage(output_tokens=5, total_tokens=5),
+    ]
     assert agent.last_repair_attempted is True
     assert len(fake_provider.requests) == 2
     assert fake_provider.requests[1].allowed_tools == ()
@@ -613,6 +624,7 @@ async def test_attachment_policy_error_does_not_enter_local_repair(fake_provider
                 reasoning_effort="max",
             ),
             parse,
+            usage_observer=lambda _usage: None,
         )
 
     assert len(fake_provider.requests) == 1
@@ -679,7 +691,11 @@ async def test_specialist_usage_is_task_local_without_stale_or_concurrent_leakag
 
     class InterleavingProvider:
         async def complete(
-            self, request: ModelRequest, executor: object | None = None
+            self,
+            request: ModelRequest,
+            executor: object | None = None,
+            *,
+            usage_observer: Any | None = None,
         ) -> ModelResponse:
             context = json.loads(request.input_items[0]["content"][0]["text"])
             if context["task_id"] == "first":
@@ -688,10 +704,13 @@ async def test_specialist_usage_is_task_local_without_stale_or_concurrent_leakag
             else:
                 release_first.set()
                 usage = Usage(output_tokens=5, total_tokens=5)
-            return ModelResponse(
+            response = ModelResponse(
                 parsed={"specialist": "lookup", "evidence": [], "candidate_answer": "answer"},
                 usage=usage,
             )
+            if usage_observer is not None:
+                usage_observer(response.usage)
+            return response
 
     agent = LookupAgent(InterleavingProvider())
     step = PlanStep(specialist="lookup", instruction="Find a source")

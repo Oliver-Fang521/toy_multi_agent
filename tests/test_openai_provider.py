@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections import deque
 from types import SimpleNamespace
@@ -927,13 +928,20 @@ async def test_openai_provider_aggregates_usage_and_extracts_sources(
         usage=_usage(7, 5, 2),
     )
 
+    observed_usage: list[Usage] = []
     response = await OpenAIProvider(fake_responses_client, "gpt-5.6-sol").complete(
-        model_request(), RecordingExecutor({"ok": True})
+        model_request(),
+        RecordingExecutor({"ok": True}),
+        usage_observer=observed_usage.append,
     )
 
     assert response.usage == Usage(
         input_tokens=17, output_tokens=9, reasoning_tokens=5, total_tokens=26
     )
+    assert observed_usage == [
+        Usage(input_tokens=10, output_tokens=4, reasoning_tokens=3, total_tokens=14),
+        Usage(input_tokens=7, output_tokens=5, reasoning_tokens=2, total_tokens=12),
+    ]
     assert [citation.model_dump() for citation in response.citations] == [
         {
             "kind": "url",
@@ -966,6 +974,91 @@ async def test_openai_provider_aggregates_usage_and_extracts_sources(
     assert response.remote_file_ids == ("file-123", "file-generated")
 
 
+@pytest.mark.asyncio
+async def test_openai_provider_publishes_completed_usage_before_cancelled_tool_call(
+    fake_responses_client: FakeResponsesClient,
+) -> None:
+    fake_responses_client.queue_function_call(
+        "execute_python", "{}", "call-1", usage=_usage(5, 2, 1)
+    )
+    tool_started = asyncio.Event()
+
+    class BlockingExecutor:
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            assert name == "execute_python"
+            assert arguments == {}
+            tool_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    observed_usage: list[Usage] = []
+    provider = OpenAIProvider(fake_responses_client, "gpt-5.6-sol")
+    invocation = asyncio.create_task(
+        provider.complete(
+            model_request(),
+            BlockingExecutor(),
+            usage_observer=observed_usage.append,
+        )
+    )
+    await asyncio.sleep(0)
+    if invocation.done():
+        await invocation
+    await asyncio.wait_for(tool_started.wait(), timeout=0.05)
+
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+
+    assert observed_usage == [
+        Usage(input_tokens=5, output_tokens=2, reasoning_tokens=1, total_tokens=7)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_usage_observers_are_invocation_local_under_concurrency() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class InterleavingResponsesClient:
+        def __init__(self) -> None:
+            self.responses = self
+
+        def with_options(self, *, max_retries: int) -> "InterleavingResponsesClient":
+            assert max_retries == 0
+            return self
+
+        async def create(self, **kwargs: Any) -> Response:
+            if kwargs["instructions"] == "first":
+                first_started.set()
+                await release_first.wait()
+                return _response("first", [], usage=_usage(3, 1, 0))
+            await first_started.wait()
+            release_first.set()
+            return _response("second", [], usage=_usage(5, 2, 1))
+
+    provider = OpenAIProvider(InterleavingResponsesClient(), "gpt-5.6-sol")
+    first_usage: list[Usage] = []
+    second_usage: list[Usage] = []
+
+    first, second = await asyncio.gather(
+        provider.complete(
+            model_request(instructions="first", allowed_tools=(), max_tool_calls=0),
+            usage_observer=first_usage.append,
+        ),
+        provider.complete(
+            model_request(instructions="second", allowed_tools=(), max_tool_calls=0),
+            usage_observer=second_usage.append,
+        ),
+    )
+
+    assert first.usage == Usage(input_tokens=3, output_tokens=1, total_tokens=4)
+    assert second.usage == Usage(
+        input_tokens=5, output_tokens=2, reasoning_tokens=1, total_tokens=7
+    )
+    assert first_usage == [first.usage]
+    assert second_usage == [second.usage]
+
+
 def _status_error(error_type: type[Exception], status_code: int) -> Exception:
     request = httpx.Request("POST", "https://api.openai.com/v1/responses")
     response = httpx.Response(status_code, request=request)
@@ -983,11 +1076,19 @@ def _status_error(error_type: type[Exception], status_code: int) -> Exception:
 )
 async def test_openai_provider_retries_transient_failures_once(transient_error: Exception) -> None:
     client = FakeResponsesClient()
-    client.queued.extend([transient_error, _response("resp-retry", [])])
+    client.queued.extend(
+        [transient_error, _response("resp-retry", [], usage=_usage(4, 2, 1))]
+    )
+    observed_usage: list[Usage] = []
 
-    await OpenAIProvider(client, "gpt-5.6-sol").complete(model_request())
+    await OpenAIProvider(client, "gpt-5.6-sol").complete(
+        model_request(), usage_observer=observed_usage.append
+    )
 
     assert len(client.requests) == 2
+    assert observed_usage == [
+        Usage(input_tokens=4, output_tokens=2, reasoning_tokens=1, total_tokens=6)
+    ]
 
 
 @pytest.mark.asyncio

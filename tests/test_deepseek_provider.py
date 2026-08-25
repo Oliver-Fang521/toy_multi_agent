@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections import deque
 from types import SimpleNamespace
@@ -173,8 +174,11 @@ async def test_deepseek_provider_executes_tool_loop_and_echoes_reasoning(
     )
     executor = RecordingExecutor({"stdout": "42"})
     provider = DeepSeekProvider(client=fake_chat_client, model="deepseek-v4-flash")
+    observed_usage: list[Usage] = []
 
-    response = await provider.complete(model_request(), executor)
+    response = await provider.complete(
+        model_request(), executor, usage_observer=observed_usage.append
+    )
 
     assert executor.calls == [
         ("execute_python", {"code": "print(6*7)"}),
@@ -247,7 +251,58 @@ async def test_deepseek_provider_executes_tool_loop_and_echoes_reasoning(
     }
     assert response.parsed == {"answer": "42"}
     assert response.usage == Usage(input_tokens=30, output_tokens=13, reasoning_tokens=10, total_tokens=43)
+    assert observed_usage == [
+        Usage(input_tokens=10, output_tokens=5, reasoning_tokens=4, total_tokens=15),
+        Usage(input_tokens=20, output_tokens=8, reasoning_tokens=6, total_tokens=28),
+    ]
     assert len(response.tool_events) == 2
+
+
+@pytest.mark.asyncio
+async def test_deepseek_provider_publishes_completed_usage_before_cancelled_tool_call(
+    fake_chat_client: FakeChatClient,
+) -> None:
+    fake_chat_client.queued.append(
+        _chat_response(
+            _chat_message(
+                content="",
+                tool_calls=[
+                    _tool_call("call-1", "execute_python", '{"code":"print(42)"}')
+                ],
+            ),
+            usage=_usage(6, 3, 2),
+        )
+    )
+    tool_started = asyncio.Event()
+
+    class BlockingExecutor:
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            assert name == "execute_python"
+            assert arguments == {"code": "print(42)"}
+            tool_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    observed_usage: list[Usage] = []
+    invocation = asyncio.create_task(
+        DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(
+            model_request(),
+            BlockingExecutor(),
+            usage_observer=observed_usage.append,
+        )
+    )
+    await asyncio.sleep(0)
+    if invocation.done():
+        await invocation
+    await asyncio.wait_for(tool_started.wait(), timeout=0.05)
+
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+
+    assert observed_usage == [
+        Usage(input_tokens=6, output_tokens=3, reasoning_tokens=2, total_tokens=9)
+    ]
 
 
 @pytest.mark.asyncio
@@ -268,13 +323,22 @@ async def test_deepseek_provider_retries_transient_error_once(
 ) -> None:
     fake_chat_client.queued.append(_status_error(RateLimitError, 429))
     fake_chat_client.queued.append(
-        _chat_response(_chat_message(content='{"answer":"42"}'))
+        _chat_response(
+            _chat_message(content='{"answer":"42"}'),
+            usage=_usage(4, 2, 1),
+        )
     )
+    observed_usage: list[Usage] = []
 
-    response = await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(model_request())
+    response = await DeepSeekProvider(fake_chat_client, "deepseek-v4-flash").complete(
+        model_request(), usage_observer=observed_usage.append
+    )
 
     assert response.parsed == {"answer": "42"}
     assert len(fake_chat_client.requests) == 2
+    assert observed_usage == [
+        Usage(input_tokens=4, output_tokens=2, reasoning_tokens=1, total_tokens=6)
+    ]
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from gaia_agent.providers.base import (
     ToolCallError,
     ToolEvent,
     ToolExecutor,
+    UsageObserver,
     serialize_tool_output,
 )
 from gaia_agent.providers.openai import _extract_json_object
@@ -128,6 +129,17 @@ def _merge_usage(accumulated: Usage, usage: Any) -> Usage:
     )
 
 
+def _publish_and_merge_usage(
+    accumulated: Usage,
+    usage: Any,
+    usage_observer: UsageObserver | None,
+) -> Usage:
+    delta = _merge_usage(Usage(), usage)
+    if usage_observer is not None:
+        usage_observer(delta)
+    return _merge_usage(accumulated, usage)
+
+
 def _validate_value(value: Any, schema: dict[str, Any], root: dict[str, Any]) -> bool:
     if "$ref" in schema:
         ref = schema["$ref"].removeprefix("#/$defs/")
@@ -206,7 +218,11 @@ class DeepSeekProvider:
         self._jitter = jitter
 
     async def complete(
-        self, request: ModelRequest, executor: ToolExecutor | None = None
+        self,
+        request: ModelRequest,
+        executor: ToolExecutor | None = None,
+        *,
+        usage_observer: UsageObserver | None = None,
     ) -> ModelResponse:
         retry_metadata = _ProviderRetryMetadata()
         retry_token: Token[_ProviderRetryMetadata | None] = _CURRENT_RETRY_METADATA.set(
@@ -223,7 +239,11 @@ class DeepSeekProvider:
         )
         try:
             try:
-                response = await self._complete(request, executor)
+                response = await self._complete(
+                    request,
+                    executor,
+                    usage_observer=usage_observer,
+                )
             except Exception as error:
                 if generation is not None:
                     generation.end(
@@ -258,7 +278,11 @@ class DeepSeekProvider:
             _CURRENT_RETRY_METADATA.reset(retry_token)
 
     async def _complete(
-        self, request: ModelRequest, executor: ToolExecutor | None = None
+        self,
+        request: ModelRequest,
+        executor: ToolExecutor | None = None,
+        *,
+        usage_observer: UsageObserver | None = None,
     ) -> ModelResponse:
         schema_hint = json.dumps(request.output_schema, sort_keys=True)
         messages: list[dict[str, Any]] = [
@@ -286,7 +310,7 @@ class DeepSeekProvider:
         tool_events: list[ToolEvent] = []
         usage = Usage()
         response = await self._create_with_retry(**common)
-        usage = _merge_usage(usage, response.usage)
+        usage = _publish_and_merge_usage(usage, response.usage, usage_observer)
         recovery_used = False
 
         while True:
@@ -305,7 +329,9 @@ class DeepSeekProvider:
                     common["messages"] = list(messages)
                     common.pop("tools", None)
                     response = await self._create_with_retry(**common)
-                    usage = _merge_usage(usage, response.usage)
+                    usage = _publish_and_merge_usage(
+                        usage, response.usage, usage_observer
+                    )
                     continue
                 break
             if undeclared := next(
@@ -328,7 +354,9 @@ class DeepSeekProvider:
                 common.pop("tools", None)
                 common["messages"] = list(messages)
                 response = await self._create_with_retry(**common)
-                usage = _merge_usage(usage, response.usage)
+                usage = _publish_and_merge_usage(
+                    usage, response.usage, usage_observer
+                )
                 continue
             for call in calls:
                 arguments = json.loads(call.function.arguments)
@@ -351,7 +379,7 @@ class DeepSeekProvider:
             tool_call_count += len(calls)
             common["messages"] = list(messages)
             response = await self._create_with_retry(**common)
-            usage = _merge_usage(usage, response.usage)
+            usage = _publish_and_merge_usage(usage, response.usage, usage_observer)
 
         output_text = ""
         parsed = None

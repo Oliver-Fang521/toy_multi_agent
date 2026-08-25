@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ class FakeProvider:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
         self.executors: list[object | None] = []
+        self.emitted_usages: list[Usage] = []
         self._responses: deque[ModelResponse] = deque()
 
     def return_parsed(
@@ -42,10 +44,16 @@ class FakeProvider:
         self,
         request: ModelRequest,
         executor: object | None = None,
+        *,
+        usage_observer: Callable[[Usage], None] | None = None,
     ) -> ModelResponse:
         self.requests.append(request)
         self.executors.append(executor)
-        return self._responses.popleft()
+        response = self._responses.popleft()
+        if usage_observer is not None:
+            usage_observer(response.usage)
+            self.emitted_usages.append(response.usage)
+        return response
 
 
 class FakeToolClient:

@@ -16,6 +16,7 @@ from gaia_agent.providers.base import (
     ToolCallError,
     ToolEvent,
     ToolExecutor,
+    UsageObserver,
     serialize_tool_output,
 )
 from gaia_agent.reliability import (
@@ -120,7 +121,11 @@ class OpenAIProvider:
         self._jitter = jitter
 
     async def complete(
-        self, request: ModelRequest, executor: ToolExecutor | None = None
+        self,
+        request: ModelRequest,
+        executor: ToolExecutor | None = None,
+        *,
+        usage_observer: UsageObserver | None = None,
     ) -> ModelResponse:
         retry_metadata = _ProviderRetryMetadata()
         retry_token: Token[_ProviderRetryMetadata | None] = _CURRENT_RETRY_METADATA.set(
@@ -137,7 +142,11 @@ class OpenAIProvider:
         )
         try:
             try:
-                response = await self._complete(request, executor)
+                response = await self._complete(
+                    request,
+                    executor,
+                    usage_observer=usage_observer,
+                )
             except Exception as error:
                 if generation is not None:
                     generation.end(
@@ -172,7 +181,11 @@ class OpenAIProvider:
             _CURRENT_RETRY_METADATA.reset(retry_token)
 
     async def _complete(
-        self, request: ModelRequest, executor: ToolExecutor | None = None
+        self,
+        request: ModelRequest,
+        executor: ToolExecutor | None = None,
+        *,
+        usage_observer: UsageObserver | None = None,
     ) -> ModelResponse:
         common = {
             "model": self._model,
@@ -193,6 +206,7 @@ class OpenAIProvider:
             common["max_tool_calls"] = request.max_tool_calls
         history: list[dict[str, Any]] = [dict(item) for item in request.input_items]
         response = await self._create_with_retry(input=request.input_items, **common)
+        _publish_response_usage(response, usage_observer)
         responses = [response]
         tool_events: list[ToolEvent] = []
         tool_call_count = 0
@@ -217,6 +231,7 @@ class OpenAIProvider:
                     input_items=outputs if self._use_previous_response_id else list(history),
                     common=tool_free_common,
                 )
+                _publish_response_usage(response, usage_observer)
                 responses.append(response)
                 break
             if undeclared := next(
@@ -269,6 +284,7 @@ class OpenAIProvider:
                 input_items=outputs if self._use_previous_response_id else list(history),
                 common=next_common,
             )
+            _publish_response_usage(response, usage_observer)
             responses.append(response)
 
         output_text, refused = _extract_output_text(response)
@@ -356,6 +372,14 @@ def _aggregate_usage(responses: list[Any]) -> Usage:
         reasoning_tokens=reasoning_tokens,
         total_tokens=total_tokens,
     )
+
+
+def _publish_response_usage(
+    response: Any,
+    usage_observer: UsageObserver | None,
+) -> None:
+    if usage_observer is not None:
+        usage_observer(_aggregate_usage([response]))
 
 
 def _extract_output_text(response: Any) -> tuple[str, bool]:

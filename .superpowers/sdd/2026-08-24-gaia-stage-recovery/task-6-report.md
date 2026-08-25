@@ -725,3 +725,136 @@ and cannot begin new guarded provider/tool work after deadline.
 
 Final independent read-only review found no Critical or Important findings and returned
 **Ready: Yes**. Its focused cancellation slice passed 3/3; Ruff and `git diff --check` were clean.
+
+---
+
+## Fix round 4 — immediate completed-turn usage publication
+
+### RED evidence
+
+The production `CriticAgent` cancellation probe and the provider/agent usage probes were added
+before production changes. All seven failed against `e0ef3a5`:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_cli_e2e.py::test_real_critic_publishes_malformed_turn_usage_before_cancelled_local_repair \
+  tests/test_agents.py::test_specialist_repairs_a_parsed_result_with_the_wrong_role \
+  tests/test_openai_provider.py::test_openai_provider_publishes_completed_usage_before_cancelled_tool_call \
+  tests/test_openai_provider.py::test_openai_provider_aggregates_usage_and_extracts_sources \
+  tests/test_openai_provider.py::test_openai_provider_usage_observers_are_invocation_local_under_concurrency \
+  tests/test_deepseek_provider.py::test_deepseek_provider_publishes_completed_usage_before_cancelled_tool_call \
+  tests/test_deepseek_provider.py::test_deepseek_provider_executes_tool_loop_and_echoes_reasoning
+FFFFFFF                                                                  [100%]
+```
+
+The exact real-Critic probe reached the second, tool-free repair request, canceled it, and then
+observed `critic.last_usage == 0` instead of the completed malformed turn's 5 tokens. After fixing
+the test's independent stage-budget setup, its focused RED was:
+
+```text
+assert critic.last_usage == Usage(input_tokens=5, total_tokens=5)
+E assert Usage(total_tokens=0) == Usage(input_tokens=5, total_tokens=5)
+1 failed
+```
+
+The agent local-repair fake received no usage observer, and both production adapters rejected the
+new per-invocation `usage_observer` interface, so successful tool-loop totals, cancellation after a
+completed turn, and concurrent observer isolation were all independently RED.
+
+### GREEN evidence
+
+Required cancellation, success/no-double, local-repair, concurrency, and SDK-retry probes:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_openai_provider.py::test_openai_provider_retries_transient_failures_once \
+  tests/test_deepseek_provider.py::test_deepseek_provider_retries_transient_error_once \
+  tests/test_cli_e2e.py::test_real_critic_publishes_malformed_turn_usage_before_cancelled_local_repair \
+  tests/test_agents.py::test_specialist_repairs_a_parsed_result_with_the_wrong_role \
+  tests/test_openai_provider.py::test_openai_provider_publishes_completed_usage_before_cancelled_tool_call \
+  tests/test_openai_provider.py::test_openai_provider_aggregates_usage_and_extracts_sources \
+  tests/test_openai_provider.py::test_openai_provider_usage_observers_are_invocation_local_under_concurrency \
+  tests/test_deepseek_provider.py::test_deepseek_provider_publishes_completed_usage_before_cancelled_tool_call \
+  tests/test_deepseek_provider.py::test_deepseek_provider_executes_tool_loop_and_echoes_reasoning
+...........                                                              [100%]
+```
+
+Impacted agent, provider, graph, runner/CLI, and trace-reliability suites:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_agents.py tests/test_openai_provider.py tests/test_deepseek_provider.py \
+  tests/test_orchestrator.py tests/test_cli_e2e.py tests/test_trace_reliability_e2e.py
+........................................................................ [ 24%]
+........................................................................ [ 49%]
+........................................................................ [ 74%]
+........................................................................ [ 99%]
+.                                                                        [100%]
+```
+
+Fresh full suite:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q
+........................................................................ [ 11%]
+........................................................................ [ 22%]
+........................................................................ [ 33%]
+........................................................................ [ 45%]
+........................................................................ [ 56%]
+........................................................................ [ 67%]
+........................................................................ [ 79%]
+........................................................................ [ 90%]
+.............................................................            [100%]
+```
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check src tests
+All checks passed!
+
+git diff --check
+# no output
+```
+
+### Behavior added in fix round 4
+
+- `ModelProvider.complete` now accepts an optional synchronous, per-invocation usage observer. The
+  deadline guard forwards that same observer without storing it, so concurrent votes cannot share
+  provider-global accounting state.
+- OpenAI Responses and DeepSeek Chat adapters publish a delta immediately after every completed SDK
+  response and before any following tool execution, schema recovery, tool-loop continuation, or
+  local stage repair can await. A failed SDK attempt that yields no response publishes nothing.
+- Provider return values retain the original aggregate usage. Agents overwrite their invocation
+  accumulator with that aggregate only on success, so already-published deltas are not added again.
+- Planner, Specialist, Critic, and Evidence Linker create an invocation-local observer backed by
+  their existing `ContextVar`. Each also exposes the latest published cumulative value outside the
+  child graph context, allowing cancellation accounting to be read before slow teardown completes;
+  concurrent active invocations continue to read their own task-local values.
+- The real restored-Critic regression starts from 7 authenticated tokens, completes a malformed
+  5-token response, and is canceled in the second repair request. Its immediate agent/result/
+  checkpoint totals are now 5/12/12; later cleanup leaves them unchanged.
+- Successful local repair and both production tool loops retain exact prior totals rather than
+  double-counting. Transient SDK retry probes publish only the one response that actually completed.
+
+### Fix-round files and concerns
+
+- `src/gaia_agent/providers/base.py`, `providers/__init__.py`: optional observer protocol/export.
+- `src/gaia_agent/providers/openai.py`, `providers/deepseek.py`: completed-response delta publication.
+- `src/gaia_agent/agents.py`: invocation-local accumulation and cancellation-visible publication.
+- `src/gaia_agent/runner.py`: deadline-guard observer forwarding.
+- Agent/provider/CLI/trace test doubles were migrated to the optional keyword interface; focused
+  regressions live in `tests/test_agents.py`, `tests/test_openai_provider.py`,
+  `tests/test_deepseek_provider.py`, and `tests/test_cli_e2e.py`.
+
+No model selection, reasoning effort, checkpoint semantic state, vote namespace, retry deadline,
+tool budget, private/public observability boundary, secret, prompt, candidate, evidence, or URL
+behavior changed. The observer addition is an internal compatible extension: callers may omit it,
+while implementations used through the internal `ModelProvider` protocol must accept the optional
+keyword. Outside an active invocation context, a shared agent reports its latest published usage;
+production constructs independent agents per vote, while concurrent active calls remain isolated
+by `ContextVar` and were regression-tested.
+
+Final independent read-only review found no Critical or Important findings and returned
+**Ready: Yes**. It confirmed response-before-await publication across both production providers,
+equivalent aggregate replacement on success, cancellation preservation, guarded forwarding, fake
+compatibility, and concurrent observer isolation; its provider/agent and focused slices passed, and
+Ruff plus `git diff --check` were clean.

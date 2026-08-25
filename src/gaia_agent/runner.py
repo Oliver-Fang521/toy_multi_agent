@@ -52,6 +52,7 @@ from gaia_agent.providers import (
     ModelResponse,
     OpenAIProvider,
     ToolExecutor,
+    UsageObserver,
 )
 from gaia_agent.reliability import (
     InvocationDeadline,
@@ -176,9 +177,15 @@ class _DeadlineGuardedProvider:
         self,
         request: ModelRequest,
         executor: ToolExecutor | None = None,
+        *,
+        usage_observer: UsageObserver | None = None,
     ) -> ModelResponse:
         ensure_current_invocation_allowed()
-        return await self._provider.complete(request, executor)
+        return await self._provider.complete(
+            request,
+            executor,
+            usage_observer=usage_observer,
+        )
 
 
 @dataclass(frozen=True)

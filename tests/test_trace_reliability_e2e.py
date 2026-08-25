@@ -102,10 +102,19 @@ class _ScriptedProvider:
         self._responses = deque(responses)
         self.calls = 0
 
-    async def complete(self, request: ModelRequest, executor: object | None = None) -> ModelResponse:
+    async def complete(
+        self,
+        request: ModelRequest,
+        executor: object | None = None,
+        *,
+        usage_observer: object | None = None,
+    ) -> ModelResponse:
         del request, executor
         self.calls += 1
-        return self._responses.popleft()
+        response = self._responses.popleft()
+        if callable(usage_observer):
+            usage_observer(response.usage)
+        return response
 
 
 class _NoToolClient:
