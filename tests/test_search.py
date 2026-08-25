@@ -215,6 +215,82 @@ async def test_search_chain_does_not_start_fallback_after_deadline() -> None:
     assert serper.calls == 0
 
 
+def test_attempt_deadline_never_rebases_past_operation_deadline() -> None:
+    class AdvancingClock:
+        def __init__(self) -> None:
+            self._values = iter((9.0, 11.0))
+
+        def __call__(self) -> float:
+            return next(self._values, 11.0)
+
+    chain = SearchProviderChain(
+        [_ScriptedProvider("openai", [])],
+        RetryPolicy(max_attempts=1),
+        clock=AdvancingClock(),
+    )
+
+    attempt_deadline = chain._attempt_deadline(
+        10.0,
+        provider_index=0,
+        attempt=1,
+    )
+
+    assert attempt_deadline is not None
+    assert attempt_deadline <= 10.0
+
+
+@pytest.mark.asyncio
+async def test_search_rechecks_deadline_at_provider_boundary() -> None:
+    class AdvancingClock:
+        def __init__(self) -> None:
+            self._values = iter((9.0, 11.0))
+
+        def __call__(self) -> float:
+            return next(self._values, 11.0)
+
+    provider = _ScriptedProvider(
+        "openai",
+        [{"answer": "must not run", "sources": []}],
+    )
+    chain = SearchProviderChain(
+        [provider],
+        RetryPolicy(max_attempts=1),
+        clock=AdvancingClock(),
+    )
+
+    with pytest.raises(search_module._OperationDeadlineExceeded):
+        await chain._search_with_deadline(provider, "question", 10.0, 10.0)
+
+    assert provider.queries == []
+
+
+@pytest.mark.asyncio
+async def test_search_rechecks_operation_deadline_at_backoff_boundary() -> None:
+    class AdvancingClock:
+        def __init__(self) -> None:
+            self._values = iter((9.0, 11.0))
+
+        def __call__(self) -> float:
+            return next(self._values, 11.0)
+
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    chain = SearchProviderChain(
+        [_ScriptedProvider("openai", [])],
+        RetryPolicy(max_attempts=1),
+        clock=AdvancingClock(),
+        sleep=sleep,
+    )
+
+    with pytest.raises(search_module._OperationDeadlineExceeded):
+        await chain._sleep_with_deadline(0.5, 10.0)
+
+    assert sleeps == []
+
+
 @pytest.mark.asyncio
 async def test_search_chain_cancels_an_inflight_provider_at_operation_deadline() -> None:
     class SlowProvider:

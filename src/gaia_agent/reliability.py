@@ -33,7 +33,21 @@ class InvocationDeadline:
             raise InvocationDeadlineExceeded("vote invocation deadline exhausted")
 
 
-_CURRENT_INVOCATION_DEADLINE: ContextVar[InvocationDeadline | None] = ContextVar(
+@dataclass(frozen=True)
+class _InvocationDeadlineGroup:
+    """All active absolute guards; nesting may only tighten authorization."""
+
+    deadlines: tuple[InvocationDeadline, ...]
+
+    def ensure_open(self) -> None:
+        for deadline in self.deadlines:
+            deadline.ensure_open()
+
+
+InvocationGuard = InvocationDeadline | _InvocationDeadlineGroup
+
+
+_CURRENT_INVOCATION_DEADLINE: ContextVar[InvocationGuard | None] = ContextVar(
     "gaia_invocation_deadline",
     default=None,
 )
@@ -43,9 +57,14 @@ _CURRENT_INVOCATION_DEADLINE: ContextVar[InvocationDeadline | None] = ContextVar
 def invocation_deadline_scope(
     deadline: InvocationDeadline | None,
 ) -> Iterator[None]:
-    token: Token[InvocationDeadline | None] = _CURRENT_INVOCATION_DEADLINE.set(
-        deadline
-    )
+    current = _CURRENT_INVOCATION_DEADLINE.get()
+    if deadline is None or current is None:
+        active: InvocationGuard | None = deadline
+    elif isinstance(current, _InvocationDeadlineGroup):
+        active = _InvocationDeadlineGroup((*current.deadlines, deadline))
+    else:
+        active = _InvocationDeadlineGroup((current, deadline))
+    token: Token[InvocationGuard | None] = _CURRENT_INVOCATION_DEADLINE.set(active)
     try:
         yield
     finally:

@@ -3,7 +3,11 @@ import pytest
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
 from gaia_agent.reliability import (
+    InvocationDeadline,
+    InvocationDeadlineExceeded,
     RetryPolicy,
+    ensure_current_invocation_allowed,
+    invocation_deadline_scope,
     is_transient_provider_error,
     retry_delay,
 )
@@ -35,3 +39,16 @@ def test_retry_delay_is_bounded() -> None:
     assert retry_delay(policy, 1, lambda: 0.0) == 1.0
     assert retry_delay(policy, 2, lambda: 0.0) == 2.0
     assert retry_delay(policy, 3, lambda: 1.0) <= 4.0
+
+
+def test_nested_stage_deadline_cannot_weaken_outer_vote_deadline() -> None:
+    now = [11.0]
+    vote = InvocationDeadline(10.0, lambda: now[0])
+    stage = InvocationDeadline(20.0, lambda: now[0])
+
+    with (
+        invocation_deadline_scope(vote),
+        invocation_deadline_scope(stage),
+        pytest.raises(InvocationDeadlineExceeded),
+    ):
+        ensure_current_invocation_allowed()

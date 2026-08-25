@@ -310,6 +310,39 @@ async def test_stage_deadline_rejects_tool_call_before_backend_invocation() -> N
 
 
 @pytest.mark.asyncio
+async def test_stage_deadline_is_rechecked_before_tool_execution_is_recorded() -> None:
+    class AdvancingClock:
+        def __init__(self) -> None:
+            self._values = iter((9.0, 11.0))
+
+        def __call__(self) -> float:
+            return next(self._values, 11.0)
+
+    audit_events: list[str] = []
+    tools = FakeTools([])
+    client = _BudgetedToolClient(
+        tools,
+        max_calls=8,
+        audit=lambda event_type, _: audit_events.append(event_type),
+        clock=AdvancingClock(),
+    )
+    client.start_scope(
+        "act:lookup:1",
+        stage="specialist",
+        max_calls=6,
+        deadline=10.0,
+    )
+
+    with pytest.raises(orchestrator_module.StageBudgetExceeded) as raised:
+        await client.call("web_search", {"query": "private query"})
+
+    assert (raised.value.stage, raised.value.reason) == ("specialist", "time")
+    assert tools.call_arguments == []
+    assert client.executed_call_count == 0
+    assert "tool_call_started" not in audit_events
+
+
+@pytest.mark.asyncio
 async def test_stage_deadline_bounds_complete_underlying_mcp_await() -> None:
     class BlockingTools:
         tool_specs: tuple[ToolSpec, ...] = ()
@@ -3620,6 +3653,41 @@ async def test_single_deadline_covers_the_complete_state_machine() -> None:
 
     assert result.error_category == TerminalErrorCategory.TIMEOUT
     assert calls == ["planner"]
+
+
+@pytest.mark.asyncio
+async def test_run_in_stage_rechecks_absolute_deadline_at_operation_boundary() -> None:
+    class AdvancingClock:
+        def __init__(self) -> None:
+            self._values = iter((9.0, 11.0))
+
+        def __call__(self) -> float:
+            return next(self._values, 11.0)
+
+    operation_started = False
+
+    async def operation() -> str:
+        nonlocal operation_started
+        operation_started = True
+        return "late"
+
+    orchestrator = _orchestrator(
+        planner=FakePlanner([], _plan(SpecialistName.LOOKUP)),
+        specialists={},
+        critic=FakeCritic([], []),
+        tools=FakeTools([]),
+    )
+    orchestrator._vote_stage_runtime = None
+    orchestrator._now = AdvancingClock()  # type: ignore[method-assign]
+
+    with pytest.raises(orchestrator_module.StageBudgetExceeded) as raised:
+        await orchestrator._run_in_stage(
+            StageBudget(name="planner", deadline=10.0, max_calls=0),
+            operation,
+        )
+
+    assert (raised.value.stage, raised.value.reason) == ("planner", "time")
+    assert operation_started is False
 
 
 @pytest.mark.asyncio

@@ -326,14 +326,28 @@ class SearchProviderChain:
     ) -> dict[str, Any]:
         if attempt_deadline is None:
             return await provider.search(query)
-        remaining_seconds = attempt_deadline - self._clock()
+        now = self._clock()
+        effective_deadline = (
+            min(attempt_deadline, operation_deadline)
+            if operation_deadline is not None
+            else attempt_deadline
+        )
+        remaining_seconds = effective_deadline - now
         if remaining_seconds <= 0:
-            if operation_deadline is not None and attempt_deadline >= operation_deadline:
+            if operation_deadline is not None and now >= operation_deadline:
                 raise _OperationDeadlineExceeded
             raise _AttemptDeadlineExceeded
-        timeout = asyncio.timeout(remaining_seconds)
+        loop_deadline = asyncio.get_running_loop().time() + remaining_seconds
+        timeout = asyncio.timeout_at(loop_deadline)
         try:
             async with timeout:
+                # Recheck immediately before entering provider code; preparing
+                # the timeout must never authorize a call after either cutoff.
+                boundary_now = self._clock()
+                if operation_deadline is not None and boundary_now >= operation_deadline:
+                    raise _OperationDeadlineExceeded
+                if boundary_now >= effective_deadline:
+                    raise _AttemptDeadlineExceeded
                 result = await provider.search(query)
         except TimeoutError:
             if timeout.expired():
@@ -342,17 +356,16 @@ class SearchProviderChain:
                 raise _AttemptDeadlineExceeded from None
             raise
         except Exception:
-            if timeout.expired() or self._clock() >= attempt_deadline:
-                if (
-                    operation_deadline is not None
-                    and self._clock() >= operation_deadline
-                ):
+            failure_now = self._clock()
+            if timeout.expired() or failure_now >= effective_deadline:
+                if operation_deadline is not None and failure_now >= operation_deadline:
                     raise _OperationDeadlineExceeded from None
                 raise _AttemptDeadlineExceeded from None
             raise
-        if operation_deadline is not None and self._clock() >= operation_deadline:
+        completed_at = self._clock()
+        if operation_deadline is not None and completed_at >= operation_deadline:
             raise _OperationDeadlineExceeded
-        if timeout.expired() or self._clock() >= attempt_deadline:
+        if timeout.expired() or completed_at >= effective_deadline:
             raise _AttemptDeadlineExceeded
         return result
 
@@ -365,13 +378,14 @@ class SearchProviderChain:
     ) -> float | None:
         if operation_deadline is None:
             return None
-        remaining = operation_deadline - self._clock()
+        now = self._clock()
+        remaining = operation_deadline - now
         if remaining <= 0:
             raise _OperationDeadlineExceeded
         current_attempt_slots = self._retry_policy.max_attempts - attempt + 1
         fallback_slots = len(self._providers) - provider_index - 1
         slot_count = max(1, current_attempt_slots + fallback_slots)
-        return self._clock() + remaining / slot_count
+        return min(operation_deadline, now + remaining / slot_count)
 
     def _retry_preserves_fallback(
         self,
@@ -405,9 +419,12 @@ class SearchProviderChain:
         remaining = operation_deadline - self._clock()
         if remaining <= delay:
             raise _OperationDeadlineExceeded
-        timeout = asyncio.timeout(remaining)
+        loop_deadline = asyncio.get_running_loop().time() + remaining
+        timeout = asyncio.timeout_at(loop_deadline)
         try:
             async with timeout:
+                if self._clock() >= operation_deadline:
+                    raise _OperationDeadlineExceeded
                 await self._sleep(delay)
         except TimeoutError:
             if timeout.expired():

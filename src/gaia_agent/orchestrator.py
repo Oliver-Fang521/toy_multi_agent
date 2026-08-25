@@ -40,6 +40,7 @@ from gaia_agent.observability import Observability, TaskTrace
 from gaia_agent.providers import ToolCallError, ToolSpec
 from gaia_agent.reliability import (
     InvocationDeadline,
+    InvocationDeadlineExceeded,
     ProviderTransientExhaustedError,
     ensure_current_invocation_allowed,
     invocation_deadline_scope,
@@ -416,21 +417,33 @@ class _BudgetedToolClient:
                     {**safe_payload, "result_keys": sorted(restored)},
                 )
                 return copy.deepcopy(restored)
-        self._audit("tool_call_started", safe_payload)
-        self.executed_call_count += 1
         try:
             if self._stage_budget is None or self._stage_budget.deadline is None:
+                ensure_current_invocation_allowed()
+                self._audit("tool_call_started", safe_payload)
+                self.executed_call_count += 1
                 result = await self._client.call(name, arguments)
             else:
                 remaining = self._stage_budget.deadline - self._now()
                 if remaining <= 0:
                     raise StageBudgetExceeded(self._stage_budget.name, "time")
-                async with asyncio.timeout(remaining):
+                loop_deadline = asyncio.get_running_loop().time() + remaining
+                async with asyncio.timeout_at(loop_deadline):
+                    # Recheck at the actual backend boundary. The stage clock may
+                    # have advanced while arguments, cache state, and timeout
+                    # scope were prepared.
+                    self._check_stage_deadline()
+                    ensure_current_invocation_allowed()
+                    self._audit("tool_call_started", safe_payload)
+                    self.executed_call_count += 1
                     result = await self._client.call(name, arguments)
                 if self._now() >= self._stage_budget.deadline:
                     raise StageBudgetExceeded(self._stage_budget.name, "time")
         except StageBudgetExceeded:
             raise
+        except InvocationDeadlineExceeded as error:
+            assert self._stage_budget is not None
+            raise StageBudgetExceeded(self._stage_budget.name, "time") from error
         except TimeoutError as error:
             assert self._stage_budget is not None
             raise StageBudgetExceeded(self._stage_budget.name, "time") from error
@@ -468,10 +481,18 @@ class _BudgetedToolClient:
         budget = self._stage_budget
         if budget is None:
             return
-        if budget.deadline is not None and budget.deadline <= self._now():
-            raise StageBudgetExceeded(budget.name, "time")
+        self._check_stage_deadline()
         if self._stage_logical_call_counts[budget.name] >= budget.max_calls:
             raise StageBudgetExceeded(budget.name, "tool_calls")
+
+    def _check_stage_deadline(self) -> None:
+        budget = self._stage_budget
+        if (
+            budget is not None
+            and budget.deadline is not None
+            and budget.deadline <= self._now()
+        ):
+            raise StageBudgetExceeded(budget.name, "time")
 
     def _now(self) -> float:
         if self._clock is not None:
@@ -1756,10 +1777,14 @@ class Orchestrator:
         | None = None,
     ) -> Any:
         remaining = None
+        loop_deadline = None
+        stage_deadline = None
         if budget.deadline is not None:
             remaining = budget.deadline - self._now()
             if remaining <= 0:
                 raise StageBudgetExceeded(budget.name, "time")
+            loop_deadline = asyncio.get_running_loop().time() + remaining
+            stage_deadline = InvocationDeadline(budget.deadline, self._now)
         previous_stage = stage_runtime.active if stage_runtime is not None else None
         if stage_runtime is not None:
             stage_runtime.active = budget.name
@@ -1770,22 +1795,41 @@ class Orchestrator:
         )
         interrupted = False
         try:
-            if remaining is None:
-                result = await operation()
-            else:
-                async with asyncio.timeout(remaining):
+            scope = (
+                invocation_deadline_scope(stage_deadline)
+                if stage_deadline is not None
+                else nullcontext()
+            )
+            with scope:
+                if loop_deadline is None:
                     result = await operation()
-                if self._now() >= budget.deadline:
-                    raise StageBudgetExceeded(budget.name, "time")
+                else:
+                    async with asyncio.timeout_at(loop_deadline):
+                        # This is the final synchronous gate before the stage
+                        # operation can invoke a provider or tool. The same
+                        # absolute deadline remains in context for nested calls.
+                        ensure_current_invocation_allowed()
+                        result = await operation()
+                    if self._now() >= budget.deadline:
+                        raise StageBudgetExceeded(budget.name, "time")
             return result
         except asyncio.CancelledError:
             interrupted = True
             raise
         except StageBudgetExceeded:
             raise
+        except InvocationDeadlineExceeded as error:
+            if stage_deadline is None:
+                raise
+            raise StageBudgetExceeded(budget.name, "time") from error
         except TimeoutError as error:
             raise StageBudgetExceeded(budget.name, "time") from error
         finally:
+            if stage_deadline is not None:
+                # Context is copied into detached tasks. Closing the shared
+                # object prevents those tasks from starting late invocations
+                # after this stage has already returned.
+                stage_deadline.close()
             if activity is not None:
                 self._vote_stage_runtime.finish(activity)
             if stage_runtime is not None and not interrupted:
