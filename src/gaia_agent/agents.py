@@ -458,6 +458,8 @@ class EvidenceLinkerAgent:
     ) -> tuple[str, ...]:
         self._last_usage.set(Usage())
         self._published_usage = Usage()
+        if not cards:
+            return ()
         context = _bounded_evidence_link_context(
             task,
             candidate,

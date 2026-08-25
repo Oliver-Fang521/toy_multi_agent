@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import re
 import string
 from collections import defaultdict
@@ -48,6 +49,7 @@ from gaia_agent.scoring import parse_number_with_status
 
 _DEFAULT_STAGE_CONTEXT_MAX_BYTES = 24_576
 _CONTEXT_BUDGET_PRESSURE_RATIO = 0.7
+_MAX_OPERATIONAL_SECONDS = 1_000_000_000.0
 
 
 class Planner(Protocol):
@@ -127,6 +129,105 @@ class StageBudgetExceeded(RuntimeError):
         self.reason = reason
 
 
+@dataclass(frozen=True)
+class StageDeadlineEnvelope:
+    """One vote's immutable absolute stage and hard-deadline cutoffs."""
+
+    vote_started_at: float
+    vote_deadline: float
+    planner_deadline: float
+    specialist_deadline: float
+    critic_deadline: float
+
+    @classmethod
+    def for_config(cls, config: RunConfig, *, started_at: float) -> StageDeadlineEnvelope:
+        planner_deadline = started_at + config.planner_timeout_seconds
+        specialist_deadline = planner_deadline + config.specialist_timeout_seconds
+        return cls(
+            vote_started_at=started_at,
+            vote_deadline=started_at + config.timeout_seconds,
+            planner_deadline=planner_deadline,
+            specialist_deadline=specialist_deadline,
+            critic_deadline=specialist_deadline + config.critic_timeout_seconds,
+        )
+
+
+@dataclass(frozen=True)
+class _StageActivity:
+    token: int
+    stage: Literal["planner", "specialist", "critic", "submit"]
+
+
+@dataclass
+class VoteStageRuntime:
+    """Migration-compatible per-vote cutoffs and cumulative active-stage timing."""
+
+    envelope: StageDeadlineEnvelope | None = None
+    clock: Callable[[], float] | None = None
+    _elapsed: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    _active: dict[int, tuple[str, float]] = field(default_factory=dict)
+    _next_token: int = 0
+
+    @classmethod
+    def for_config(
+        cls,
+        config: RunConfig,
+        *,
+        started_at: float,
+        clock: Callable[[], float] | None = None,
+    ) -> VoteStageRuntime:
+        return cls(
+            envelope=StageDeadlineEnvelope.for_config(config, started_at=started_at),
+            clock=clock,
+        )
+
+    def bind_defaults(
+        self,
+        config: RunConfig,
+        *,
+        started_at: float,
+        clock: Callable[[], float],
+    ) -> None:
+        if self.envelope is None:
+            self.envelope = StageDeadlineEnvelope.for_config(
+                config,
+                started_at=started_at,
+            )
+        if self.clock is None:
+            self.clock = clock
+
+    def now(self) -> float:
+        if self.clock is not None:
+            return self.clock()
+        return asyncio.get_running_loop().time()
+
+    def begin(
+        self,
+        stage: Literal["planner", "specialist", "critic", "submit"],
+    ) -> _StageActivity:
+        self._next_token += 1
+        activity = _StageActivity(self._next_token, stage)
+        self._active[activity.token] = (stage, self.now())
+        return activity
+
+    def finish(self, activity: _StageActivity) -> None:
+        active = self._active.pop(activity.token, None)
+        if active is None:
+            return
+        stage, started_at = active
+        self._elapsed[stage] += _finite_nonnegative(self.now() - started_at)
+
+    def elapsed_seconds(self, stage: str) -> float:
+        elapsed = self._elapsed.get(stage, 0.0)
+        now = self.now()
+        elapsed += sum(
+            _finite_nonnegative(now - started_at)
+            for active_stage, started_at in self._active.values()
+            if active_stage == stage
+        )
+        return _finite_nonnegative(elapsed)
+
+
 @dataclass
 class _StageRuntime:
     active: Literal["planner", "specialist", "critic"] | None = None
@@ -186,11 +287,13 @@ class _BudgetedToolClient:
         max_calls: int,
         audit: Callable[[str, dict[str, Any]], None],
         notebook: ResearchNotebook | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._client = client
         self._max_calls = max_calls
         self._audit = audit
         self._notebook = notebook
+        self._clock = clock
         self._scope = "unscoped"
         self._scope_logical_call_count = 0
         self._stage_budget: StageBudget | None = None
@@ -319,8 +422,15 @@ class _BudgetedToolClient:
             if self._stage_budget is None or self._stage_budget.deadline is None:
                 result = await self._client.call(name, arguments)
             else:
-                async with asyncio.timeout_at(self._stage_budget.deadline):
+                remaining = self._stage_budget.deadline - self._now()
+                if remaining <= 0:
+                    raise StageBudgetExceeded(self._stage_budget.name, "time")
+                async with asyncio.timeout(remaining):
                     result = await self._client.call(name, arguments)
+                if self._now() >= self._stage_budget.deadline:
+                    raise StageBudgetExceeded(self._stage_budget.name, "time")
+        except StageBudgetExceeded:
+            raise
         except TimeoutError as error:
             assert self._stage_budget is not None
             raise StageBudgetExceeded(self._stage_budget.name, "time") from error
@@ -358,10 +468,15 @@ class _BudgetedToolClient:
         budget = self._stage_budget
         if budget is None:
             return
-        if budget.deadline is not None and budget.deadline <= asyncio.get_running_loop().time():
+        if budget.deadline is not None and budget.deadline <= self._now():
             raise StageBudgetExceeded(budget.name, "time")
         if self._stage_logical_call_counts[budget.name] >= budget.max_calls:
             raise StageBudgetExceeded(budget.name, "tool_calls")
+
+    def _now(self) -> float:
+        if self._clock is not None:
+            return self._clock()
+        return asyncio.get_running_loop().time()
 
 
 class _GraphState(TypedDict, total=False):
@@ -393,6 +508,7 @@ class Orchestrator:
         observability: Observability | None = None,
         notebook: ResearchNotebook | None = None,
         evidence_linker: EvidenceLinker | None = None,
+        stage_runtime: VoteStageRuntime | None = None,
     ) -> None:
         if config.max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -411,6 +527,7 @@ class Orchestrator:
         self._observability = observability or Observability()
         self._notebook = notebook
         self._evidence_linker = evidence_linker
+        self._vote_stage_runtime = stage_runtime
         self._trace: TaskTrace | None = None
         self._audit_events: list[AuditEvent] = []
         self.correction_count = 0
@@ -426,6 +543,9 @@ class Orchestrator:
     def set_invocation_deadline(self, deadline: InvocationDeadline) -> None:
         self._invocation_deadline = deadline
 
+    def set_stage_runtime(self, runtime: VoteStageRuntime) -> None:
+        self._vote_stage_runtime = runtime
+
     def authenticated_checkpoint_usage(self) -> Usage | None:
         if self._notebook is None:
             return None
@@ -438,8 +558,25 @@ class Orchestrator:
 
     async def _run(self, task: GaiaTask) -> TaskPrediction:
         loop = asyncio.get_running_loop()
-        started = loop.time()
-        global_deadline = started + self._config.timeout_seconds
+        started = (
+            self._vote_stage_runtime.now()
+            if self._vote_stage_runtime is not None
+            else loop.time()
+        )
+        if self._vote_stage_runtime is None:
+            self._vote_stage_runtime = VoteStageRuntime.for_config(
+                self._config,
+                started_at=started,
+                clock=loop.time,
+            )
+        else:
+            self._vote_stage_runtime.bind_defaults(
+                self._config,
+                started_at=started,
+                clock=loop.time,
+            )
+        assert self._vote_stage_runtime.envelope is not None
+        global_deadline = self._vote_stage_runtime.envelope.vote_deadline
         self._audit_events = []
         self.correction_count = 0
         self.step_count = 0
@@ -459,7 +596,10 @@ class Orchestrator:
         stage_runtime = _StageRuntime()
         try:
             try:
-                async with asyncio.timeout_at(global_deadline):
+                global_remaining = global_deadline - self._now()
+                if global_remaining <= 0:
+                    raise TimeoutError
+                async with asyncio.timeout(global_remaining):
                     ensure_current_invocation_allowed()
                     async with self._tool_client_factory(execution_task) as active_tools:
                         raw_tools = active_tools
@@ -468,6 +608,7 @@ class Orchestrator:
                             max_calls=self._config.max_tool_calls,
                             audit=self._audit,
                             notebook=self._notebook,
+                            clock=self._now,
                         )
                         try:
                             prediction = await self._execute(
@@ -491,11 +632,13 @@ class Orchestrator:
                             )
                             cancellation_checkpoint_refreshed = True
                             raise
+                    if self._now() >= global_deadline:
+                        raise TimeoutError
             except TimeoutError as error:
                 active_stage = stage_runtime.active
                 if active_stage is not None:
                     stage_deadline = budgets[active_stage].deadline
-                    if stage_deadline is not None and loop.time() >= stage_deadline:
+                    if stage_deadline is not None and self._now() >= stage_deadline:
                         raise StageBudgetExceeded(active_stage, "time") from error
                 raise
         except asyncio.CancelledError as error:
@@ -550,7 +693,7 @@ class Orchestrator:
         if prediction is not None:
             return prediction.model_copy(
                 update={
-                    "duration_seconds": loop.time() - started,
+                    "duration_seconds": self._now() - started,
                     "usage": state.usage,
                 }
             )
@@ -564,7 +707,7 @@ class Orchestrator:
             task_id=task.task_id,
             level=task.level,
             answer=None,
-            duration_seconds=loop.time() - started,
+            duration_seconds=self._now() - started,
             usage=state.usage,
             critic_verdict=state.critic_verdict,
             evidence_ids=tuple(item.evidence_id for item in state.evidence),
@@ -737,7 +880,7 @@ class Orchestrator:
         state = graph_state["runtime"]
         task = graph_state["task"]
         self._audit("plan_started", {"task_id": task.task_id})
-        stage_started = asyncio.get_running_loop().time()
+        stage_started = self._now()
         with self._stage_span("planner", {"stage": "planner"}) as planner_span:
             if planner_span is not None:
                 planner_span.set_summary(
@@ -928,7 +1071,10 @@ class Orchestrator:
             self._audit("evidence_repair_started", {"card_count": len(cards)})
             try:
                 selected_hashes = await self._run_in_stage(
-                    _evidence_repair_budget(graph_state["budgets"]["critic"]),
+                    _evidence_repair_budget(
+                        graph_state["budgets"]["critic"],
+                        now=self._now(),
+                    ),
                     lambda: self._evidence_linker.link(
                         task,
                         state.candidate or "",
@@ -1033,7 +1179,7 @@ class Orchestrator:
         if decision is None:
             raise ValueError("graph submit node requires a critic decision")
         budget = graph_state["budgets"]["critic"]
-        now = asyncio.get_running_loop().time()
+        now = self._now()
         submit_budget = StageBudget(
             name="submit",
             deadline=budget.deadline,
@@ -1052,6 +1198,7 @@ class Orchestrator:
                 summary_budget=submit_budget,
             ),
             graph_state["stage_runtime"],
+            telemetry_stage="submit",
         )
         return {"prediction": prediction}
 
@@ -1147,7 +1294,7 @@ class Orchestrator:
                 "step_number": state.step_count,
             },
         )
-        stage_started = asyncio.get_running_loop().time()
+        stage_started = self._now()
         with self._stage_span(
             "specialist",
             {
@@ -1256,7 +1403,7 @@ class Orchestrator:
                 "has_candidate": state.candidate is not None,
             },
         )
-        stage_started = asyncio.get_running_loop().time()
+        stage_started = self._now()
         with self._stage_span(
             "critic",
             {
@@ -1512,7 +1659,7 @@ class Orchestrator:
             "submit_started",
             {"evidence_ids": list(evidence_ids)},
         )
-        stage_started = asyncio.get_running_loop().time()
+        stage_started = self._now()
         with self._stage_span(
             "submit",
             {"stage": "submit", "evidence_count": len(evidence_ids)},
@@ -1556,30 +1703,37 @@ class Orchestrator:
             evidence_ids=evidence_ids,
         )
 
+    def _now(self) -> float:
+        if self._vote_stage_runtime is not None:
+            return self._vote_stage_runtime.now()
+        return asyncio.get_running_loop().time()
+
     def _stage_budgets(self, started: float) -> dict[str, StageBudget]:
-        planner_deadline = started + self._config.planner_timeout_seconds
-        specialist_deadline = planner_deadline + self._config.specialist_timeout_seconds
-        critic_deadline = specialist_deadline + self._config.critic_timeout_seconds
+        envelope = (
+            self._vote_stage_runtime.envelope
+            if self._vote_stage_runtime is not None
+            else None
+        ) or StageDeadlineEnvelope.for_config(self._config, started_at=started)
         return {
             "planner": StageBudget(
                 "planner",
-                planner_deadline,
+                envelope.planner_deadline,
                 0,
-                started_at=started,
+                started_at=envelope.vote_started_at,
                 budget_seconds=self._config.planner_timeout_seconds,
             ),
             "specialist": StageBudget(
                 "specialist",
-                specialist_deadline,
+                envelope.specialist_deadline,
                 self._config.specialist_max_tool_calls,
-                started_at=planner_deadline,
+                started_at=envelope.planner_deadline,
                 budget_seconds=self._config.specialist_timeout_seconds,
             ),
             "critic": StageBudget(
                 "critic",
-                critic_deadline,
+                envelope.critic_deadline,
                 self._config.critic_max_tool_calls,
-                started_at=specialist_deadline,
+                started_at=envelope.specialist_deadline,
                 budget_seconds=self._config.critic_timeout_seconds,
             ),
         }
@@ -1597,22 +1751,43 @@ class Orchestrator:
         budget: StageBudget,
         operation: Callable[[], Awaitable[Any]],
         stage_runtime: _StageRuntime | None = None,
+        *,
+        telemetry_stage: Literal["planner", "specialist", "critic", "submit"]
+        | None = None,
     ) -> Any:
+        remaining = None
+        if budget.deadline is not None:
+            remaining = budget.deadline - self._now()
+            if remaining <= 0:
+                raise StageBudgetExceeded(budget.name, "time")
         previous_stage = stage_runtime.active if stage_runtime is not None else None
         if stage_runtime is not None:
             stage_runtime.active = budget.name
+        activity = (
+            self._vote_stage_runtime.begin(telemetry_stage or budget.name)
+            if self._vote_stage_runtime is not None
+            else None
+        )
         interrupted = False
         try:
-            if budget.deadline is None:
-                return await operation()
-            async with asyncio.timeout_at(budget.deadline):
-                return await operation()
+            if remaining is None:
+                result = await operation()
+            else:
+                async with asyncio.timeout(remaining):
+                    result = await operation()
+                if self._now() >= budget.deadline:
+                    raise StageBudgetExceeded(budget.name, "time")
+            return result
         except asyncio.CancelledError:
             interrupted = True
+            raise
+        except StageBudgetExceeded:
             raise
         except TimeoutError as error:
             raise StageBudgetExceeded(budget.name, "time") from error
         finally:
+            if activity is not None:
+                self._vote_stage_runtime.finish(activity)
             if stage_runtime is not None and not interrupted:
                 stage_runtime.active = previous_stage
 
@@ -1653,24 +1828,25 @@ class Orchestrator:
     ) -> dict[str, object]:
         """Return bounded operational state without graph inputs or checkpoint data."""
 
-        del started
         budget_seconds = (
             budget.budget_seconds
             if budget.budget_seconds is not None
             else self._stage_timeout_seconds(budget.name)
         )
-        stage_started = budget.started_at
-        if stage_started is None:
-            stage_started = (
-                budget.deadline - budget_seconds
-                if budget.deadline is not None
-                else asyncio.get_running_loop().time()
-            )
-        elapsed = max(0.0, asyncio.get_running_loop().time() - stage_started)
-        remaining = max(0.0, budget_seconds - elapsed)
+        now = self._now()
+        elapsed = (
+            self._vote_stage_runtime.elapsed_seconds(budget.name)
+            if self._vote_stage_runtime is not None
+            else _finite_nonnegative(now - started)
+        )
+        remaining = (
+            max(0.0, budget.deadline - now)
+            if budget.deadline is not None
+            else max(0.0, budget_seconds - elapsed)
+        )
         remaining_bucket = (
             "exhausted"
-            if remaining == 0.0
+            if budget_seconds <= 0.0 or remaining == 0.0
             else "low"
             if remaining <= budget_seconds * 0.25
             else "ample"
@@ -1698,14 +1874,18 @@ class Orchestrator:
         return self._trace.span(name, metadata)
 
 
-def _evidence_repair_budget(critic_budget: StageBudget) -> StageBudget:
+def _evidence_repair_budget(
+    critic_budget: StageBudget,
+    *,
+    now: float | None = None,
+) -> StageBudget:
     if critic_budget.deadline is None:
         return critic_budget
-    now = asyncio.get_running_loop().time()
-    remaining = max(0.0, critic_budget.deadline - now)
+    active_now = asyncio.get_running_loop().time() if now is None else now
+    remaining = max(0.0, critic_budget.deadline - active_now)
     return StageBudget(
         name="critic",
-        deadline=now + remaining / 2,
+        deadline=active_now + remaining / 2,
         max_calls=critic_budget.max_calls,
         started_at=critic_budget.started_at,
         budget_seconds=critic_budget.budget_seconds,
@@ -1729,6 +1909,12 @@ def _add_usage(first: Usage, second: Usage) -> Usage:
         reasoning_tokens=first.reasoning_tokens + second.reasoning_tokens,
         total_tokens=first.total_tokens + second.total_tokens,
     )
+
+
+def _finite_nonnegative(value: float) -> float:
+    if not math.isfinite(value):
+        return 0.0
+    return min(_MAX_OPERATIONAL_SECONDS, max(0.0, value))
 
 
 def _numeric_value(answer: str | None) -> float | None:

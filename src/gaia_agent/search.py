@@ -55,7 +55,34 @@ class SearchUnavailableError(ToolCallError):
         self.fallback_attempted = fallback_attempted
 
 
-class SearchDeadlineExceeded(RuntimeError):
+class SearchDeadlineExceeded(ToolCallError):
+    """Safe typed operation expiry, including bounded routing metadata."""
+
+    def __init__(
+        self,
+        *,
+        provider: str | None = None,
+        attempt_count: int = 1,
+        circuit_open_count: int = 0,
+        fallback_attempted: bool = False,
+        fallback_used: bool = False,
+    ) -> None:
+        super().__init__("search_timeout")
+        self.provider = provider
+        self.category = "timeout"
+        self.retryable = True
+        self.http_status = None
+        self.attempt_count = max(1, attempt_count)
+        self.circuit_open_count = max(0, circuit_open_count)
+        self.fallback_attempted = fallback_attempted
+        self.fallback_used = fallback_used
+
+
+class _AttemptDeadlineExceeded(RuntimeError):
+    pass
+
+
+class _OperationDeadlineExceeded(RuntimeError):
     pass
 
 
@@ -259,7 +286,13 @@ class _Circuit:
 
 
 class SearchProviderChain:
-    """Retries each configured provider before falling through to the next one."""
+    """Retry providers while reserving one equal time slice per later fallback.
+
+    Each current-provider retry and each remaining fallback provider owns one
+    dynamic share of the operation time left at attempt entry. A retry can use
+    only its share; downstream providers retain theirs regardless of provider
+    count, while every call and backoff remains under the one operation cutoff.
+    """
 
     def __init__(
         self,
@@ -288,24 +321,122 @@ class SearchProviderChain:
         self,
         provider: SearchProvider,
         query: str,
-        deadline: float | None,
+        attempt_deadline: float | None,
+        operation_deadline: float | None,
     ) -> dict[str, Any]:
-        if deadline is None:
+        if attempt_deadline is None:
             return await provider.search(query)
-        remaining_seconds = deadline - self._clock()
+        remaining_seconds = attempt_deadline - self._clock()
         if remaining_seconds <= 0:
-            raise SearchDeadlineExceeded
+            if operation_deadline is not None and attempt_deadline >= operation_deadline:
+                raise _OperationDeadlineExceeded
+            raise _AttemptDeadlineExceeded
         timeout = asyncio.timeout(remaining_seconds)
         try:
             async with timeout:
                 result = await provider.search(query)
         except TimeoutError:
             if timeout.expired():
-                raise SearchDeadlineExceeded from None
+                if operation_deadline is not None and attempt_deadline >= operation_deadline:
+                    raise _OperationDeadlineExceeded from None
+                raise _AttemptDeadlineExceeded from None
             raise
-        if timeout.expired():
-            raise SearchDeadlineExceeded
+        except Exception:
+            if timeout.expired() or self._clock() >= attempt_deadline:
+                if (
+                    operation_deadline is not None
+                    and self._clock() >= operation_deadline
+                ):
+                    raise _OperationDeadlineExceeded from None
+                raise _AttemptDeadlineExceeded from None
+            raise
+        if operation_deadline is not None and self._clock() >= operation_deadline:
+            raise _OperationDeadlineExceeded
+        if timeout.expired() or self._clock() >= attempt_deadline:
+            raise _AttemptDeadlineExceeded
         return result
+
+    def _attempt_deadline(
+        self,
+        operation_deadline: float | None,
+        *,
+        provider_index: int,
+        attempt: int,
+    ) -> float | None:
+        if operation_deadline is None:
+            return None
+        remaining = operation_deadline - self._clock()
+        if remaining <= 0:
+            raise _OperationDeadlineExceeded
+        current_attempt_slots = self._retry_policy.max_attempts - attempt + 1
+        fallback_slots = len(self._providers) - provider_index - 1
+        slot_count = max(1, current_attempt_slots + fallback_slots)
+        return self._clock() + remaining / slot_count
+
+    def _retry_preserves_fallback(
+        self,
+        operation_deadline: float | None,
+        *,
+        provider_index: int,
+        attempt: int,
+        delay: float,
+    ) -> bool:
+        if operation_deadline is None:
+            return True
+        remaining = operation_deadline - self._clock()
+        if remaining <= delay:
+            return False
+        fallback_slots = len(self._providers) - provider_index - 1
+        current_retry_slots = self._retry_policy.max_attempts - attempt
+        slot_count = current_retry_slots + fallback_slots
+        if fallback_slots <= 0 or slot_count <= 0:
+            return True
+        fallback_reserve = remaining * fallback_slots / slot_count
+        return remaining - delay > fallback_reserve
+
+    async def _sleep_with_deadline(
+        self,
+        delay: float,
+        operation_deadline: float | None,
+    ) -> None:
+        if operation_deadline is None:
+            await self._sleep(delay)
+            return
+        remaining = operation_deadline - self._clock()
+        if remaining <= delay:
+            raise _OperationDeadlineExceeded
+        timeout = asyncio.timeout(remaining)
+        try:
+            async with timeout:
+                await self._sleep(delay)
+        except TimeoutError:
+            if timeout.expired():
+                raise _OperationDeadlineExceeded from None
+            raise
+        if timeout.expired() or self._clock() >= operation_deadline:
+            raise _OperationDeadlineExceeded
+
+    def _deadline_error(
+        self,
+        *,
+        provider: str | None,
+        total_attempts: int,
+        circuit_open_count: int,
+        fallback_attempted: bool,
+        fallback_used: bool,
+    ) -> SearchDeadlineExceeded:
+        return SearchDeadlineExceeded(
+            provider=provider,
+            attempt_count=total_attempts,
+            circuit_open_count=circuit_open_count,
+            fallback_attempted=fallback_attempted,
+            fallback_used=fallback_used,
+        )
+
+    def _record_transient_failure(self, circuit: _Circuit) -> None:
+        circuit.failures += 1
+        if circuit.failures >= self._threshold:
+            circuit.open_until = self._clock() + self._cooldown
 
     async def search(self, query: str) -> dict[str, Any]:
         deadline = (
@@ -317,37 +448,64 @@ class SearchProviderChain:
         circuit_open_count = 0
         fallback_attempted = False
         fallback_category: str | None = None
+        active_provider: str | None = None
+        fallback_used = False
         for provider_index, provider in enumerate(self._providers):
             if not self._can_wait(deadline, 0.0):
-                raise SearchDeadlineExceeded
+                raise self._deadline_error(
+                    provider=active_provider,
+                    total_attempts=total_attempts,
+                    circuit_open_count=circuit_open_count,
+                    fallback_attempted=fallback_attempted,
+                    fallback_used=fallback_used,
+                )
             circuit = self._circuits[provider.provider]
             if circuit.open_until > self._clock():
                 circuit_open_count += 1
                 continue
             if provider_index > 0:
                 fallback_attempted = True
+                fallback_used = True
+            active_provider = provider.provider
             for attempt in range(1, self._retry_policy.max_attempts + 1):
                 if not self._can_wait(deadline, 0.0):
-                    raise SearchDeadlineExceeded
+                    raise self._deadline_error(
+                        provider=active_provider,
+                        total_attempts=total_attempts,
+                        circuit_open_count=circuit_open_count,
+                        fallback_attempted=fallback_attempted,
+                        fallback_used=fallback_used,
+                    )
                 total_attempts += 1
                 try:
-                    result = await self._search_with_deadline(provider, query, deadline)
-                except SearchProviderError as error:
-                    fallback_category = error.category
-                    if not error.retryable:
-                        circuit.failures = 0
-                        circuit.open_until = 0.0
-                        break
-                    if attempt < self._retry_policy.max_attempts:
-                        delay = retry_delay(self._retry_policy, attempt, lambda: 0.0)
-                        if not self._can_wait(deadline, delay):
-                            raise SearchDeadlineExceeded
-                        await self._sleep(delay)
-                        continue
-                    circuit.failures += 1
-                    if circuit.failures >= self._threshold:
-                        circuit.open_until = self._clock() + self._cooldown
-                    break
+                    attempt_deadline = self._attempt_deadline(
+                        deadline,
+                        provider_index=provider_index,
+                        attempt=attempt,
+                    )
+                    result = await self._search_with_deadline(
+                        provider,
+                        query,
+                        attempt_deadline,
+                        deadline,
+                    )
+                except _AttemptDeadlineExceeded:
+                    error = SearchProviderError(
+                        provider=provider.provider,
+                        category="timeout",
+                        retryable=True,
+                    )
+                except _OperationDeadlineExceeded:
+                    self._record_transient_failure(circuit)
+                    raise self._deadline_error(
+                        provider=provider.provider,
+                        total_attempts=total_attempts,
+                        circuit_open_count=circuit_open_count,
+                        fallback_attempted=fallback_attempted,
+                        fallback_used=fallback_used,
+                    ) from None
+                except SearchProviderError as caught:
+                    error = caught
                 else:
                     circuit.failures = 0
                     circuit.open_until = 0.0
@@ -359,6 +517,60 @@ class SearchProviderChain:
                         fallback_used=provider_index > 0,
                         category=fallback_category if provider_index > 0 else None,
                     )
+                fallback_category = error.category
+                if not error.retryable:
+                    circuit.failures = 0
+                    circuit.open_until = 0.0
+                    break
+                if deadline is not None and self._clock() >= deadline:
+                    self._record_transient_failure(circuit)
+                    raise self._deadline_error(
+                        provider=provider.provider,
+                        total_attempts=total_attempts,
+                        circuit_open_count=circuit_open_count,
+                        fallback_attempted=fallback_attempted,
+                        fallback_used=fallback_used,
+                    )
+                if attempt < self._retry_policy.max_attempts:
+                    delay = retry_delay(self._retry_policy, attempt, lambda: 0.0)
+                    if not self._retry_preserves_fallback(
+                        deadline,
+                        provider_index=provider_index,
+                        attempt=attempt,
+                        delay=delay,
+                    ):
+                        if provider_index < len(self._providers) - 1:
+                            self._record_transient_failure(circuit)
+                            break
+                        raise self._deadline_error(
+                            provider=provider.provider,
+                            total_attempts=total_attempts,
+                            circuit_open_count=circuit_open_count,
+                            fallback_attempted=fallback_attempted,
+                            fallback_used=fallback_used,
+                        )
+                    try:
+                        await self._sleep_with_deadline(delay, deadline)
+                    except _OperationDeadlineExceeded:
+                        self._record_transient_failure(circuit)
+                        raise self._deadline_error(
+                            provider=provider.provider,
+                            total_attempts=total_attempts,
+                            circuit_open_count=circuit_open_count,
+                            fallback_attempted=fallback_attempted,
+                            fallback_used=fallback_used,
+                        ) from None
+                    continue
+                self._record_transient_failure(circuit)
+                break
+        if deadline is not None and self._clock() >= deadline:
+            raise self._deadline_error(
+                provider=active_provider,
+                total_attempts=total_attempts,
+                circuit_open_count=circuit_open_count,
+                fallback_attempted=fallback_attempted,
+                fallback_used=fallback_used,
+            )
         raise SearchUnavailableError(
             total_attempts,
             circuit_open_count=circuit_open_count,

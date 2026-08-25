@@ -55,11 +55,11 @@ async def test_evidence_linker_selects_only_known_hashes_without_tools(
 
 
 @pytest.mark.asyncio
-async def test_evidence_linker_rejects_the_whole_selection_for_unknown_or_duplicate_hashes(
+async def test_evidence_linker_rejects_the_whole_selection_for_an_unknown_hash(
     fake_provider, task
 ) -> None:
     fake_provider.return_parsed(
-        {"evidence_entry_hashes": ["known", "invented", "known"]}
+        {"evidence_entry_hashes": ["known", "invented"]}
     )
 
     selected = await EvidenceLinkerAgent(fake_provider).link(
@@ -70,6 +70,36 @@ async def test_evidence_linker_rejects_the_whole_selection_for_unknown_or_duplic
 
     assert selected == ()
     assert len(fake_provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_rejects_the_whole_selection_for_a_duplicate_hash(
+    fake_provider, task
+) -> None:
+    fake_provider.return_parsed(
+        {"evidence_entry_hashes": ["known", "known"]}
+    )
+
+    selected = await EvidenceLinkerAgent(fake_provider).link(
+        task,
+        "answer",
+        ({"entry_hash": "known", "excerpt": "authenticated excerpt"},),
+    )
+
+    assert selected == ()
+    assert len(fake_provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_empty_cards_short_circuit_before_tiny_context_build(
+    fake_provider, task
+) -> None:
+    linker = EvidenceLinkerAgent(fake_provider, max_context_bytes=1)
+
+    selected = await linker.link(task, "answer", ())
+
+    assert selected == ()
+    assert fake_provider.requests == []
 
 
 @pytest.mark.asyncio

@@ -918,6 +918,64 @@ async def test_mcp_success_span_records_private_search_routing_metadata(
 
 
 @pytest.mark.asyncio
+async def test_all_search_provider_expiry_is_typed_across_real_mcp_client_boundary(
+    tmp_path: Path, run_config: RunConfig
+) -> None:
+    class BlockingProvider:
+        def __init__(self, provider: str) -> None:
+            self.provider = provider
+            self.calls = 0
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    providers = [
+        BlockingProvider("openai"),
+        BlockingProvider("serper"),
+        BlockingProvider("serpapi"),
+    ]
+    chain = SearchProviderChain(
+        providers,
+        RetryPolicy(base_delay_seconds=0.0, max_delay_seconds=0.0),
+        clock=time.monotonic,
+        operation_timeout_seconds=0.3,
+    )
+    settings = MCPServerSettings(
+        task_root=tmp_path,
+        attachment_reader=AttachmentReader(tmp_path, set()),
+        web_reader=SimpleNamespace(),
+        backend=SimpleNamespace(),
+        api_key="private-openai-key",
+        hf_token="private-hf-token",
+        search_provider=chain,
+    )
+
+    started = time.monotonic()
+    async with Client(build_server(settings)) as protocol_client:
+        client = MCPToolClient(
+            task_root=tmp_path,
+            config=run_config.model_copy(update={"timeout_seconds": 1.0}),
+            allowed={"web_search"},
+        )
+        client._client = protocol_client
+        with pytest.raises(ToolExecutionError) as caught:
+            await client.call("web_search", {"query": "private question"})
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert [provider.calls for provider in providers] == [4, 4, 4]
+    assert str(caught.value) == "tool failed: web_search"
+    assert caught.value.category == "timeout"
+    assert caught.value.retryable is True
+    assert caught.value.provider == "serpapi"
+    assert caught.value.attempt_count == 12
+    assert caught.value.fallback_attempted is True
+    assert caught.value.fallback_used is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid_provider", ["https://private.test/provider", ["serper"]]
 )

@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import os
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from datetime import datetime
@@ -1031,6 +1031,192 @@ async def test_checkpoint_restore_act_resumes_at_next_specialist(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_recovered_act_after_absolute_specialist_cutoff_skips_specialist_but_keeps_critic(
+    tmp_path: Path,
+) -> None:
+    class FakeClock:
+        def __init__(self, now: float) -> None:
+            self.now = now
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    class ForbiddenSpecialist:
+        last_usage = Usage()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self, *_args: Any) -> AgentResult:
+            self.calls += 1
+            raise AssertionError("specialist must not start after its absolute cutoff")
+
+    class ReserveCritic:
+        last_usage = Usage()
+
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+            self.calls = 0
+
+        async def verify(self, *_args: Any) -> CriticDecision:
+            self.calls += 1
+            self.clock.advance(10.0)
+            return _decision("approve", ("evidence-0001",))
+
+    task = _task()
+    config = _config(
+        timeout_seconds=300.0,
+        planner_timeout_seconds=30.0,
+        specialist_timeout_seconds=210.0,
+        critic_timeout_seconds=60.0,
+        quality_policy="benchmark",
+    )
+    clock = FakeClock(245.0)
+    runtime_type = orchestrator_module.VoteStageRuntime
+    stage_runtime = runtime_type.for_config(config, started_at=0.0, clock=clock)
+    plan = _plan(SpecialistName.COMPUTATION, SpecialistName.COMPUTATION)
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(
+        _checkpoint(
+            cursor="act",
+            plan=plan,
+            next_step_index=1,
+            logical_tool_calls=0,
+            stage_logical_tool_calls=StageToolCallCounts(),
+        )
+    )
+    specialist = ForbiddenSpecialist()
+    critic = ReserveCritic(clock)
+    orchestrator = Orchestrator(
+        planner=FakePlanner([], plan),
+        specialists={SpecialistName.COMPUTATION: specialist},
+        critic=critic,
+        tool_client_factory=FakeToolFactory(FakeTools([])),
+        config=config,
+        notebook=notebook,
+    )
+    orchestrator.set_stage_runtime(stage_runtime)
+
+    prediction = await orchestrator.run(task)
+
+    assert specialist.calls == 0
+    assert critic.calls == 1
+    assert clock.now == 255.0
+    assert prediction.answer == "restored answer"
+    assert prediction.error_category is None
+    assert stage_runtime.envelope.specialist_deadline == 240.0
+    assert stage_runtime.envelope.critic_deadline == 300.0
+
+
+@pytest.mark.asyncio
+async def test_recovered_act_inside_cutoff_gets_only_remaining_specialist_time(
+    tmp_path: Path,
+) -> None:
+    class FakeClock:
+        def __init__(self, now: float) -> None:
+            self.now = now
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    class RemainingSpecialist:
+        last_usage = Usage()
+
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+            self.calls = 0
+
+        async def run(
+            self,
+            task: GaiaTask,
+            step: PlanStep,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> AgentResult:
+            self.calls += 1
+            self.clock.advance(39.0)
+            await tools.call("web_search", {"query": "remaining specialist slice"})
+            return _result(
+                SpecialistName.COMPUTATION,
+                (_evidence("second-computation", "computation"),),
+                "restored answer",
+            )
+
+    class ReserveCritic:
+        last_usage = Usage()
+
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+            self.calls = 0
+
+        async def verify(self, *_args: Any) -> CriticDecision:
+            self.calls += 1
+            self.clock.advance(1.0)
+            return _decision("approve", ("evidence-0001", "evidence-0002"))
+
+    task = _task()
+    config = _config(
+        timeout_seconds=300.0,
+        planner_timeout_seconds=30.0,
+        specialist_timeout_seconds=210.0,
+        critic_timeout_seconds=60.0,
+        quality_policy="benchmark",
+    )
+    clock = FakeClock(200.0)
+    runtime_type = orchestrator_module.VoteStageRuntime
+    stage_runtime = runtime_type.for_config(config, started_at=0.0, clock=clock)
+    plan = _plan(SpecialistName.COMPUTATION, SpecialistName.COMPUTATION)
+    notebook = ResearchNotebook(
+        tmp_path / "private",
+        task.task_id,
+        run_generation="run-1",
+    )
+    notebook.save_stage_checkpoint(
+        _checkpoint(
+            cursor="act",
+            plan=plan,
+            next_step_index=1,
+            logical_tool_calls=0,
+            stage_logical_tool_calls=StageToolCallCounts(),
+        )
+    )
+    specialist = RemainingSpecialist(clock)
+    critic = ReserveCritic(clock)
+    tools = FakeTools([])
+    orchestrator = Orchestrator(
+        planner=FakePlanner([], plan),
+        specialists={SpecialistName.COMPUTATION: specialist},
+        critic=critic,
+        tool_client_factory=FakeToolFactory(tools),
+        config=config,
+        notebook=notebook,
+    )
+    orchestrator.set_stage_runtime(stage_runtime)
+
+    prediction = await orchestrator.run(task)
+
+    assert specialist.calls == 1
+    assert critic.calls == 1
+    assert clock.now == 240.0
+    assert tools.call_arguments[0] == (
+        "web_search",
+        {"query": "remaining specialist slice"},
+    )
+    assert prediction.answer == "restored answer"
+    assert prediction.error_category is None
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_restore_submit_skips_completed_critic(tmp_path: Path) -> None:
     task = _task()
     notebook = ResearchNotebook(
@@ -1727,6 +1913,205 @@ async def test_orchestrator_publishes_safe_reasoning_summaries() -> None:
         "global_call_count",
     }.issubset(submit_summary)
     assert all("Marie Curie" not in repr(summary) for summary in summaries)
+
+
+@pytest.mark.asyncio
+async def test_stage_summaries_use_actual_cumulative_execution_elapsed() -> None:
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    class AdvancingPlanner:
+        last_usage = Usage()
+
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+
+        async def plan(self, task: GaiaTask) -> AgentPlan:
+            self.clock.advance(1.0)
+            return _plan(SpecialistName.COMPUTATION, SpecialistName.COMPUTATION)
+
+    class AdvancingSpecialist:
+        last_usage = Usage()
+
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+            self.calls = 0
+
+        async def run(
+            self,
+            task: GaiaTask,
+            step: PlanStep,
+            evidence: tuple[Evidence, ...],
+            tools: Any,
+        ) -> AgentResult:
+            self.calls += 1
+            await tools.call("web_search", {"query": f"lookup-{self.calls}"})
+            self.clock.advance(1.0)
+            return _result(
+                SpecialistName.COMPUTATION,
+                (_evidence(f"calculation-{self.calls}", "computation"),),
+                "42",
+            )
+
+    class AdvancingCritic:
+        last_usage = Usage()
+
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+
+        async def verify(self, *_args: Any) -> CriticDecision:
+            self.clock.advance(1.0)
+            return _decision("approve", ("evidence-0001", "evidence-0002"))
+
+    class AdvancingTools(FakeTools):
+        def __init__(self, clock: FakeClock) -> None:
+            super().__init__([])
+            self.clock = clock
+
+        async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            if name == "submit_answer":
+                self.clock.advance(1.0)
+            return await super().call(name, arguments)
+
+    class Observation:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.updates: list[dict[str, Any]] = []
+
+        def update(self, **kwargs: Any) -> None:
+            self.updates.append(kwargs)
+
+    class Context(AbstractContextManager[Observation]):
+        def __init__(self, observation: Observation) -> None:
+            self.observation = observation
+
+        def __enter__(self) -> Observation:
+            return self.observation
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class Client:
+        def __init__(self) -> None:
+            self.observations: list[Observation] = []
+
+        def start_as_current_observation(
+            self, *, name: str, **_kwargs: Any
+        ) -> Context:
+            observation = Observation(name)
+            self.observations.append(observation)
+            return Context(observation)
+
+    config = _config(
+        timeout_seconds=100.0,
+        planner_timeout_seconds=10.0,
+        specialist_timeout_seconds=70.0,
+        critic_timeout_seconds=20.0,
+    )
+    clock = FakeClock()
+    runtime_type = orchestrator_module.VoteStageRuntime
+    stage_runtime = runtime_type.for_config(config, started_at=0.0, clock=clock)
+    trace_client = Client()
+    observability = Observability(
+        ObservabilityConfig(enabled=True, public_key="pk", secret_key="sk"),
+        client=trace_client,
+    )
+    trace = observability.start_task(
+        "actual-stage-elapsed",
+        level=1,
+        model="test-model",
+        reasoning_effort="low",
+        evaluation_mode="test",
+    )
+    specialist = AdvancingSpecialist(clock)
+    orchestrator = Orchestrator(
+        planner=AdvancingPlanner(clock),
+        specialists={SpecialistName.COMPUTATION: specialist},
+        critic=AdvancingCritic(clock),
+        tool_client_factory=FakeToolFactory(AdvancingTools(clock)),
+        config=config,
+        observability=observability,
+    )
+    orchestrator.set_stage_runtime(stage_runtime)
+
+    prediction = await orchestrator.run(_task(question="Compute 42"))
+    trace.close()
+
+    assert prediction.answer == "42"
+    summaries_by_stage: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for observation in trace_client.observations:
+        if observation.name not in {"planner", "specialist", "critic", "submit"}:
+            continue
+        summary = observation.updates[-1]["output"]["reasoning_summary"]
+        summaries_by_stage[observation.name].append(summary)
+    assert summaries_by_stage["planner"][-1]["elapsed_seconds"] == 1.0
+    assert [
+        summary["elapsed_seconds"]
+        for summary in summaries_by_stage["specialist"]
+    ] == [1.0, 2.0]
+    assert summaries_by_stage["specialist"][-1]["logical_call_count"] == 2
+    assert summaries_by_stage["specialist"][-1]["remaining_bucket"] == "ample"
+    assert summaries_by_stage["critic"][-1]["elapsed_seconds"] == 1.0
+    assert summaries_by_stage["submit"][-1]["elapsed_seconds"] == 1.0
+    assert summaries_by_stage["submit"][-1]["logical_call_count"] == 1
+    assert all(
+        math.isfinite(summary["elapsed_seconds"])
+        and summary["elapsed_seconds"] >= 0.0
+        for summaries in summaries_by_stage.values()
+        for summary in summaries
+    )
+
+
+@pytest.mark.asyncio
+async def test_stage_remaining_bucket_uses_absolute_cutoff_not_active_elapsed() -> None:
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    config = _config(
+        timeout_seconds=300.0,
+        planner_timeout_seconds=30.0,
+        specialist_timeout_seconds=210.0,
+        critic_timeout_seconds=60.0,
+    )
+    clock = FakeClock()
+    runtime_type = orchestrator_module.VoteStageRuntime
+    stage_runtime = runtime_type.for_config(config, started_at=0.0, clock=clock)
+    activity = stage_runtime.begin("specialist")
+    clock.advance(239.0)
+    stage_runtime.finish(activity)
+    orchestrator = _orchestrator(
+        planner=FakePlanner([], _plan(SpecialistName.LOOKUP)),
+        specialists={},
+        critic=FakeCritic([], []),
+        tools=FakeTools([]),
+        config=config,
+    )
+    orchestrator.set_stage_runtime(stage_runtime)
+    budget = orchestrator._stage_budgets(clock())["specialist"]
+
+    summary = orchestrator._stage_operational_summary(
+        budget,
+        None,
+        clock(),
+    )
+
+    assert budget.deadline == 240.0
+    assert summary["elapsed_seconds"] == 239.0
+    assert summary["remaining_bucket"] == "low"
 
 
 @pytest.mark.asyncio

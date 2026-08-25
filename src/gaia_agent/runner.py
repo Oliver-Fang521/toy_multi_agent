@@ -43,7 +43,7 @@ from gaia_agent.models import (
     Usage,
 )
 from gaia_agent.observability import Observability, ObservabilityConfig, TaskTraceOutcome
-from gaia_agent.orchestrator import Orchestrator, choose_majority
+from gaia_agent.orchestrator import Orchestrator, VoteStageRuntime, choose_majority
 from gaia_agent.persistence import RunManifest, RunStore
 from gaia_agent.providers import (
     DeepSeekProvider,
@@ -406,6 +406,11 @@ class EvaluationRunner:
         vote_started = self._clock()
         vote_deadline = vote_started + self._config.timeout_seconds
         invocation_deadline = InvocationDeadline(vote_deadline, self._clock)
+        stage_runtime = VoteStageRuntime.for_config(
+            self._config,
+            started_at=vote_started,
+            clock=self._clock,
+        )
         try:
             return await self._run_vote_with_invocation_deadline(
                 task,
@@ -413,6 +418,7 @@ class EvaluationRunner:
                 vote_started=vote_started,
                 vote_deadline=vote_deadline,
                 invocation_deadline=invocation_deadline,
+                stage_runtime=stage_runtime,
             )
         finally:
             invocation_deadline.close()
@@ -425,6 +431,7 @@ class EvaluationRunner:
         vote_started: float,
         vote_deadline: float,
         invocation_deadline: InvocationDeadline,
+        stage_runtime: VoteStageRuntime,
     ) -> _TaskRun:
         audit_events: list[AuditEvent] = []
         first_plan: AgentPlan | None = None
@@ -453,6 +460,7 @@ class EvaluationRunner:
                     orchestrator,
                     invocation_deadline,
                 )
+                _set_orchestrator_stage_runtime(orchestrator, stage_runtime)
                 remaining_seconds = vote_deadline - self._clock()
                 if remaining_seconds <= 0:
                     raise TimeoutError
@@ -673,6 +681,15 @@ def _set_orchestrator_invocation_deadline(
     setter = getattr(orchestrator, "set_invocation_deadline", None)
     if callable(setter):
         setter(deadline)
+
+
+def _set_orchestrator_stage_runtime(
+    orchestrator: TaskOrchestrator,
+    runtime: VoteStageRuntime,
+) -> None:
+    setter = getattr(orchestrator, "set_stage_runtime", None)
+    if callable(setter):
+        setter(runtime)
 
 
 def _authenticated_checkpoint_usage(

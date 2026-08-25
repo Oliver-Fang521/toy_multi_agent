@@ -280,7 +280,12 @@ class MCPToolClient:
                     {
                         key: value
                         for key, value in trace_metadata.items()
-                        if key in {"circuit_open_count", "fallback_attempted"}
+                        if key
+                        in {
+                            "circuit_open_count",
+                            "fallback_attempted",
+                            "fallback_used",
+                        }
                     }
                 )
                 raise _tool_execution_error(name, **safe)
@@ -499,6 +504,9 @@ def _safe_failure_payload(message: str) -> dict[str, Any] | None:
     fallback_attempted = value.get("fallback_attempted")
     if isinstance(fallback_attempted, bool):
         safe["fallback_attempted"] = fallback_attempted
+    fallback_used = value.get("fallback_used")
+    if isinstance(fallback_used, bool):
+        safe["fallback_used"] = fallback_used
     return safe
 
 
@@ -520,6 +528,7 @@ def _tool_execution_error(
     http_status: int | None = None,
     circuit_open_count: int | None = None,
     fallback_attempted: bool | None = None,
+    fallback_used: bool | None = None,
 ) -> ToolExecutionError:
     error = ToolExecutionError(f"tool failed: {name}")
     error.category = category
@@ -531,6 +540,8 @@ def _tool_execution_error(
         error.circuit_open_count = circuit_open_count
     if fallback_attempted is not None:
         error.fallback_attempted = fallback_attempted
+    if fallback_used is not None:
+        error.fallback_used = fallback_used
     return error
 
 
@@ -571,6 +582,9 @@ def _safe_tool_failure_trace(error: Exception) -> dict[str, Any]:
     fallback_attempted = getattr(error, "fallback_attempted", None)
     if isinstance(fallback_attempted, bool):
         safe["fallback_attempted"] = fallback_attempted
+    fallback_used = getattr(error, "fallback_used", None)
+    if isinstance(fallback_used, bool):
+        safe["fallback_used"] = fallback_used
     return safe
 
 

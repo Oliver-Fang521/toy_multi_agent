@@ -1711,6 +1711,100 @@ async def test_runner_checkpoint_transient_resumes_once_with_remaining_vote_budg
 
 
 @pytest.mark.asyncio
+async def test_runner_injects_one_absolute_stage_runtime_into_recovery_attempts(
+    tmp_path: Path,
+) -> None:
+    task = _fixture_tasks()[0][0]
+    clock = _FakeClock()
+    stage_runtimes: list[Any] = []
+    attempts = 0
+
+    def factory(active_task: GaiaTask, vote_namespace: str) -> Any:
+        nonlocal attempts
+        assert active_task.task_id == task.task_id
+        assert vote_namespace == "vote-0001"
+        attempts += 1
+        attempt = attempts
+
+        class RecordingOrchestrator:
+            audit_events: tuple[AuditEvent, ...] = ()
+
+            def __init__(self) -> None:
+                self.stage_runtime: Any | None = None
+
+            def set_stage_runtime(self, runtime: Any) -> None:
+                self.stage_runtime = runtime
+                stage_runtimes.append(runtime)
+
+            async def run(self, run_task: GaiaTask) -> TaskPrediction:
+                assert run_task.task_id == task.task_id
+                assert self.stage_runtime is not None
+                activity = self.stage_runtime.begin("specialist")
+                clock.advance(1.0)
+                self.stage_runtime.finish(activity)
+                if attempt == 1:
+                    clock.advance(199.0)
+                    self.audit_events = (
+                        _checkpoint_audit_event("act", candidate_present=True),
+                    )
+                    return TaskPrediction(
+                        task_id=task.task_id,
+                        level=task.level,
+                        answer=None,
+                        critic_verdict="not_run",
+                        error_category=TerminalErrorCategory.TIMEOUT,
+                    )
+                self.audit_events = (
+                    AuditEvent(
+                        sequence=1,
+                        event_type="checkpoint_restored",
+                        timestamp=datetime.now(UTC),
+                        payload={
+                            "cursor": "act",
+                            "logical_tool_calls": 0,
+                            "step_count": 1,
+                            "candidate_present": True,
+                        },
+                    ),
+                )
+                return TaskPrediction(
+                    task_id=task.task_id,
+                    level=task.level,
+                    answer="42",
+                    critic_verdict="approve",
+                )
+
+        return RecordingOrchestrator()
+
+    runner = EvaluationRunner(
+        config=_config(
+            tmp_path,
+            timeout_seconds=300.0,
+            planner_timeout_seconds=30.0,
+            specialist_timeout_seconds=210.0,
+            critic_timeout_seconds=60.0,
+        ),
+        dataset_loader=lambda _config: ([task], "unused"),
+        orchestrator_factory=factory,
+        sleep=lambda _delay: asyncio.sleep(0),
+        clock=clock,
+    )
+
+    result = await runner._run_vote(task, vote_namespace="vote-0001")
+
+    assert result.prediction.answer == "42"
+    assert attempts == 2
+    assert len(stage_runtimes) == 2
+    assert stage_runtimes[0] is stage_runtimes[1]
+    envelope = stage_runtimes[0].envelope
+    assert envelope.vote_deadline == 300.0
+    assert envelope.planner_deadline == 30.0
+    assert envelope.specialist_deadline == 240.0
+    assert envelope.critic_deadline == 300.0
+    assert stage_runtimes[0].elapsed_seconds("specialist") == 2.0
+
+
+@pytest.mark.asyncio
 async def test_runner_scopes_checkpoints_per_vote_but_reuses_scope_for_recovery(
     tmp_path: Path,
 ) -> None:

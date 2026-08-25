@@ -954,6 +954,7 @@ def _failure_trace_metadata(error: ToolCallError, failure: SafeToolFailure) -> d
             **failure.model_dump(exclude={"tool"}),
             "circuit_open_count": getattr(error, "circuit_open_count", None),
             "fallback_attempted": getattr(error, "fallback_attempted", None),
+            "fallback_used": getattr(error, "fallback_used", None),
         }
     )
 
@@ -1015,11 +1016,25 @@ async def _safe_tool_call(
         details = failure.model_dump(exclude={"tool", "http_status"})
         if failure.http_status is not None:
             details["http_status"] = failure.http_status
+        trace_metadata = _failure_trace_metadata(error, failure)
+        if mcp_result:
+            details.update(
+                {
+                    key: value
+                    for key, value in trace_metadata.items()
+                    if key
+                    in {
+                        "circuit_open_count",
+                        "fallback_attempted",
+                        "fallback_used",
+                    }
+                }
+            )
         message = serialize_tool_output({"error": "tool_failed", **details})
         if mcp_result:
             return _call_tool_result(
                 None,
-                trace_metadata=_failure_trace_metadata(error, failure),
+                trace_metadata=trace_metadata,
                 error_message=message,
             )
         raise RuntimeError(message) from None

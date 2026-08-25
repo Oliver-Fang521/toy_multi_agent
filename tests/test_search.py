@@ -288,6 +288,102 @@ async def test_search_chain_cancels_fallback_within_remaining_operation_time() -
 
 
 @pytest.mark.asyncio
+async def test_default_retries_reserve_time_for_a_successful_serper_fallback() -> None:
+    class SlowOpenAI:
+        provider = "openai"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            await asyncio.sleep(0.14)
+            raise SearchProviderError(
+                provider=self.provider,
+                category="timeout",
+                retryable=True,
+            )
+
+    class HealthySerper:
+        provider = "serper"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started_at: float | None = None
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            self.started_at = time.monotonic()
+            return {"answer": "fallback", "sources": []}
+
+    openai = SlowOpenAI()
+    serper = HealthySerper()
+    started = time.monotonic()
+    chain = SearchProviderChain(
+        [openai, serper],
+        RetryPolicy(base_delay_seconds=0.001, max_delay_seconds=0.004),
+        clock=time.monotonic,
+        operation_timeout_seconds=0.5,
+    )
+
+    result = await asyncio.wait_for(chain.search("question"), timeout=0.75)
+
+    assert openai.calls == 4
+    assert serper.calls == 1
+    assert serper.started_at is not None
+    assert serper.started_at - started < 0.5
+    assert result.provider == "serper"
+    assert result.category == "timeout"
+    assert result.attempt_count == 5
+    assert result.fallback_used is True
+
+
+@pytest.mark.asyncio
+async def test_retry_reservations_support_three_ordered_search_providers() -> None:
+    class SlowProvider:
+        def __init__(self, provider: str) -> None:
+            self.provider = provider
+            self.calls = 0
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            await asyncio.sleep(0.12)
+            raise SearchProviderError(
+                provider=self.provider,
+                category="timeout",
+                retryable=True,
+            )
+
+    class HealthySerpAPI:
+        provider = "serpapi"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def search(self, query: str) -> dict[str, Any]:
+            self.calls += 1
+            return {"answer": "last fallback", "sources": []}
+
+    openai = SlowProvider("openai")
+    serper = SlowProvider("serper")
+    serpapi = HealthySerpAPI()
+    chain = SearchProviderChain(
+        [openai, serper, serpapi],
+        RetryPolicy(base_delay_seconds=0.001, max_delay_seconds=0.004),
+        clock=time.monotonic,
+        operation_timeout_seconds=0.6,
+    )
+
+    result = await asyncio.wait_for(chain.search("question"), timeout=0.85)
+
+    assert [openai.calls, serper.calls, serpapi.calls] == [4, 4, 1]
+    assert result.provider == "serpapi"
+    assert result.category == "timeout"
+    assert result.attempt_count == 9
+    assert result.fallback_used is True
+
+
+@pytest.mark.asyncio
 async def test_search_chain_falls_back_in_order_after_bounded_transient_retries() -> None:
     openai = _ScriptedProvider("openai", [_transient("openai"), _transient("openai")])
     serper = _ScriptedProvider("serper", [{"answer": "fallback", "sources": []}])
