@@ -257,6 +257,7 @@ class RunManifest(FrozenModel):
             "private_notebook_max_bytes",
             "stage_context_max_bytes",
             "search_circuit_cooldown",
+            "search_timeout_seconds",
             "langfuse_input_cost_per_million",
             "langfuse_output_cost_per_million",
         }:

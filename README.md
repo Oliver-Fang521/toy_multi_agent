@@ -77,11 +77,12 @@ are omitted), so `--resume` rejects a run whose behavior-defining configuration 
 
 | Environment variable | Default | Bound and purpose |
 | --- | --- | --- |
-| `GAIA_PROVIDER_MAX_ATTEMPTS` | `4` | 1–10 attempts for recoverable provider and search-provider calls |
+| `GAIA_PROVIDER_MAX_ATTEMPTS` | `4` | 1–10 attempts for recoverable provider and search-provider calls; `.env.example` uses `3` |
 | `GAIA_PROVIDER_BACKOFF_BASE` | `0.5` | Positive finite base delay, at most 30 seconds |
 | `GAIA_PRIVATE_NOTEBOOK_MAX_BYTES` | `65536` | Per-entry private checkpoint cap, at most 1 MiB |
 | `GAIA_STAGE_CONTEXT_MAX_BYTES` | `24576` | Per-specialist and Critic context cap, at most 1 MiB |
 | `GAIA_SEARCH_CIRCUIT_COOLDOWN` | `30` | Finite search-provider circuit-open cooldown, 0–3600 seconds |
+| `GAIA_SEARCH_TIMEOUT_SECONDS` | `120` | Positive finite absolute deadline for the complete hosted-search/fallback chain, capped at 3600 seconds |
 | `LANGFUSE_INPUT_COST_PER_MILLION` | unset | Optional non-negative finite input-token rate, capped at 1,000,000 |
 | `LANGFUSE_OUTPUT_COST_PER_MILLION` | unset | Optional non-negative finite output-token rate, capped at 1,000,000 |
 
@@ -95,8 +96,8 @@ schema/semantic repair; attachment-ineligible visual routes normalize before dis
 Critic receives the surviving normalized route. These recovery steps are bounded and never expose
 tool content or credentials in public artifacts.
 
-The checked-in `.env.example` opts into a 600-second run budget split as 30 seconds for Planner,
-510 seconds for Specialist, and 60 seconds for Critic. These are environment overrides, not changes
+The checked-in `.env.example` opts into a 500-second run budget split as 30 seconds for Planner,
+410 seconds for Specialist, and 60 seconds for Critic. These are environment overrides, not changes
 to the built-in defaults above.
 
 The sample size must be at least three and divisible by three so the run contains equal counts from

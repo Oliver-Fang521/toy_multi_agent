@@ -483,6 +483,33 @@ async def test_search_chain_falls_back_in_order_after_bounded_transient_retries(
 
 
 @pytest.mark.asyncio
+async def test_three_primary_attempts_then_fallback_within_search_deadline() -> None:
+    openai = _ScriptedProvider(
+        "openai",
+        [_transient("openai"), _transient("openai"), _transient("openai")],
+    )
+    serper = _ScriptedProvider(
+        "serper",
+        [{"answer": "fallback", "sources": []}],
+    )
+    chain = SearchProviderChain(
+        [openai, serper],
+        RetryPolicy(max_attempts=3, base_delay_seconds=0.5),
+        clock=lambda: 0.0,
+        operation_timeout_seconds=120.0,
+        sleep=lambda _: asyncio.sleep(0),
+    )
+
+    result = await chain.search("question")
+
+    assert result.provider == "serper"
+    assert result.attempt_count == 4
+    assert result.fallback_used is True
+    assert openai.queries == ["question", "question", "question"]
+    assert serper.queries == ["question"]
+
+
+@pytest.mark.asyncio
 async def test_search_chain_opens_circuit_skips_provider_then_closes_after_probe() -> None:
     now = [0.0]
     openai = _ScriptedProvider(

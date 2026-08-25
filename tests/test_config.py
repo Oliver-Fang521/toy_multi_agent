@@ -60,19 +60,19 @@ def test_extended_specialist_budget_loads_from_environment(
 ) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-environment")
     monkeypatch.setenv("HF_TOKEN", "hf-environment")
-    monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", "600")
+    monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", "500")
     monkeypatch.setenv("GAIA_PLANNER_TIMEOUT_SECONDS", "30")
-    monkeypatch.setenv("GAIA_SPECIALIST_TIMEOUT_SECONDS", "510")
+    monkeypatch.setenv("GAIA_SPECIALIST_TIMEOUT_SECONDS", "410")
     monkeypatch.setenv("GAIA_CRITIC_TIMEOUT_SECONDS", "60")
 
     config = RunConfig.from_env()
 
-    assert config.timeout_seconds == 600.0
+    assert config.timeout_seconds == 500.0
     assert (
         config.planner_timeout_seconds,
         config.specialist_timeout_seconds,
         config.critic_timeout_seconds,
-    ) == (30.0, 510.0, 60.0)
+    ) == (30.0, 410.0, 60.0)
 
 
 @pytest.mark.parametrize(
@@ -137,6 +137,7 @@ def test_run_config_accepts_bounded_reliability_settings_from_environment(
     monkeypatch.setenv("GAIA_PRIVATE_NOTEBOOK_MAX_BYTES", "80000")
     monkeypatch.setenv("GAIA_STAGE_CONTEXT_MAX_BYTES", "32768")
     monkeypatch.setenv("GAIA_SEARCH_CIRCUIT_COOLDOWN", "90")
+    monkeypatch.setenv("GAIA_SEARCH_TIMEOUT_SECONDS", "120")
     monkeypatch.setenv("LANGFUSE_INPUT_COST_PER_MILLION", "0.25")
     monkeypatch.setenv("LANGFUSE_OUTPUT_COST_PER_MILLION", "1.50")
 
@@ -149,6 +150,7 @@ def test_run_config_accepts_bounded_reliability_settings_from_environment(
     assert config.private_notebook_max_bytes == 80_000
     assert config.stage_context_max_bytes == 32_768
     assert config.search_circuit_cooldown == 90
+    assert config.search_timeout_seconds == 120
     assert str(config.langfuse_input_cost_per_million) == "0.25"
     assert str(config.langfuse_output_cost_per_million) == "1.50"
 
@@ -169,6 +171,9 @@ def test_run_config_accepts_bounded_reliability_settings_from_environment(
         ("search_circuit_cooldown", -1.0),
         ("search_circuit_cooldown", float("nan")),
         ("search_circuit_cooldown", 3_601.0),
+        ("search_timeout_seconds", 0.0),
+        ("search_timeout_seconds", float("nan")),
+        ("search_timeout_seconds", 3_601.0),
         ("langfuse_input_cost_per_million", "-0.01"),
         ("langfuse_output_cost_per_million", "NaN"),
         ("langfuse_output_cost_per_million", "1000000.01"),

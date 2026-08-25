@@ -63,14 +63,16 @@ def test_mcp_server_env_propagates_specialist_search_budget(tmp_path: Path) -> N
         openai_api_key="openai-test-secret",
         hf_token="hf-test-secret",
         sample_size=3,
-        timeout_seconds=100,
-        specialist_timeout_seconds=70,
+        timeout_seconds=300,
+        specialist_timeout_seconds=210,
+        search_timeout_seconds=120,
         output_dir=tmp_path / "results",
     )
 
     env = MCPToolClient(task_root=tmp_path, config=config)._minimal_server_env()
 
-    assert env["GAIA_SPECIALIST_TIMEOUT_SECONDS"] == "70.0"
+    assert env["GAIA_SPECIALIST_TIMEOUT_SECONDS"] == "210.0"
+    assert env["GAIA_SEARCH_TIMEOUT_SECONDS"] == "120.0"
 
 
 @pytest.mark.asyncio
@@ -2769,6 +2771,7 @@ def test_settings_caps_direct_webpage_timeout_without_shortening_hosted_tools(
     monkeypatch.setenv("GAIA_ATTACHMENTS", "[]")
     monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", str(global_timeout))
     monkeypatch.setenv("GAIA_SPECIALIST_TIMEOUT_SECONDS", str(specialist_timeout))
+    monkeypatch.setenv("GAIA_SEARCH_TIMEOUT_SECONDS", "120")
     monkeypatch.delenv("GAIA_MCP_FAKE_BACKEND", raising=False)
     monkeypatch.setattr(mcp_server, "HTTPWebReader", CapturingWebReader)
     monkeypatch.setattr(
@@ -2784,7 +2787,10 @@ def test_settings_caps_direct_webpage_timeout_without_shortening_hosted_tools(
     assert settings.backend._timeout_seconds == global_timeout
     assert settings.backend._web_search_timeout_seconds == expected_hosted_web_timeout
     assert isinstance(settings.search_provider, SearchProviderChain)
-    assert settings.search_provider._operation_timeout_seconds == specialist_timeout
+    assert settings.search_provider._operation_timeout_seconds == min(
+        specialist_timeout,
+        120.0,
+    )
 
 
 def test_fake_settings_caps_direct_webpage_timeout(

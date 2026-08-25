@@ -414,6 +414,7 @@ class MCPToolClient:
             "GAIA_PROVIDER_MAX_ATTEMPTS": str(self._config.provider_max_attempts),
             "GAIA_PROVIDER_BACKOFF_BASE": str(self._config.provider_backoff_base),
             "GAIA_SEARCH_CIRCUIT_COOLDOWN": str(self._config.search_circuit_cooldown),
+            "GAIA_SEARCH_TIMEOUT_SECONDS": str(self._config.search_timeout_seconds),
             "OPENAI_API_KEY": self._config.openai_api_key.get_secret_value(),
             "HF_TOKEN": self._config.hf_token.get_secret_value(),
         }

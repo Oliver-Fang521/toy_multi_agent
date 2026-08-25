@@ -1179,6 +1179,10 @@ def _settings_from_env() -> MCPServerSettings:
         base_delay_seconds=float(os.environ.get("GAIA_PROVIDER_BACKOFF_BASE", "0.5")),
     )
     search_circuit_cooldown = float(os.environ.get("GAIA_SEARCH_CIRCUIT_COOLDOWN", "30"))
+    search_timeout_seconds = min(
+        specialist_timeout_seconds,
+        float(os.environ.get("GAIA_SEARCH_TIMEOUT_SECONDS", "120")),
+    )
     fake_backend = os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1"
     fallback_provider_count = int(bool(serper_api_key)) + int(bool(serpapi_api_key))
     hosted_web_search_timeout_seconds = min(
@@ -1223,7 +1227,7 @@ def _settings_from_env() -> MCPServerSettings:
             provider_retry_policy,
             time.monotonic,
             circuit_cooldown_seconds=search_circuit_cooldown,
-            operation_timeout_seconds=specialist_timeout_seconds,
+            operation_timeout_seconds=search_timeout_seconds,
         )
     return MCPServerSettings(
         task_root=task_root,

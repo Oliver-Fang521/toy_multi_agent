@@ -1122,6 +1122,7 @@ def _manifest_for(
             "private_notebook_max_bytes": config.private_notebook_max_bytes,
             "stage_context_max_bytes": config.stage_context_max_bytes,
             "search_circuit_cooldown": config.search_circuit_cooldown,
+            "search_timeout_seconds": config.search_timeout_seconds,
             **(
                 {"langfuse_input_cost_per_million": config.langfuse_input_cost_per_million}
                 if config.langfuse_input_cost_per_million is not None

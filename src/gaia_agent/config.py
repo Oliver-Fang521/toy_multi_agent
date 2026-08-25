@@ -34,6 +34,7 @@ class RunConfig(BaseModel):
     private_notebook_max_bytes: int = Field(default=65_536, ge=1, le=1_048_576)
     stage_context_max_bytes: int = Field(default=24_576, ge=1, le=MAX_STAGE_CONTEXT_BYTES)
     search_circuit_cooldown: float = Field(default=30.0, ge=0, le=3_600, allow_inf_nan=False)
+    search_timeout_seconds: float = Field(default=120.0, gt=0, le=3_600, allow_inf_nan=False)
     langfuse_input_cost_per_million: Decimal | None = Field(
         default=None, ge=0, le=Decimal(1_000_000), allow_inf_nan=False
     )
@@ -107,6 +108,7 @@ class RunConfig(BaseModel):
             ),
             "stage_context_max_bytes": os.environ.get("GAIA_STAGE_CONTEXT_MAX_BYTES", "24576"),
             "search_circuit_cooldown": os.environ.get("GAIA_SEARCH_CIRCUIT_COOLDOWN", "30"),
+            "search_timeout_seconds": os.environ.get("GAIA_SEARCH_TIMEOUT_SECONDS", "120"),
             "langfuse_input_cost_per_million": os.environ.get(
                 "LANGFUSE_INPUT_COST_PER_MILLION"
             ),

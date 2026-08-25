@@ -101,11 +101,13 @@ def test_manifest_allows_stage_budget_limits() -> None:
                 "critic_timeout_seconds": 18.0,
                 "specialist_max_tool_calls": 7,
                 "critic_max_tool_calls": 2,
+                "search_timeout_seconds": 55.0,
             },
         }
     )
 
     assert manifest.limits["specialist_max_tool_calls"] == 7
+    assert manifest.limits["search_timeout_seconds"] == 55.0
 
 
 def test_duplicate_prediction_is_rejected(tmp_path, prediction) -> None:
