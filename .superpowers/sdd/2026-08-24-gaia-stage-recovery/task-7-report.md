@@ -67,3 +67,23 @@ OpenAI, and DeepSeek span closure, submit-stage labeling, and checkpoint route o
   exception, checkpoint/notebook, HMAC/path, filename, and configured credential sentinels plus
   forbidden raw structural fields. This covers those explicit deterministic test paths; it does
   not claim live services or controller-owned scans.
+
+## Fix round 3
+
+- Strengthened the same no-network runner/orchestrator privacy harness without changing production
+  behavior. After creating the authenticated test checkpoint, the harness reads its private test
+  checkpoint file, obtains the actual derived `integrity_hmac_sha256`, adds it (and its normalized
+  case variant) to the forbidden values, and scans every recorded trace/span payload. Raw
+  checkpoint schema and private-lineage keys (`schema_version`, `contract`, `notebook_scope`,
+  `signature`, `evidence_origins`, `raw_evidence_id_digests`, and `candidate_origins`) are now
+  rejected structurally, including normalized HMAC key spelling, while safe root
+  `checkpoint_restored` remains permitted.
+- The test mutation proof deep-copies a real recorded payload, injects that derived HMAC into a
+  nested value, and requires the recursive checker to fail. It also mutation-checks every new
+  forbidden structural key.
+- Planner, Specialist, Critic, and Submit now each have mandatory nonempty successful operational
+  summaries in the success run. The harness checks bounded stage/status/counter fields and
+  sentinel absence for each, then proves omission coverage by removing each summary in turn and
+  requiring the expectation helper to fail.
+- These were test-only proof gaps: the strengthened production-path test passed against the
+  existing bounded observability implementation; no production change was indicated.

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -1891,6 +1892,14 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
         "hmac",
         "content",
         "filename",
+        "integrity_hmac_sha256",
+        "schema_version",
+        "contract",
+        "notebook_scope",
+        "signature",
+        "evidence_origins",
+        "raw_evidence_id_digests",
+        "candidate_origins",
     }
 
     class RecordingObservation:
@@ -1937,7 +1946,12 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
     def assert_private_values_absent(value: object) -> None:
         if isinstance(value, dict):
             for key, item in value.items():
-                assert key not in forbidden_keys
+                normalized_key = (
+                    key.strip().lower().replace("-", "_")
+                    if isinstance(key, str)
+                    else key
+                )
+                assert normalized_key not in forbidden_keys
                 assert_private_values_absent(key)
                 assert_private_values_absent(item)
         elif isinstance(value, (tuple, list)):
@@ -1972,6 +1986,7 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
         quality_policy="benchmark",
     )
     saved_checkpoints: set[str] = set()
+    checkpoint_paths: list[Path] = []
 
     class PrivacyTools(FakeTools):
         async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2030,6 +2045,7 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
                     }
                 )
                 notebook.save_stage_checkpoint(checkpoint)
+                checkpoint_paths.append(notebook.root / task.task_id / ".stage-checkpoint.json")
                 saved_checkpoints.add(task.task_id)
         planner = FakePlanner(
             calls,
@@ -2073,6 +2089,12 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
         observability=observability,
     )
     await runner.run()
+
+    assert len(checkpoint_paths) == 1
+    checkpoint_payload = json.loads(checkpoint_paths[0].read_text(encoding="utf-8"))
+    actual_checkpoint_hmac = checkpoint_payload["integrity_hmac_sha256"]
+    assert isinstance(actual_checkpoint_hmac, str) and actual_checkpoint_hmac
+    sentinels.update({actual_checkpoint_hmac, actual_checkpoint_hmac.upper()})
 
     # Exercise the real MCP client span as a no-network search fallback boundary.
     class TimedOutSearch:
@@ -2155,11 +2177,66 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
     ]
     assert any(output.get("checkpoint_restored") is True for output in root_outputs)
     assert any(output.get("terminal_route") == "terminal_failure" for output in root_outputs)
-    assert any(
-        update.get("output", {}).get("reasoning_summary", {}).get("stage") == "submit"
-        for observation in recorder.observations
-        for update in observation.updates
-    )
+    required_stages = ("planner", "specialist", "critic", "submit")
+    required_summary_fields = {
+        "stage",
+        "budget_seconds",
+        "elapsed_seconds",
+        "remaining_bucket",
+        "logical_call_count",
+        "global_call_count",
+        "executed_call_count",
+        "restored_call_count",
+    }
+
+    def stage_summary_records() -> dict[str, list[tuple[dict[str, Any], str]]]:
+        records = {stage: [] for stage in required_stages}
+        for observation in recorder.observations:
+            if observation.name not in records:
+                continue
+            for update in observation.updates:
+                summary = update.get("output", {}).get("reasoning_summary")
+                status = update.get("metadata", {}).get("status")
+                if isinstance(summary, dict) and isinstance(status, str):
+                    records[observation.name].append((summary, status))
+        return records
+
+    def assert_required_stage_summaries(
+        records: dict[str, list[tuple[dict[str, Any], str]]],
+    ) -> None:
+        for stage in required_stages:
+            matching = [
+                (summary, status)
+                for summary, status in records[stage]
+                if summary.get("stage") == stage and status == "ok"
+            ]
+            assert matching, f"missing safe {stage} operational summary"
+            summary, status = matching[-1]
+            assert status == "ok"
+            assert required_summary_fields <= set(summary)
+            assert summary["remaining_bucket"] in {"ample", "low", "exhausted"}
+            assert all(
+                isinstance(summary[field], (int, float)) and summary[field] >= 0
+                for field in ("budget_seconds", "elapsed_seconds")
+            )
+            assert all(
+                isinstance(summary[field], int) and summary[field] >= 0
+                for field in (
+                    "logical_call_count",
+                    "global_call_count",
+                    "executed_call_count",
+                    "restored_call_count",
+                )
+            )
+            assert_private_values_absent(summary)
+
+    summaries_by_stage = stage_summary_records()
+    assert_required_stage_summaries(summaries_by_stage)
+    for stage in required_stages:
+        removed_summary = copy.deepcopy(summaries_by_stage)
+        removed_summary[stage] = []
+        with pytest.raises(AssertionError, match=f"missing safe {stage}"):
+            assert_required_stage_summaries(removed_summary)
     assert any(
         update.get("output", {}).get("reasoning_summary", {}).get("provider") == "serper"
         and update["output"]["reasoning_summary"].get("category") == "timeout"
@@ -2168,6 +2245,24 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
     )
     for observation in recorder.observations:
         assert_private_values_absent((observation.kwargs, observation.updates))
+    leaked_recording = copy.deepcopy(
+        [(observation.kwargs, observation.updates) for observation in recorder.observations]
+    )
+    leaked_recording[0][0]["metadata"]["model"] = actual_checkpoint_hmac
+    with pytest.raises(AssertionError):
+        assert_private_values_absent(leaked_recording)
+    for forbidden_key in (
+        "Integrity-HMAC-SHA256",
+        "schema_version",
+        "contract",
+        "notebook_scope",
+        "signature",
+        "evidence_origins",
+        "raw_evidence_id_digests",
+        "candidate_origins",
+    ):
+        with pytest.raises(AssertionError):
+            assert_private_values_absent({forbidden_key: "safe-test-value"})
 
     # Cancellation crosses the actual runner -> orchestrator stage span path as
     # well; it must close and flush without retaining the blocked planner input.
