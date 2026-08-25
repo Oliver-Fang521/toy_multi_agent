@@ -95,6 +95,10 @@ schema/semantic repair; attachment-ineligible visual routes normalize before dis
 Critic receives the surviving normalized route. These recovery steps are bounded and never expose
 tool content or credentials in public artifacts.
 
+The checked-in `.env.example` opts into a 600-second run budget split as 30 seconds for Planner,
+510 seconds for Specialist, and 60 seconds for Critic. These are environment overrides, not changes
+to the built-in defaults above.
+
 The sample size must be at least three and divisible by three so the run contains equal counts from
 GAIA levels 1, 2, and 3. Votes must be a positive odd number. Run `uv run gaia-agent evaluate
 --help` for the current CLI surface.

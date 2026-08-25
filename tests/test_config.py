@@ -55,6 +55,26 @@ def test_stage_budgets_must_fit_global_limits() -> None:
         )
 
 
+def test_extended_specialist_budget_loads_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-environment")
+    monkeypatch.setenv("HF_TOKEN", "hf-environment")
+    monkeypatch.setenv("GAIA_TIMEOUT_SECONDS", "600")
+    monkeypatch.setenv("GAIA_PLANNER_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("GAIA_SPECIALIST_TIMEOUT_SECONDS", "510")
+    monkeypatch.setenv("GAIA_CRITIC_TIMEOUT_SECONDS", "60")
+
+    config = RunConfig.from_env()
+
+    assert config.timeout_seconds == 600.0
+    assert (
+        config.planner_timeout_seconds,
+        config.specialist_timeout_seconds,
+        config.critic_timeout_seconds,
+    ) == (30.0, 510.0, 60.0)
+
+
 @pytest.mark.parametrize(
     "values",
     [
