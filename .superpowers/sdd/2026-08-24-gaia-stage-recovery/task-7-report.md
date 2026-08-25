@@ -87,3 +87,25 @@ OpenAI, and DeepSeek span closure, submit-stage labeling, and checkpoint route o
   requiring the expectation helper to fail.
 - These were test-only proof gaps: the strengthened production-path test passed against the
   existing bounded observability implementation; no production change was indicated.
+
+## Fix round 4
+
+- Corrected the stage-summary attribution proof without changing production code. The recorder now
+  groups child observations by the active `gaia-task` root observation, and the normal
+  sentinel-bearing success root is validated independently from checkpoint restoration, failure,
+  cancellation, and MCP fallback roots. No task ID or task content is added to trace payloads.
+- RED: after removing the normal-success Submit summary from the prior aggregated raw recording,
+  `UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_orchestrator.py::test_runner_orchestrator_telemetry_never_records_production_path_content -q`
+  failed with `Failed: DID NOT RAISE AssertionError`; the checkpoint-restoration Submit had masked
+  the omission.
+- GREEN: Planner, Specialist, Critic, and Submit are each required to have a nonempty successful
+  summary within that exact success root. For every stage, the mutation proof deep-copies those raw
+  observations, removes the targeted raw `reasoning_summary`, and reruns the same extraction and
+  validation helper, which rejects the omission.
+- Stage summaries are also checked against the production sanitizer's stage and remaining-bucket
+  enums, one-million call-count cap, and finite, nonnegative one-billion-second cap. Boolean numeric
+  impostors are rejected. The actual derived checkpoint HMAC/private structural scan and the
+  checkpoint, terminal-failure, cancellation, and MCP fallback paths remain covered with dummy
+  sentinels only.
+- Verification: the focused harness, the 203-test observability/reliability/orchestrator/MCP matrix,
+  the full test suite, `uv run ruff check src tests`, and `git diff --check` all pass.

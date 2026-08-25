@@ -2,8 +2,10 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import os
 from collections import deque
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +14,7 @@ from typing import Any, Self
 
 import pytest
 
+import gaia_agent.observability as observability_module
 import gaia_agent.orchestrator as orchestrator_module
 from gaia_agent import runner as runner_module
 from gaia_agent.agents import StageProtocolError, StageValidationCode
@@ -1919,18 +1922,27 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
                 self.updates.append(kwargs)
 
     class RecordingContext(AbstractContextManager[RecordingObservation]):
-        def __init__(self, observation: RecordingObservation) -> None:
+        def __init__(
+            self,
+            observation: RecordingObservation,
+            on_exit: Callable[[], None] | None = None,
+        ) -> None:
             self.observation = observation
+            self.on_exit = on_exit
 
         def __enter__(self) -> RecordingObservation:
             return self.observation
 
         def __exit__(self, *_args: object) -> None:
             self.observation.ended = True
+            if self.on_exit is not None:
+                self.on_exit()
 
     class RecordingClient:
         def __init__(self) -> None:
             self.observations: list[RecordingObservation] = []
+            self.root_groups: list[list[RecordingObservation]] = []
+            self._active_root_group: list[RecordingObservation] | None = None
             self.flush_count = 0
 
         def start_as_current_observation(
@@ -1938,7 +1950,15 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
         ) -> RecordingContext:
             observation = RecordingObservation(name=name, as_type=as_type, kwargs=kwargs)
             self.observations.append(observation)
-            return RecordingContext(observation)
+            on_exit: Callable[[], None] | None = None
+            if name == "gaia-task":
+                root_group = [observation]
+                self.root_groups.append(root_group)
+                self._active_root_group = root_group
+                on_exit = lambda: setattr(self, "_active_root_group", None)
+            elif self._active_root_group is not None:
+                self._active_root_group.append(observation)
+            return RecordingContext(observation, on_exit)
 
         def flush(self) -> None:
             self.flush_count += 1
@@ -2089,6 +2109,10 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
         observability=observability,
     )
     await runner.run()
+    assert len(recorder.root_groups) == 3
+    success_observations = recorder.root_groups[0]
+    assert success_observations[0].name == "gaia-task"
+    assert success_observations[0].kwargs.get("metadata", {}).get("level") == 1
 
     assert len(checkpoint_paths) == 1
     checkpoint_payload = json.loads(checkpoint_paths[0].read_text(encoding="utf-8"))
@@ -2189,9 +2213,11 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
         "restored_call_count",
     }
 
-    def stage_summary_records() -> dict[str, list[tuple[dict[str, Any], str]]]:
+    def stage_summary_records(
+        observations: list[RecordingObservation],
+    ) -> dict[str, list[tuple[dict[str, Any], str]]]:
         records = {stage: [] for stage in required_stages}
-        for observation in recorder.observations:
+        for observation in observations:
             if observation.name not in records:
                 continue
             for update in observation.updates:
@@ -2202,8 +2228,9 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
         return records
 
     def assert_required_stage_summaries(
-        records: dict[str, list[tuple[dict[str, Any], str]]],
+        observations: list[RecordingObservation],
     ) -> None:
+        records = stage_summary_records(observations)
         for stage in required_stages:
             matching = [
                 (summary, status)
@@ -2214,13 +2241,24 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
             summary, status = matching[-1]
             assert status == "ok"
             assert required_summary_fields <= set(summary)
-            assert summary["remaining_bucket"] in {"ample", "low", "exhausted"}
+            assert summary["stage"] == stage
+            assert summary["stage"] in observability_module._SAFE_STAGE_NAMES
+            assert (
+                summary["remaining_bucket"]
+                in observability_module._SAFE_REMAINING_BUCKETS
+            )
             assert all(
-                isinstance(summary[field], (int, float)) and summary[field] >= 0
+                isinstance(summary[field], (int, float))
+                and not isinstance(summary[field], bool)
+                and math.isfinite(summary[field])
+                # This is the explicit, currently unnamed _sanitize_summary cap.
+                and 0 <= summary[field] <= 1_000_000_000.0
                 for field in ("budget_seconds", "elapsed_seconds")
             )
             assert all(
-                isinstance(summary[field], int) and summary[field] >= 0
+                isinstance(summary[field], int)
+                and not isinstance(summary[field], bool)
+                and 0 <= summary[field] <= observability_module._MAX_OUTCOME_COUNT
                 for field in (
                     "logical_call_count",
                     "global_call_count",
@@ -2230,13 +2268,26 @@ async def test_runner_orchestrator_telemetry_never_records_production_path_conte
             )
             assert_private_values_absent(summary)
 
-    summaries_by_stage = stage_summary_records()
-    assert_required_stage_summaries(summaries_by_stage)
+    assert_required_stage_summaries(success_observations)
     for stage in required_stages:
-        removed_summary = copy.deepcopy(summaries_by_stage)
-        removed_summary[stage] = []
+        missing_stage_summary = copy.deepcopy(success_observations)
+        removed_count = 0
+        for observation in missing_stage_summary:
+            if observation.name != stage:
+                continue
+            for update in observation.updates:
+                output = update.get("output")
+                summary = output.get("reasoning_summary") if isinstance(output, dict) else None
+                if (
+                    isinstance(summary, dict)
+                    and summary.get("stage") == stage
+                    and update.get("metadata", {}).get("status") == "ok"
+                ):
+                    output.pop("reasoning_summary")
+                    removed_count += 1
+        assert removed_count > 0
         with pytest.raises(AssertionError, match=f"missing safe {stage}"):
-            assert_required_stage_summaries(removed_summary)
+            assert_required_stage_summaries(missing_stage_summary)
     assert any(
         update.get("output", {}).get("reasoning_summary", {}).get("provider") == "serper"
         and update["output"]["reasoning_summary"].get("category") == "timeout"
