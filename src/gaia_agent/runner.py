@@ -53,6 +53,7 @@ from gaia_agent.providers import (
     OpenAIProvider,
     ToolExecutor,
     UsageObserver,
+    complete_with_usage_observer,
 )
 from gaia_agent.reliability import (
     InvocationDeadline,
@@ -181,7 +182,8 @@ class _DeadlineGuardedProvider:
         usage_observer: UsageObserver | None = None,
     ) -> ModelResponse:
         ensure_current_invocation_allowed()
-        return await self._provider.complete(
+        return await complete_with_usage_observer(
+            self._provider,
             request,
             executor,
             usage_observer=usage_observer,

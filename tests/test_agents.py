@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import json
+import weakref
 from typing import Any
 
 import pytest
@@ -23,7 +25,12 @@ from gaia_agent.agents import (
 )
 from gaia_agent.mcp_client import AttachmentPolicyError
 from gaia_agent.models import AgentPlan, Evidence, PlanStep, SpecialistName, Usage
-from gaia_agent.providers import ModelRequest, ModelResponse, ToolEvent
+from gaia_agent.providers import (
+    ModelRequest,
+    ModelResponse,
+    ToolEvent,
+    complete_with_usage_observer,
+)
 
 
 @pytest.mark.asyncio
@@ -571,6 +578,333 @@ async def test_specialist_repairs_a_parsed_result_with_the_wrong_role(
         "candidate_answer": "42",
     }
     assert "Repair code: role_mismatch" in fake_provider.requests[1].instructions
+
+
+@pytest.mark.asyncio
+async def test_specialist_accepts_legacy_provider_with_keyword_only_executor(
+    fake_tools, task
+) -> None:
+    class LegacyProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            request: ModelRequest,
+            *,
+            executor: object | None = None,
+        ) -> ModelResponse:
+            self.calls += 1
+            assert executor is fake_tools
+            return ModelResponse(
+                parsed={
+                    "specialist": "lookup",
+                    "evidence": [],
+                    "candidate_answer": "legacy answer",
+                },
+                usage=Usage(input_tokens=4, total_tokens=4),
+            )
+
+    provider = LegacyProvider()
+    agent = LookupAgent(provider)
+
+    result = await agent.run(
+        task,
+        PlanStep(specialist="lookup", instruction="Find a source"),
+        (),
+        fake_tools,
+    )
+
+    assert provider.calls == 1
+    assert result.candidate_answer == "legacy answer"
+    assert result.usage == Usage(input_tokens=4, total_tokens=4)
+    assert agent.last_usage == result.usage
+
+
+@pytest.mark.asyncio
+async def test_specialist_accepts_keyword_only_request_name_and_executor(
+    fake_tools, task
+) -> None:
+    class LegacyProvider:
+        async def complete(
+            self,
+            *,
+            payload: ModelRequest,
+            executor: object | None = None,
+        ) -> ModelResponse:
+            assert executor is fake_tools
+            return ModelResponse(
+                parsed={
+                    "specialist": "lookup",
+                    "evidence": [],
+                    "candidate_answer": "keyword named request",
+                },
+                usage=Usage(input_tokens=2, total_tokens=2),
+            )
+
+    result = await LookupAgent(LegacyProvider()).run(
+        task,
+        PlanStep(specialist="lookup", instruction="Named request"),
+        (),
+        fake_tools,
+    )
+
+    assert result.candidate_answer == "keyword named request"
+    assert result.usage == Usage(input_tokens=2, total_tokens=2)
+
+
+@pytest.mark.asyncio
+async def test_provider_positional_only_observer_keeps_keyword_only_executor(
+    fake_tools, task
+) -> None:
+    class PositionalObserverProvider:
+        async def complete(
+            self,
+            request: ModelRequest,
+            usage_observer: Any | None = None,
+            /,
+            *,
+            executor: object | None = None,
+        ) -> ModelResponse:
+            assert executor is fake_tools
+            response = ModelResponse(
+                parsed={
+                    "specialist": "lookup",
+                    "evidence": [],
+                    "candidate_answer": "positional observer",
+                },
+                usage=Usage(output_tokens=3, total_tokens=3),
+            )
+            assert callable(usage_observer)
+            usage_observer(response.usage)
+            return response
+
+    result = await LookupAgent(PositionalObserverProvider()).run(
+        task,
+        PlanStep(specialist="lookup", instruction="Find a source"),
+        (),
+        fake_tools,
+    )
+
+    assert result.usage == Usage(output_tokens=3, total_tokens=3)
+
+
+@pytest.mark.asyncio
+async def test_provider_varargs_keeps_declared_keyword_executor(
+    fake_tools, task
+) -> None:
+    class VarargsProvider:
+        async def complete(
+            self,
+            request: ModelRequest,
+            *extra_arguments: object,
+            executor: object | None = None,
+            **kwargs: Any,
+        ) -> ModelResponse:
+            assert extra_arguments == ()
+            assert executor is fake_tools
+            assert callable(kwargs["usage_observer"])
+            response = ModelResponse(
+                parsed={
+                    "specialist": "lookup",
+                    "evidence": [],
+                    "candidate_answer": "named executor",
+                },
+                usage=Usage(output_tokens=4, total_tokens=4),
+            )
+            kwargs["usage_observer"](response.usage)
+            return response
+
+    result = await LookupAgent(VarargsProvider()).run(
+        task,
+        PlanStep(specialist="lookup", instruction="Find a source"),
+        (),
+        fake_tools,
+    )
+
+    assert result.usage == Usage(output_tokens=4, total_tokens=4)
+
+
+@pytest.mark.asyncio
+async def test_uninspectable_provider_uses_historical_call_once_for_local_repair(
+    task,
+) -> None:
+    class UninspectableComplete:
+        __signature__ = "not a signature"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        async def __call__(self, *args: object) -> ModelResponse:
+            self.calls.append(args)
+            return ModelResponse(
+                parsed={
+                    "restatement": "Synthetic task",
+                    "steps": [
+                        {
+                            "specialist": "lookup",
+                            "instruction": "Find a source",
+                        }
+                    ]
+                },
+                usage=Usage(input_tokens=1, total_tokens=1),
+            )
+
+    complete = UninspectableComplete()
+
+    plan = await PlannerAgent(type("Provider", (), {"complete": complete})()).plan(task)
+
+    assert len(plan.steps) == 1
+    assert [len(args) for args in complete.calls] == [1]
+
+
+@pytest.mark.asyncio
+async def test_provider_compatibility_dispatch_does_not_retain_provider_instance() -> None:
+    class LegacyProvider:
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            return ModelResponse(usage=Usage(total_tokens=1))
+
+    provider = LegacyProvider()
+    provider_ref = weakref.ref(provider)
+    request = ModelRequest(
+        instructions="usage probe",
+        input_items=(),
+        output_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        max_tool_calls=0,
+    )
+
+    response = await complete_with_usage_observer(provider, request)
+    del provider
+    gc.collect()
+
+    assert response.usage == Usage(total_tokens=1)
+    assert provider_ref() is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_provider_first_call_usage_survives_cancelled_local_repair(
+    fake_tools, task
+) -> None:
+    repair_started = asyncio.Event()
+
+    class LegacyProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            request: ModelRequest,
+            executor: object | None = None,
+        ) -> ModelResponse:
+            self.calls += 1
+            if self.calls == 1:
+                assert executor is fake_tools
+                return ModelResponse(
+                    parsed={
+                        "specialist": "computation",
+                        "evidence": [],
+                        "candidate_answer": "42",
+                    },
+                    usage=Usage(input_tokens=5, total_tokens=5),
+                )
+            assert request.allowed_tools == ()
+            assert executor is None
+            repair_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    provider = LegacyProvider()
+    agent = LookupAgent(provider)
+    invocation = asyncio.create_task(
+        agent.run(
+            task,
+            PlanStep(specialist="lookup", instruction="Find a source"),
+            (),
+            fake_tools,
+        )
+    )
+    repair_wait = asyncio.create_task(repair_started.wait())
+    done, _pending = await asyncio.wait(
+        {invocation, repair_wait},
+        timeout=0.05,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if invocation in done:
+        repair_wait.cancel()
+        await asyncio.gather(repair_wait, return_exceptions=True)
+        await invocation
+    assert repair_wait in done
+
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+
+    assert provider.calls == 2
+    assert agent.last_usage == Usage(input_tokens=5, total_tokens=5)
+
+
+@pytest.mark.asyncio
+async def test_provider_var_keyword_signature_receives_usage_observer(fake_tools, task) -> None:
+    class KeywordProvider:
+        def __init__(self) -> None:
+            self.observer_keys: list[set[str]] = []
+
+        async def complete(
+            self,
+            request: ModelRequest,
+            executor: object | None = None,
+            **kwargs: Any,
+        ) -> ModelResponse:
+            assert executor is fake_tools
+            self.observer_keys.append(set(kwargs))
+            response = ModelResponse(
+                parsed={
+                    "specialist": "lookup",
+                    "evidence": [],
+                    "candidate_answer": "kwargs answer",
+                },
+                usage=Usage(output_tokens=3, total_tokens=3),
+            )
+            kwargs["usage_observer"](response.usage)
+            return response
+
+    provider = KeywordProvider()
+    result = await LookupAgent(provider).run(
+        task,
+        PlanStep(specialist="lookup", instruction="Find a source"),
+        (),
+        fake_tools,
+    )
+
+    assert result.usage == Usage(output_tokens=3, total_tokens=3)
+    assert provider.observer_keys == [{"usage_observer"}]
+
+
+@pytest.mark.asyncio
+async def test_provider_body_type_error_is_not_retried(task) -> None:
+    class BodyTypeErrorProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            request: ModelRequest,
+            executor: object | None = None,
+        ) -> ModelResponse:
+            self.calls += 1
+            raise TypeError("provider body failed")
+
+    provider = BodyTypeErrorProvider()
+
+    with pytest.raises(TypeError, match="provider body failed"):
+        await PlannerAgent(provider).plan(task)
+
+    assert provider.calls == 1
 
 
 @pytest.mark.asyncio

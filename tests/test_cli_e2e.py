@@ -492,6 +492,45 @@ async def test_offline_evaluation_runner_persists_reliability_audit_events(
 
 
 @pytest.mark.asyncio
+async def test_provider_factory_deadline_guard_accepts_legacy_complete_signature(
+    tmp_path: Path,
+) -> None:
+    tasks, revision = _fixture_tasks()
+
+    class LegacyOfflineProvider(_OfflineProvider):
+        supports_vision = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            request: ModelRequest,
+            executor: Any | None = None,
+        ) -> ModelResponse:
+            self.calls += 1
+            return await super().complete(request, executor)
+
+    provider = LegacyOfflineProvider()
+    runner = build_runner(
+        _config(tmp_path),
+        dataset_loader=lambda _config: (tasks, revision),
+        provider_factory=lambda _config: ProviderRuntime(
+            provider=provider,
+            provider_name="legacy-offline",
+            evaluation_mode="test",
+            fake_mcp_backend=True,
+        ),
+    )
+
+    summary = await runner.run()
+
+    assert summary.total == 3
+    assert summary.failure_categories == {}
+    assert provider.calls == 9
+
+
+@pytest.mark.asyncio
 async def test_evaluation_runner_persists_context_pressure_at_configured_one_mebibyte_boundary(
     tmp_path: Path,
 ) -> None:

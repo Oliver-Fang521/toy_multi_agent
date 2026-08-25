@@ -858,3 +858,90 @@ Final independent read-only review found no Critical or Important findings and r
 equivalent aggregate replacement on success, cancellation preservation, guarded forwarding, fake
 compatibility, and concurrent observer isolation; its provider/agent and focused slices passed, and
 Ruff plus `git diff --check` were clean.
+
+---
+
+## Fix round 5 — legacy provider observer compatibility
+
+### RED evidence
+
+The fix-four observer call sites passed `usage_observer=` unconditionally, which rejected legacy
+structural providers that still implement `complete(request, executor=None)`. The focused legacy
+Agent, local-repair cancellation, guarded ProviderFactory, `**kwargs`, and body-`TypeError` tests
+were added around a pre-invocation signature-binding dispatcher. Additional compatibility tests
+first exposed three binding holes in the inherited dispatcher:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_agents.py::test_specialist_accepts_keyword_only_request_name_and_executor \
+  tests/test_agents.py::test_provider_positional_only_observer_keeps_keyword_only_executor \
+  tests/test_agents.py::test_uninspectable_provider_uses_historical_call_once_for_local_repair
+FFF
+```
+
+- a keyword-only request parameter named `payload` was never supplied;
+- a positional-only `usage_observer` caused a declared keyword-only executor to be lost; and
+- an uninspectable tool-free provider was called as `complete(request, None)` rather than the
+  historical `complete(request)` form.
+
+The independent read-only review then found one more binding regression. Its focused test was RED:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_agents.py::test_provider_varargs_keeps_declared_keyword_executor
+F
+```
+
+The positional candidate bound the executor into `*args`, leaving the declared keyword executor as
+`None`.
+
+### GREEN evidence
+
+The final compatibility slice, including the review regression, passed:
+
+```text
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q \
+  tests/test_agents.py::test_specialist_accepts_legacy_provider_with_keyword_only_executor \
+  tests/test_agents.py::test_specialist_accepts_keyword_only_request_name_and_executor \
+  tests/test_agents.py::test_provider_positional_only_observer_keeps_keyword_only_executor \
+  tests/test_agents.py::test_provider_varargs_keeps_declared_keyword_executor \
+  tests/test_agents.py::test_uninspectable_provider_uses_historical_call_once_for_local_repair \
+  tests/test_agents.py::test_provider_compatibility_dispatch_does_not_retain_provider_instance \
+  tests/test_agents.py::test_legacy_provider_first_call_usage_survives_cancelled_local_repair \
+  tests/test_agents.py::test_provider_var_keyword_signature_receives_usage_observer \
+  tests/test_agents.py::test_provider_body_type_error_is_not_retried \
+  tests/test_cli_e2e.py::test_provider_factory_deadline_guard_accepts_legacy_complete_signature
+..........
+```
+
+The existing exact per-turn built-in OpenAI/DeepSeek usage, cancellation, graph, runner/CLI, and
+trace-reliability suites were also rerun, followed by the full suite and static checks.
+
+### Compatibility behavior
+
+- Agents and `_DeadlineGuardedProvider` use one exported `complete_with_usage_observer` invocation
+  helper. It inspects and binds a supported structural signature before the only provider call, so a
+  `TypeError` raised from provider code is never interpreted as a binding failure or retried.
+- Legacy providers that do not accept the observer are called once and publish their successful
+  aggregate response usage once. Consequently, their first completed local-repair turn remains
+  available if the later repair is cancelled, while no legacy provider can expose an unfinished
+  internal turn.
+- Explicit observer parameters and `**kwargs` receive the per-invocation observer. Named keyword
+  executors are preferred over a variadic positional match; positional-only observer/executor forms
+  and keyword-only request names are bound before invocation.
+- The uninspectable fallback makes exactly the prior call shape: `complete(request)` without an
+  executor and `complete(request, executor)` with one. It does not speculate or retry alternative
+  shapes, so it retains only successful aggregate accounting until the provider adopts the observer
+  interface.
+- The helper has no provider registry or cache. The direct weak-reference regression proves an
+  ephemeral provider is collectable after completion.
+
+### Files
+
+- `src/gaia_agent/providers/base.py`: documented structural-provider protocol and one-shot,
+  signature-compatible invocation helper.
+- `src/gaia_agent/providers/__init__.py`: helper export.
+- `src/gaia_agent/agents.py`, `src/gaia_agent/runner.py`: route all observer-aware calls through the
+  helper.
+- `tests/test_agents.py`, `tests/test_cli_e2e.py`: Agent, cancellation, signature, ProviderFactory,
+  TypeError, observer, and lifetime regressions.

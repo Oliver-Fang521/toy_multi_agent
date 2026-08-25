@@ -23,7 +23,12 @@ from gaia_agent.models import (
     SpecialistName,
     Usage,
 )
-from gaia_agent.providers import ModelProvider, ModelRequest, UsageObserver
+from gaia_agent.providers import (
+    ModelProvider,
+    ModelRequest,
+    UsageObserver,
+    complete_with_usage_observer,
+)
 from gaia_agent.research_notebook import NotebookEntry, select_evidence_cards
 
 if TYPE_CHECKING:
@@ -209,7 +214,8 @@ async def _complete_with_local_repair(
     The repair call is deliberately tool-free. A malformed response is a protocol
     failure, not evidence that the stage needs a second research trajectory.
     """
-    response = await provider.complete(
+    response = await complete_with_usage_observer(
+        provider,
         request,
         executor,
         usage_observer=usage_observer,
@@ -234,7 +240,8 @@ async def _complete_with_local_repair(
         if response.parsed is not None
         else _repair_request(request)
     )
-    repaired = await provider.complete(
+    repaired = await complete_with_usage_observer(
+        provider,
         repair_request,
         usage_observer=usage_observer,
     )
@@ -486,7 +493,8 @@ class EvidenceLinkerAgent:
             max_tool_calls=0,
             reasoning_effort=self.reasoning_effort,
         )
-        response = await self.provider.complete(
+        response = await complete_with_usage_observer(
+            self.provider,
             request,
             usage_observer=_usage_observer(
                 self._last_usage,

@@ -9,6 +9,7 @@ from gaia_agent.providers.base import (
     ToolExecutor,
     ToolSpec,
     UsageObserver,
+    complete_with_usage_observer,
     serialize_tool_output,
     tool_output_size_bytes,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "ToolExecutor",
     "ToolSpec",
     "UsageObserver",
+    "complete_with_usage_observer",
     "serialize_tool_output",
     "tool_output_size_bytes",
 ]

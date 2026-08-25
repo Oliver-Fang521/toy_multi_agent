@@ -1,5 +1,6 @@
 import json
 from collections.abc import Callable
+from inspect import Parameter, Signature, signature
 from typing import Any, Literal, Protocol
 
 from pydantic import Field, field_validator
@@ -123,6 +124,13 @@ UsageObserver = Callable[[Usage], None]
 
 
 class ModelProvider(Protocol):
+    """Preferred provider shape.
+
+    Runtime dispatch also accepts legacy structural providers whose ``complete``
+    method omits ``usage_observer``. Such providers can report only the aggregate
+    usage of a successfully returned response, not partial internal turns.
+    """
+
     supports_vision: bool
 
     async def complete(
@@ -133,3 +141,179 @@ class ModelProvider(Protocol):
         usage_observer: UsageObserver | None = None,
     ) -> ModelResponse:
         raise NotImplementedError
+
+
+async def complete_with_usage_observer(
+    provider: ModelProvider,
+    request: ModelRequest,
+    executor: ToolExecutor | None = None,
+    *,
+    usage_observer: UsageObserver | None = None,
+) -> ModelResponse:
+    """Call an observer-aware or legacy structural provider exactly once.
+
+    Signature binding happens before invocation, so a ``TypeError`` raised by the
+    provider body is never mistaken for an incompatible signature and retried.
+    Inspectable providers may take request/executor positionally or by keyword;
+    the observer may be named or accepted through ``**kwargs``. Legacy providers
+    publish their returned aggregate once after successful completion. An
+    uninspectable callable uses the historical call shape exactly once
+    (``complete(request)`` without tools, otherwise ``complete(request, executor)``),
+    so it cannot receive per-turn usage until it adopts the observer interface.
+    """
+
+    complete = provider.complete
+    try:
+        complete_signature = signature(complete)
+    except (TypeError, ValueError):
+        # An uninspectable structural provider gets the historical call shape.
+        # Do not retry another shape if that one raises from inside the provider.
+        if executor is None:
+            response = await complete(request)
+        else:
+            response = await complete(request, executor)
+        if usage_observer is not None:
+            usage_observer(response.usage)
+        return response
+
+    supports_observer = _supports_usage_observer(complete_signature)
+    args, kwargs = _bind_complete_call(
+        complete_signature,
+        request,
+        executor,
+        usage_observer=usage_observer,
+        supports_observer=supports_observer,
+    )
+    response = await complete(*args, **kwargs)
+    if usage_observer is not None and not supports_observer:
+        usage_observer(response.usage)
+    return response
+
+
+def _supports_usage_observer(complete_signature: Signature) -> bool:
+    observer = complete_signature.parameters.get("usage_observer")
+    return observer is not None or any(
+        parameter.kind is Parameter.VAR_KEYWORD
+        for parameter in complete_signature.parameters.values()
+    )
+
+
+def _bind_complete_call(
+    complete_signature: Signature,
+    request: ModelRequest,
+    executor: ToolExecutor | None,
+    *,
+    usage_observer: UsageObserver | None,
+    supports_observer: bool,
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    observer = complete_signature.parameters.get("usage_observer")
+    if observer is not None and observer.kind is Parameter.POSITIONAL_ONLY:
+        positional = _positional_observer_arguments(
+            complete_signature,
+            request,
+            executor,
+            usage_observer,
+        )
+        executor_kwargs = _keyword_executor_arguments(complete_signature, executor)
+        complete_signature.bind(*positional, **executor_kwargs)
+        return positional, executor_kwargs
+
+    observer_kwargs = (
+        {"usage_observer": usage_observer} if supports_observer else {}
+    )
+    executor_parameter = complete_signature.parameters.get("executor")
+    positional_executor = (
+        executor_parameter is None
+        or executor_parameter.kind is Parameter.POSITIONAL_ONLY
+    )
+    candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = (
+        [
+            ((request, executor), dict(observer_kwargs)),
+            ((request,), {"executor": executor, **observer_kwargs}),
+        ]
+        if positional_executor
+        else [
+            ((request,), {"executor": executor, **observer_kwargs}),
+            ((request, executor), dict(observer_kwargs)),
+        ]
+    )
+    if executor is None:
+        candidates.extend(
+            [
+                ((request,), dict(observer_kwargs)),
+                ((), {"request": request, **observer_kwargs}),
+            ]
+        )
+    candidates.append(
+        ((), {"request": request, "executor": executor, **observer_kwargs})
+    )
+    if request_name := _keyword_only_request_name(complete_signature):
+        candidates.append(
+            (
+                (),
+                {
+                    request_name: request,
+                    "executor": executor,
+                    **observer_kwargs,
+                },
+            )
+        )
+        if executor is None:
+            candidates.append(((), {request_name: request, **observer_kwargs}))
+    last_error: TypeError | None = None
+    for args, kwargs in candidates:
+        try:
+            complete_signature.bind(*args, **kwargs)
+        except TypeError as error:
+            last_error = error
+            continue
+        return args, kwargs
+    raise TypeError("provider complete signature is incompatible with ModelProvider") from last_error
+
+
+def _keyword_executor_arguments(
+    complete_signature: Signature,
+    executor: ToolExecutor | None,
+) -> dict[str, Any]:
+    executor_parameter = complete_signature.parameters.get("executor")
+    if executor_parameter is None or executor_parameter.kind is Parameter.POSITIONAL_ONLY:
+        return {}
+    return {"executor": executor}
+
+
+def _keyword_only_request_name(complete_signature: Signature) -> str | None:
+    for parameter in complete_signature.parameters.values():
+        if parameter.kind is Parameter.KEYWORD_ONLY and parameter.name not in {
+            "executor",
+            "usage_observer",
+        }:
+            return parameter.name
+    return None
+
+
+def _positional_observer_arguments(
+    complete_signature: Signature,
+    request: ModelRequest,
+    executor: ToolExecutor | None,
+    usage_observer: UsageObserver | None,
+) -> tuple[Any, ...]:
+    values: list[Any] = []
+    request_assigned = False
+    for parameter in complete_signature.parameters.values():
+        if parameter.kind is not Parameter.POSITIONAL_ONLY:
+            break
+        if not request_assigned:
+            values.append(request)
+            request_assigned = True
+        elif parameter.name == "executor":
+            values.append(executor)
+        elif parameter.name == "usage_observer":
+            values.append(usage_observer)
+            return tuple(values)
+        elif parameter.default is not Parameter.empty:
+            values.append(parameter.default)
+        else:
+            raise TypeError(
+                "provider complete positional parameters are incompatible with ModelProvider"
+            )
+    raise TypeError("provider usage_observer parameter could not be bound")
