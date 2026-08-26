@@ -1,179 +1,317 @@
-# GAIA Multi-Agent Evaluation
+# toy_multi_agent
 
-This project runs a reproducible, tool-assisted evaluation on a balanced subset of the
-[GAIA 2023](https://huggingface.co/datasets/gaia-benchmark/GAIA) validation split. It is a
-provider-neutral `Plan -> Act -> Verify -> Submit` system with an OpenAI production adapter.
+A reliability-first multi-agent system for solving and evaluating tool-assisted reasoning tasks on
+the [GAIA benchmark](https://huggingface.co/datasets/gaia-benchmark/GAIA).
 
-## Install and authenticate
+I built this project to explore a practical question: **how do you make a group of LLM agents
+behave like a bounded, inspectable system instead of an open-ended chain of prompts?** The result is
+a provider-neutral `Plan -> Act -> Verify -> Submit` workflow with role-specific tools, typed
+intermediate state, recovery checkpoints, independent answer verification, and privacy-safe
+evaluation artifacts.
 
-Python 3.11 or newer and [uv](https://docs.astral.sh/uv/) are required.
+The best completed 15-task run in this repository scored **46.67% (7/15)** on a deterministic,
+balanced sample of the GAIA validation split. This is a project evaluation on 15 selected tasks,
+not a claim about the full 165-question GAIA validation leaderboard.
+
+## What I built
+
+- A **LangGraph orchestration state machine** that controls planning, specialist execution,
+  evidence repair, criticism, correction, rejection, and final submission.
+- Six operational roles with explicit responsibilities: one Planner, four Specialists, and one
+  Critic. A separate Evidence Linker reconnects restored private research to a candidate without
+  inventing new evidence.
+- A real **MCP v2 tool server** running as an isolated stdio subprocess. Every role receives only
+  its allowlisted tools.
+- Hosted web research, webpage reading, Python execution, attachment analysis, image inspection,
+  and audio transcription without executing model-generated code on the host machine.
+- Bounded reliability controls: global and per-stage deadlines, tool budgets, retries with backoff,
+  loop detection, structured-response repair, search fallback/circuit breaking, and resumable
+  authenticated checkpoints.
+- A privacy-aware evaluation pipeline that excludes GAIA questions, reference answers,
+  attachments, prompts, credentials, and hidden reasoning from public artifacts.
+- Optional Langfuse tracing with operational summaries and usage data, while deliberately omitting
+  sensitive task content and chain-of-thought.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    D[GAIA validation task] --> R[Evaluation runner]
+    R --> O[LangGraph orchestrator]
+
+    O --> P[Planner<br/>no tools]
+    P --> S{Specialist router}
+    S --> L[Lookup<br/>web search + page read]
+    S --> C[Computation<br/>hosted Python]
+    S --> F[File analysis<br/>attachment + Python + audio]
+    S --> V[Visual<br/>registered image inspection]
+
+    L --> E[Typed evidence + candidate]
+    C --> E
+    F --> E
+    V --> E
+    E --> K[Independent Critic]
+    K -->|approve| A[Submit concise answer]
+    K -->|revise once| S
+    K -->|insufficient evidence| X[Reject]
+
+    M[Isolated stdio MCP server] -. role allowlists .-> L
+    M -. role allowlists .-> C
+    M -. role allowlists .-> F
+    M -. role allowlists .-> V
+    M -. verification tools .-> K
+
+    O <--> N[Private authenticated<br/>research checkpoints]
+    R --> Q[Public redacted<br/>reports + audit metadata]
+```
+
+The system is split into four planes:
+
+| Plane | Responsibility | Main implementation |
+| --- | --- | --- |
+| Control | Own the graph, routing, budgets, correction loop, and terminal state | `orchestrator.py`, `runner.py` |
+| Agent | Define role prompts, structured schemas, tool permissions, and local response repair | `agents.py`, `models.py` |
+| Tool | Expose bounded MCP tools and keep execution outside the orchestrator process | `mcp_server.py`, `mcp_client.py`, `search.py` |
+| Quality | Score answers, persist safe artifacts, recover state, report metrics, and trace operations | `scoring.py`, `persistence.py`, `research_notebook.py`, `reporting.py`, `observability.py` |
+
+## How the implementation works
+
+### 1. Plan
+
+The Planner receives the task, level, attachment metadata, and available capabilities. It cannot
+call tools or answer the task. It returns a typed `AgentPlan` containing one to eight ordered steps.
+Invalid routing is normalized, and a conservative answer-free fallback route is available if both
+the initial structured response and its local repair fail.
+
+### 2. Act
+
+Each plan step is dispatched to exactly one specialist:
+
+| Specialist | Allowed tools | Evidence it may produce |
+| --- | --- | --- |
+| Lookup | `web_search`, `read_webpage` | Source evidence with URLs |
+| Computation | `execute_python` | Reproducible computation evidence |
+| File analysis | `read_attachment`, `execute_python`, `transcribe_audio` | File and computation evidence |
+| Visual | `read_attachment` | Visual evidence from the registered attachment |
+
+The orchestrator assigns trusted sequential evidence IDs, tracks which step produced every item,
+rejects duplicate or malformed evidence, deduplicates repeated tool calls, and stops early when a
+candidate has enough typed evidence for criticism.
+
+### 3. Verify and correct
+
+The Critic independently checks the candidate against the evidence and may use a bounded subset of
+research tools. It returns `approve`, `revise`, or `insufficient_evidence` together with the exact
+evidence IDs it checked. The graph permits at most one correction pass; an unsupported result is
+rejected rather than silently submitted.
+
+### 4. Submit and score
+
+Only a concise GAIA-format answer with checked evidence can reach submission. The evaluation runner
+then applies GAIA-compatible answer normalization and scoring, aggregates accuracy/latency/usage,
+and writes deterministic JSON and Markdown reports.
+
+### Reliability and recovery
+
+Each vote has immutable Planner, Specialist, Critic, and global deadlines. Tool calls are counted
+both globally and by stage. Recoverable provider failures use bounded retry/backoff; hosted search
+can fall back to configured providers behind a circuit breaker. Structured stage output gets one
+tool-free local repair instead of launching an unbounded second research path.
+
+After stable graph transitions, private research state is written to an authenticated sibling
+checkpoint directory. `--resume` validates the persisted run configuration, restores only trusted
+state, repairs incomplete public records, and skips already completed tasks.
+
+### Security and privacy boundaries
+
+- Secrets are accepted only from environment variables and are redacted from failures and traces.
+- Attachments must be registered to the active task; path containment and file-type/resource limits
+  are enforced.
+- Public webpage reads reject non-public network destinations and apply redirect, timeout, and size
+  limits.
+- Python runs in hosted Code Interpreter, not on the local host.
+- Public artifacts use strict schemas and allowlists. They do not contain task questions, reference
+  answers, attachment contents/paths, prompts, model output, raw tool results, or hidden reasoning.
+- Private research checkpoints are ignored by Git and are not part of benchmark reports.
+
+## Best 15-task GAIA result
+
+The best complete run used a deterministic sample with five tasks from each GAIA difficulty level.
+
+| Metric | Result |
+| --- | ---: |
+| Overall accuracy | **46.67% (7/15)** |
+| Level 1 | **100.00% (5/5)** |
+| Level 2 | **40.00% (2/5)** |
+| Level 3 | **0.00% (0/5)** |
+| Critic approvals | 8/15 |
+| Median task duration | 208.900 s |
+| p95 task duration | 500.011 s |
+| Total tokens | 959,469 |
+
+Run configuration:
+
+- model: `gpt-5.6-luna`
+- reasoning effort: `max`
+- sample size: `15`
+- seed: `42`
+- votes per task: `1`
+- maximum steps: `8`
+- maximum tool calls: `24`
+- per-task timeout: `500` seconds
+- dataset revision: `682dd723ee1e1697e00360edccf2366dc8418dd9`
+
+The checked-in [aggregate report](benchmarks/gaia-15-best/report.md) and
+[machine-readable summary](benchmarks/gaia-15-best/summary.json) contain the public, privacy-safe
+result. The original completed run directory also passed the project's independent
+`verify-results` integrity check before publication.
+
+### How to interpret this result
+
+This run is useful for comparing iterations of this project because the sample selection and
+dataset revision are fixed. It is deliberately small and therefore has high statistical
+uncertainty. It must not be compared directly with scores produced on the full GAIA validation set
+or under different tool/model budgets.
+
+The result also exposes the main remaining weakness: Level 3 tasks did not convert into correct
+answers, and five tasks ended in malformed-response failures despite longer specialist budgets.
+That points to structured-output robustness and hard-task synthesis as the highest-value next
+improvements.
+
+## Repository structure
+
+```text
+toy_multi_agent/
+├── src/gaia_agent/
+│   ├── agents.py              # Planner, specialists, Critic, Evidence Linker
+│   ├── orchestrator.py        # LangGraph state machine and budget enforcement
+│   ├── runner.py              # Dataset selection, voting, scoring, resume, composition
+│   ├── mcp_server.py          # Isolated MCP tools and attachment/network policies
+│   ├── mcp_client.py          # Role allowlists, tool accounting, safe tool envelopes
+│   ├── providers/             # Provider-neutral interface and OpenAI/DeepSeek adapters
+│   ├── persistence.py         # Public schemas, audit log, integrity and privacy checks
+│   ├── research_notebook.py   # Private authenticated recovery checkpoints
+│   ├── observability.py       # Privacy-safe optional Langfuse telemetry
+│   ├── scoring.py             # GAIA-compatible answer normalization and scoring
+│   ├── reporting.py           # Aggregate metrics and deterministic reports
+│   └── cli.py                 # `evaluate` and `verify-results` commands
+├── tests/                     # Unit, integration, E2E, privacy, and recovery tests
+├── benchmarks/gaia-15-best/   # Published aggregate benchmark result
+├── docs/superpowers/          # Design decisions and implementation plans
+├── pyproject.toml
+└── uv.lock
+```
+
+## Install
+
+Requirements: Python 3.11 or newer and [uv](https://docs.astral.sh/uv/).
 
 ```console
 uv sync --extra dev
 ```
 
-On the GAIA dataset page, sign in to Hugging Face, accept the gated dataset terms, and create a
-Hugging Face token that can read gated repositories. Set that token and an OpenAI API key in the
-shell that will run the evaluation:
+Accept the gated GAIA dataset terms on Hugging Face, then provide credentials through the
+environment:
 
 ```console
 export OPENAI_API_KEY="YOUR_OPENAI_API_KEY"
 export HF_TOKEN="YOUR_HUGGING_FACE_TOKEN"
 ```
 
-Do not commit these values or put them directly in command history. `.env` is ignored, but the CLI
-does not load it automatically.
+Do not commit these values. `.env` is ignored and the CLI does not load it automatically.
 
-## Architecture
+## Run the evaluation
 
-The architecture follows the four-plane boundaries of
-[`adorosario/customgpt-agent`](https://github.com/adorosario/customgpt-agent), scoped to the tools
-needed for GAIA:
-
-1. A provider-agnostic orchestrator owns the bounded `Plan -> Act -> Verify -> Submit` state
-   machine; only the provider adapter calls the OpenAI Responses API.
-2. Six roles have separate prompts and permissions: the tool-free **planner**; **lookup**,
-   **computation**, **file-analysis**, and **visual** specialists; and an independent **critic**.
-3. A real local MCP v2 server runs as a separate stdio subprocess. Specialists receive only their
-   allowlisted tools: hosted web search/page retrieval, hosted Python, registered attachment
-   inspection, and terminal answer submission.
-4. The quality plane enforces step and tool budgets, loop detection, evidence rules, critic review,
-   audit events, scoring, and independently verifiable reports.
-
-Web search uses OpenAI's hosted Web Search tool. Python and attachment computation use an ephemeral
-OpenAI Code Interpreter container; model-generated code never runs on the host. These hosted tools,
-model calls, file uploads, and optional repeated votes can incur API charges. Bound exposure before
-a run with `--sample-size`, `--max-steps`, `--max-tool-calls`, `--timeout-seconds`, and `--votes`.
-The default limits are 15 tasks, 8 steps, 24 tool calls, 300 seconds per attempt, and one vote.
-
-## Configuration
-
-`OPENAI_API_KEY` and `HF_TOKEN` are required and are accepted only from the environment. Non-secret
-settings use the following precedence: an explicitly supplied CLI option overrides its `GAIA_*`
-environment variable, which overrides the built-in default.
-
-| CLI option | Environment variable | Default |
-| --- | --- | --- |
-| `--model` | `GAIA_MODEL` | `gpt-5.6-luna` |
-| `--reasoning-effort` | `GAIA_REASONING_EFFORT` | `max` |
-| *(quality policy)* | `GAIA_QUALITY_POLICY` | `benchmark` |
-| `--sample-size` | `GAIA_SAMPLE_SIZE` | `15` |
-| `--seed` | `GAIA_SEED` | `42` |
-| `--max-steps` | `GAIA_MAX_STEPS` | `8` |
-| `--max-tool-calls` | `GAIA_MAX_TOOL_CALLS` | `24` |
-| `--timeout-seconds` | `GAIA_TIMEOUT_SECONDS` | `300` |
-| `--planner-timeout-seconds` | `GAIA_PLANNER_TIMEOUT_SECONDS` | 10% of `GAIA_TIMEOUT_SECONDS` |
-| `--specialist-timeout-seconds` | `GAIA_SPECIALIST_TIMEOUT_SECONDS` | 70% of `GAIA_TIMEOUT_SECONDS` |
-| `--critic-timeout-seconds` | `GAIA_CRITIC_TIMEOUT_SECONDS` | 20% of `GAIA_TIMEOUT_SECONDS` |
-| `--specialist-max-tool-calls` | `GAIA_SPECIALIST_MAX_TOOL_CALLS` | `GAIA_MAX_TOOL_CALLS` minus Critic reserve |
-| `--critic-max-tool-calls` | `GAIA_CRITIC_MAX_TOOL_CALLS` | one quarter of `GAIA_MAX_TOOL_CALLS` (minimum 1, or 0 when total is 1) |
-| `--votes` | `GAIA_VOTES` | `1` |
-| `--output-dir` | `GAIA_OUTPUT_DIR` | `results/gaia-15-seed42` |
-| `--resume` / `--no-resume` | `GAIA_RESUME` | `false` |
-
-The following reliability settings are environment-only so every stage of a run uses the same
-bounded behavior. They are included in the public manifest (except that unset optional cost rates
-are omitted), so `--resume` rejects a run whose behavior-defining configuration has changed.
-
-| Environment variable | Default | Bound and purpose |
-| --- | --- | --- |
-| `GAIA_PROVIDER_MAX_ATTEMPTS` | `4` | 1–10 attempts for recoverable provider and search-provider calls; `.env.example` uses `3` |
-| `GAIA_PROVIDER_BACKOFF_BASE` | `0.5` | Positive finite base delay, at most 30 seconds |
-| `GAIA_PRIVATE_NOTEBOOK_MAX_BYTES` | `65536` | Per-entry private checkpoint cap, at most 1 MiB |
-| `GAIA_STAGE_CONTEXT_MAX_BYTES` | `24576` | Per-specialist and Critic context cap, at most 1 MiB |
-| `GAIA_SEARCH_CIRCUIT_COOLDOWN` | `30` | Finite search-provider circuit-open cooldown, 0–3600 seconds |
-| `GAIA_SEARCH_TIMEOUT_SECONDS` | `120` | Positive finite absolute deadline for the complete hosted-search/fallback chain, capped at 3600 seconds |
-| `LANGFUSE_INPUT_COST_PER_MILLION` | unset | Optional non-negative finite input-token rate, capped at 1,000,000 |
-| `LANGFUSE_OUTPUT_COST_PER_MILLION` | unset | Optional non-negative finite output-token rate, capped at 1,000,000 |
-
-Stage timeout budgets must be positive and total no more than the global timeout. Specialist and
-Critic tool budgets are non-negative and total no more than the global tool limit. The primary
-provider is the OpenAI Responses adapter. Hosted web search is attempted first, then Serper when
-`SERPER_API_KEY` is configured, followed by the optional SerpAPI fallback; each provider is retried within the configured budget
-and opens a short circuit after repeated failures. The model adapter retries recoverable connection,
-timeout, rate-limit, and internal-server errors in place; structured stage responses get one local
-schema/semantic repair; attachment-ineligible visual routes normalize before dispatch; and the
-Critic receives the surviving normalized route. These recovery steps are bounded and never expose
-tool content or credentials in public artifacts.
-
-The checked-in `.env.example` opts into a 500-second run budget split as 30 seconds for Planner,
-410 seconds for Specialist, and 60 seconds for Critic. These are environment overrides, not changes
-to the built-in defaults above.
-
-The sample size must be at least three and divisible by three so the run contains equal counts from
-GAIA levels 1, 2, and 3. Votes must be a positive odd number. Run `uv run gaia-agent evaluate
---help` for the current CLI surface.
-
-`GAIA_QUALITY_POLICY=benchmark` keeps a critic-approved, scorer-valid answer eligible for the
-official GAIA comparison even when the internal evidence-density gate is inconclusive. Set it to
-`strict` for the older audit-oriented evidence gate. This is an internal policy switch; it does
-not change GAIA's official answer scorer.
-
-### Langfuse observability
-
-Tracing is optional. Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` together to enable it;
-`LANGFUSE_ENABLED=false` always disables tracing. `LANGFUSE_BASE_URL` defaults to
-`https://cloud.langfuse.com`, and `LANGFUSE_PROJECT_NAME` is an optional project label. The CLI
-does not load `.env` automatically, so export these variables in the shell that runs the command
-or source a local, ignored `.env` file first.
-
-Each task trace contains only stable identifiers and configuration. Planner, specialist, critic,
-submit, model-generation, and MCP-tool observations contain stage names, statuses, counts, model
-name, reasoning setting, and token totals. New traces also include a bounded `reasoning_summary`
-with route, step/tool/evidence counts, critic verdict, and repair/fallback status so the visible
-decision path can be inspected without exposing hidden chain-of-thought. Questions, reference
-answers, candidate text, attachments, prompts, model output, tool arguments/results, and credentials are excluded. Langfuse transport failures
-are swallowed and cannot change scoring or retries. Call `flush` at run completion is handled by
-the runner; no Langfuse data is written into the public result artifacts.
-
-Each root trace closes with the scorer-facing outcome fields `answer_present`, `evidence_count`,
-`critic_verdict`, `error_category`, `correct`, provider retry count, tool success/failure counts,
-latencies, and checkpoint-restoration state. The optional cost rates configure Langfuse generation
-cost accounting only; they are not credentials.
-
-## Run and verify
-
-A bounded three-task smoke run selects one task per level and limits each attempt to one planned
-step:
+Start with a balanced three-task smoke run:
 
 ```console
-GAIA_MAX_STEPS=1 uv run gaia-agent evaluate --sample-size 3 --seed 42 --output-dir results/smoke-3
+GAIA_MAX_STEPS=1 uv run gaia-agent evaluate \
+  --sample-size 3 \
+  --seed 42 \
+  --output-dir results/smoke-3
+
 uv run gaia-agent verify-results results/smoke-3
 ```
 
-Run the deterministic 15-task evaluation and independently verify its public artifacts:
+Reproduce the configuration used by the published best 15-task run:
 
 ```console
-uv run gaia-agent evaluate --sample-size 15 --seed 42 --output-dir results/gaia-15-seed42
+GAIA_MODEL=gpt-5.6-luna \
+GAIA_REASONING_EFFORT=max \
+GAIA_QUALITY_POLICY=benchmark \
+GAIA_PROVIDER_MAX_ATTEMPTS=3 \
+uv run gaia-agent evaluate \
+  --sample-size 15 \
+  --seed 42 \
+  --votes 1 \
+  --max-steps 8 \
+  --max-tool-calls 24 \
+  --timeout-seconds 500 \
+  --planner-timeout-seconds 30 \
+  --specialist-timeout-seconds 410 \
+  --critic-timeout-seconds 60 \
+  --specialist-max-tool-calls 18 \
+  --critic-max-tool-calls 6 \
+  --output-dir results/gaia-15-seed42
+
 uv run gaia-agent verify-results results/gaia-15-seed42
 ```
 
-Each output directory contains `manifest.json`, `predictions.jsonl`, `summary.json`, `report.md`,
-and per-task `plan.json` and `audit.jsonl` files when those stages ran. Artifacts retain only stable
-task IDs, aggregate metrics, concise predictions, role/transition metadata, opaque evidence IDs,
-and safe tool-shape metadata. They exclude GAIA question text, reference answers, attachment
-content and paths, credentials, prompts, and hidden reasoning. `results/` is gitignored as an
-additional safeguard.
+The fixed configuration reproduces the evaluation protocol and task selection, not a guaranteed
+score: hosted search results and model outputs can change between runs.
 
-Private research-notebook checkpoints are kept in a sibling hidden directory derived from the public
-output directory: `results/gaia-luna-max` uses `results/.gaia-luna-max.private`. They are replay aids
-only and are not part of the report, manifest, predictions, or audit artifacts.
+Resume an interrupted run by repeating the same command and output directory with `--resume`.
+Behavior-defining configuration must match the stored manifest.
 
-To continue an interrupted run, repeat the same command and output directory with `--resume` (or
-set `GAIA_RESUME=true`). The persisted selection and all run-defining configuration must match;
-complete valid checkpoints are skipped and incomplete checkpoints are repaired. Re-run
-`verify-results` after completion to check schemas, privacy allowlists, selection balance, audit
-sequence integrity, prediction completeness, and recomputed summary/report metrics.
+## Key configuration
 
-For a production Luna/max evaluation, configure credentials externally and run:
+CLI options override `GAIA_*` environment variables, which override built-in defaults.
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `GAIA_MODEL` | `gpt-5.6-luna` | Production model |
+| `GAIA_REASONING_EFFORT` | `max` | Reasoning level |
+| `GAIA_SAMPLE_SIZE` | `15` | Balanced evaluation size; divisible by 3 |
+| `GAIA_MAX_STEPS` | `8` | Maximum plan steps |
+| `GAIA_MAX_TOOL_CALLS` | `24` | Global logical tool-call budget |
+| `GAIA_TIMEOUT_SECONDS` | `300` | Global per-attempt deadline |
+| `GAIA_VOTES` | `1` | Positive odd vote count |
+| `GAIA_QUALITY_POLICY` | `benchmark` | Submission policy for degraded Critic repair |
+| `GAIA_OUTPUT_DIR` | `results/gaia-15-seed42` | Public result directory |
+| `GAIA_RESUME` | `false` | Restore a matching interrupted run |
+
+Planner, Specialist, and Critic timeout/tool budgets, provider retry policy, search deadlines,
+checkpoint sizes, context limits, fallback search providers, and optional Langfuse settings are
+also configurable. See [.env.example](.env.example) and `uv run gaia-agent evaluate --help` for the
+current interface.
+
+## Test and verify
 
 ```console
-GAIA_MODEL=gpt-5.6-luna GAIA_REASONING_EFFORT=max \
-uv run gaia-agent evaluate --sample-size 15 --seed 42 --output-dir results/gaia-luna-max
+uv run pytest
+uv run ruff check .
+
+# After running either evaluation command above:
+uv run gaia-agent verify-results results/gaia-15-seed42
 ```
 
-## Interpretation
+The test suite covers agent schemas and permissions, graph transitions, MCP isolation, provider
+adapters, dataset selection, scoring, persistence, checkpoint recovery, observability privacy,
+report recomputation, and end-to-end reliability behavior.
 
-The fixed seed makes this 15-task sample reproducible, but it is not statistically or procedurally
-comparable to the full 165-question GAIA validation leaderboard. Report it as a measured project
-evaluation, not as a leaderboard score or parity claim for the reference system.
+## Design choices
+
+The design and implementation history is retained under `docs/superpowers/`. Notable decisions
+include the original multi-agent design, the LangGraph migration, observability/privacy boundaries,
+trace-driven reliability improvements, and stage-level recovery.
+
+## Limitations
+
+- GAIA is gated; reproducing the evaluation requires accepting its dataset terms.
+- Hosted tools and model calls can incur API charges.
+- The published score covers only 15 deterministic validation tasks.
+- The production composition is intentionally pinned to the configured Luna/max evaluation path;
+  provider-neutral test adapters exist, but different production providers are not benchmark
+  equivalent.
+- The project does not publish GAIA questions, reference answers, task-level predictions, or
+  attachments.

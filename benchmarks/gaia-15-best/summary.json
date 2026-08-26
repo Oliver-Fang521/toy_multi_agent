@@ -1,0 +1,41 @@
+{
+  "benchmark": "GAIA 2023 validation",
+  "dataset_revision": "682dd723ee1e1697e00360edccf2366dc8418dd9",
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "max",
+  "sample_size": 15,
+  "seed": 42,
+  "votes": 1,
+  "limits": {
+    "max_steps": 8,
+    "max_tool_calls": 24,
+    "planner_timeout_seconds": 30.0,
+    "specialist_timeout_seconds": 410.0,
+    "critic_timeout_seconds": 60.0,
+    "timeout_seconds": 500.0
+  },
+  "result": {
+    "accuracy": 0.4666666666666667,
+    "correct": 7,
+    "total": 15,
+    "by_level": {
+      "1": {"accuracy": 1.0, "correct": 5, "total": 5},
+      "2": {"accuracy": 0.4, "correct": 2, "total": 5},
+      "3": {"accuracy": 0.0, "correct": 0, "total": 5}
+    },
+    "critic_verdicts": {"approve": 8, "not_run": 7},
+    "failure_categories": {"malformed_response": 5, "timeout": 2},
+    "usage": {
+      "input_tokens": 824214,
+      "output_tokens": 135255,
+      "reasoning_tokens": 124390,
+      "total_tokens": 959469
+    },
+    "total_seconds": 3515.61284808442,
+    "p50_seconds": 208.90001449990086,
+    "p95_seconds": 500.01088912505656
+  },
+  "scope_note": "Deterministic balanced 15-task sample; not comparable to the full GAIA leaderboard.",
+  "privacy_note": "Aggregate-only artifact; excludes task text, answers, attachments, prompts, raw tool results, and hidden reasoning.",
+  "source_summary_sha256": "988792c05fc073b6a7b9376feda779fd005da94c75d514a5e21d6d125e9c612e"
+}
