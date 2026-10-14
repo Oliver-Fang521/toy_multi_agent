@@ -13,8 +13,8 @@ class RunConfig(BaseModel):
 
     openai_api_key: SecretStr
     hf_token: SecretStr
-    model: str = "gpt-5.6-luna"
-    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "max"
+    model: str = "gpt-6.1-sol"
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
     quality_policy: Literal["benchmark", "strict"] = "benchmark"
     sample_size: int = 15
     seed: int = 42
@@ -90,8 +90,8 @@ class RunConfig(BaseModel):
         values: dict[str, object] = {
             "openai_api_key": os.environ.get("OPENAI_API_KEY"),
             "hf_token": os.environ.get("HF_TOKEN"),
-            "model": os.environ.get("GAIA_MODEL", "gpt-5.6-luna"),
-            "reasoning_effort": os.environ.get("GAIA_REASONING_EFFORT", "max"),
+            "model": os.environ.get("GAIA_MODEL", "gpt-6.1-sol"),
+            "reasoning_effort": os.environ.get("GAIA_REASONING_EFFORT", "low"),
             "quality_policy": os.environ.get("GAIA_QUALITY_POLICY", "benchmark"),
             "sample_size": os.environ.get("GAIA_SAMPLE_SIZE", "15"),
             "seed": os.environ.get("GAIA_SEED", "42"),

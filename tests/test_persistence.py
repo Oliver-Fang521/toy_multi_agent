@@ -19,6 +19,24 @@ from gaia_agent.observability import TaskTraceOutcome
 from gaia_agent.persistence import PublicNote, RunManifest, RunStore
 
 
+def test_response_diagnostic_audit_is_strictly_allowlisted():
+    from gaia_agent.persistence import _public_audit_payload
+
+    payload = {
+        "stage": "specialist",
+        "phase": "repair",
+        "code": "schema",
+        "response_status": "incomplete",
+        "incomplete_reason": "max_output_tokens",
+    }
+    assert _public_audit_payload("stage_response_diagnostic", payload) == payload
+    for key in ("phase", "code", "response_status", "incomplete_reason"):
+        with pytest.raises(ValueError):
+            _public_audit_payload("stage_response_diagnostic", {**payload, key: "PRIVATE"})
+    with pytest.raises(ValueError):
+        _public_audit_payload("stage_response_diagnostic", {**payload, "raw_output": "PRIVATE"})
+
+
 def manifest_for(task_ids: list[str]) -> RunManifest:
     return RunManifest(
         selected_task_ids=tuple(task_ids),
@@ -122,9 +140,7 @@ def test_corrupt_or_incomplete_checkpoint_records_are_not_resumed(tmp_path, pred
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id, "task-2"]))
     store.append(prediction)
     store.predictions_path.write_text(
-        store.predictions_path.read_text()
-        + '{"task_id":"task-2","level":2}\n'
-        + "not-json\n",
+        store.predictions_path.read_text() + '{"task_id":"task-2","level":2}\n' + "not-json\n",
         encoding="utf-8",
     )
 
@@ -221,7 +237,9 @@ def test_parseable_invalid_duplicate_makes_a_task_incomplete_until_next_append_r
     assert store.predictions_path.read_text().count("\n") == 2
 
 
-def test_unparseable_checkpoint_line_fails_safe_until_next_append_repairs(tmp_path, prediction) -> None:
+def test_unparseable_checkpoint_line_fails_safe_until_next_append_repairs(
+    tmp_path, prediction
+) -> None:
     store = RunStore.create(tmp_path, manifest_for(["task-1", "task-2"]))
     second = prediction.model_copy(update={"task_id": "task-2", "level": 2})
     store.append(prediction)
@@ -294,7 +312,9 @@ def test_langfuse_safe_output_has_no_private_checkpoint_fields() -> None:
     assert {"candidate", "checkpoint", "evidence"}.isdisjoint(output)
 
 
-def test_prediction_level_must_match_manifest_on_append_resume_and_integrity(tmp_path, prediction) -> None:
+def test_prediction_level_must_match_manifest_on_append_resume_and_integrity(
+    tmp_path, prediction
+) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
     wrong_level = prediction.model_copy(update={"level": 2})
 
@@ -320,7 +340,9 @@ def test_manifest_level_mapping_participates_in_resume_identity(tmp_path) -> Non
         RunStore.open(tmp_path, changed_levels)
 
 
-def test_artifact_inputs_reject_unknown_keys_and_nested_arbitrary_text(tmp_path, prediction) -> None:
+def test_artifact_inputs_reject_unknown_keys_and_nested_arbitrary_text(
+    tmp_path, prediction
+) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
 
     with pytest.raises(TypeError, match="AgentPlan"):
@@ -352,7 +374,9 @@ def test_manifest_rejects_markdown_injection_in_public_strings() -> None:
         )
 
 
-def test_task_six_terminal_not_run_prediction_and_audit_are_publicly_reportable(tmp_path, prediction) -> None:
+def test_task_six_terminal_not_run_prediction_and_audit_are_publicly_reportable(
+    tmp_path, prediction
+) -> None:
     from gaia_agent.reporting import summarize, write_reports
 
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
@@ -448,9 +472,7 @@ def test_read_webpage_search_fallback_audit_shape_is_public_and_allowlisted(
     assert '"result_keys":["answer","fallback","sources","url"]' in audit
 
 
-def test_recoverable_tool_failure_audit_is_public_and_integrity_safe(
-    tmp_path, prediction
-) -> None:
+def test_recoverable_tool_failure_audit_is_public_and_integrity_safe(tmp_path, prediction) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
     store.append_audit(
         prediction.task_id,
@@ -521,7 +543,9 @@ def test_restored_tool_audit_is_public_and_integrity_safe(tmp_path, prediction) 
     assert "gated question" not in audit
 
 
-def test_manifest_rejects_known_environment_secrets_in_all_public_identifiers(tmp_path, monkeypatch) -> None:
+def test_manifest_rejects_known_environment_secrets_in_all_public_identifiers(
+    tmp_path, monkeypatch
+) -> None:
     secret = "env-private-value"
     monkeypatch.setenv("OPENAI_API_KEY", secret)
     values = {
@@ -546,7 +570,9 @@ def test_manifest_rejects_known_environment_secrets_in_all_public_identifiers(tm
     assert safe.manifest_path.exists()
 
 
-def test_bounded_task_four_results_are_allowed_only_as_the_shared_shape(tmp_path, prediction) -> None:
+def test_bounded_task_four_results_are_allowed_only_as_the_shared_shape(
+    tmp_path, prediction
+) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
     for sequence, tool, argument_keys in (
         (1, "execute_python", ["instruction", "paths"]),
@@ -615,17 +641,34 @@ def test_persistence_accepts_bounded_orchestrator_reliability_audit_events(
     assert f'"event_type":"{event_type}"' in audit
 
 
-def test_not_run_requires_an_incorrect_terminal_failure_and_audit_context(tmp_path, prediction) -> None:
+def test_not_run_requires_an_incorrect_terminal_failure_and_audit_context(
+    tmp_path, prediction
+) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
     invalid_predictions = (
         prediction.model_copy(
-            update={"answer": "unverified", "correct": False, "critic_verdict": "not_run", "error_category": TerminalErrorCategory.TIMEOUT}
+            update={
+                "answer": "unverified",
+                "correct": False,
+                "critic_verdict": "not_run",
+                "error_category": TerminalErrorCategory.TIMEOUT,
+            }
         ),
         prediction.model_copy(
-            update={"answer": None, "correct": False, "critic_verdict": "not_run", "error_category": None}
+            update={
+                "answer": None,
+                "correct": False,
+                "critic_verdict": "not_run",
+                "error_category": None,
+            }
         ),
         prediction.model_copy(
-            update={"answer": None, "correct": True, "critic_verdict": "not_run", "error_category": TerminalErrorCategory.TIMEOUT}
+            update={
+                "answer": None,
+                "correct": True,
+                "critic_verdict": "not_run",
+                "error_category": TerminalErrorCategory.TIMEOUT,
+            }
         ),
     )
     for item in invalid_predictions:
@@ -654,7 +697,9 @@ def test_not_run_requires_an_incorrect_terminal_failure_and_audit_context(tmp_pa
         )
 
 
-@pytest.mark.parametrize("identifier", ["tokenizers", "secretariat", "passwordless", "api-key-docs"])
+@pytest.mark.parametrize(
+    "identifier", ["tokenizers", "secretariat", "passwordless", "api-key-docs"]
+)
 def test_ordinary_public_identifiers_are_not_rejected_as_secrets(identifier) -> None:
     manifest = RunManifest(
         selected_task_ids=("task-1",),
@@ -669,7 +714,9 @@ def test_ordinary_public_identifiers_are_not_rejected_as_secrets(identifier) -> 
     assert manifest.model == identifier
 
 
-@pytest.mark.parametrize("identifier", ["sk-credentialvalue", "hf_credentialvalue", "Bearer credentialvalue"])
+@pytest.mark.parametrize(
+    "identifier", ["sk-credentialvalue", "hf_credentialvalue", "Bearer credentialvalue"]
+)
 def test_credential_shaped_public_identifiers_are_rejected(identifier) -> None:
     with pytest.raises(ValidationError, match="public"):
         RunManifest(
@@ -683,7 +730,9 @@ def test_credential_shaped_public_identifiers_are_rejected(identifier) -> None:
         )
 
 
-def test_terminal_failure_rejects_extra_known_verdict_without_persisting(tmp_path, prediction) -> None:
+def test_terminal_failure_rejects_extra_known_verdict_without_persisting(
+    tmp_path, prediction
+) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
 
     with pytest.raises(ValueError, match="terminal_failure"):
@@ -707,12 +756,25 @@ def test_terminal_failure_rejects_extra_known_verdict_without_persisting(tmp_pat
 @pytest.mark.parametrize(
     ("event_type", "payload"),
     [
-        ("terminal_failure", {"category": "timeout", "critic_verdict": "not_run", "verdict": "approve"}),
+        (
+            "terminal_failure",
+            {"category": "timeout", "critic_verdict": "not_run", "verdict": "approve"},
+        ),
         ("verify_completed", {"verdict": "approve", "category": "timeout"}),
-        ("tool_call_started", {"tool": "web_search", "call_number": 1, "argument_keys": ["query"], "result_keys": ["answer", "sources"]}),
+        (
+            "tool_call_started",
+            {
+                "tool": "web_search",
+                "call_number": 1,
+                "argument_keys": ["query"],
+                "result_keys": ["answer", "sources"],
+            },
+        ),
     ],
 )
-def test_audit_event_rejects_known_keys_from_the_wrong_event(tmp_path, prediction, event_type, payload) -> None:
+def test_audit_event_rejects_known_keys_from_the_wrong_event(
+    tmp_path, prediction, event_type, payload
+) -> None:
     store = RunStore.create(tmp_path, manifest_for([prediction.task_id]))
 
     with pytest.raises(ValueError):

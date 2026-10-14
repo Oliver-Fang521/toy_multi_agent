@@ -71,9 +71,7 @@ _SAFE_RETRY_CATEGORIES = frozenset(
 _SAFE_RETRY_DECISIONS = frozenset(
     {"not_needed", "retry", "recovered", "exhausted", "not_retryable"}
 )
-_SAFE_RETRY_REASONS = frozenset(
-    {"provider_transient_exhausted", "timeout", "task_transient"}
-)
+_SAFE_RETRY_REASONS = frozenset({"provider_transient_exhausted", "timeout", "task_transient"})
 _SAFE_TERMINAL_ROUTES = frozenset(
     {"submit", "recovered_submit", "checkpoint_restored", "terminal_failure"}
 )
@@ -196,6 +194,7 @@ _SAFE_IO_KEYS = frozenset(
 )
 _SAFE_SUMMARY_KEYS = frozenset(
     {
+        "response_diagnostics",
         "route",
         "specialist",
         "specialists",
@@ -419,9 +418,7 @@ def _safe_trace_decision(key: str, value: Any) -> Any:
     if key == "http_status":
         return (
             value
-            if isinstance(value, int)
-            and not isinstance(value, bool)
-            and 100 <= value <= 599
+            if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599
             else None
         )
     minimum = 1 if key == "attempt_count" else 0
@@ -503,14 +500,16 @@ def _sanitize_io(value: dict[str, object] | None) -> dict[str, object]:
             continue
         elif key not in _SAFE_IO_KEYS:
             continue
-        if key.endswith("_count") and isinstance(raw_value, int) and not isinstance(raw_value, bool):
+        if (
+            key.endswith("_count")
+            and isinstance(raw_value, int)
+            and not isinstance(raw_value, bool)
+        ):
             safe[key] = max(0, raw_value)
         elif key.endswith("_keys") and isinstance(raw_value, (list, tuple)):
-            safe[key] = [
-                item[:_MAX_STRING_LENGTH]
-                for item in raw_value
-                if isinstance(item, str)
-            ][:32]
+            safe[key] = [item[:_MAX_STRING_LENGTH] for item in raw_value if isinstance(item, str)][
+                :32
+            ]
     return safe
 
 
@@ -554,7 +553,32 @@ def _sanitize_summary(value: dict[str, object] | None) -> dict[str, object]:
         key = str(raw_key)
         if key not in _SAFE_SUMMARY_KEYS:
             continue
-        if key == "stage":
+        if key == "response_diagnostics":
+            allowed = {
+                "phase": {"initial", "repair"},
+                "code": {
+                    "valid",
+                    "schema",
+                    "role_mismatch",
+                    "evidence_shape",
+                    "source_url_missing",
+                    "candidate_format",
+                    "checked_evidence",
+                },
+                "response_status": {"completed", "incomplete", "failed", "unknown"},
+                "incomplete_reason": {"none", "max_output_tokens", "content_filter", "other"},
+            }
+            if isinstance(raw_value, (list, tuple)):
+                safe[key] = [
+                    {field: item[field] for field in allowed}
+                    for item in raw_value[:2]
+                    if isinstance(item, dict)
+                    and all(
+                        isinstance(item.get(field), str) and item[field] in values
+                        for field, values in allowed.items()
+                    )
+                ]
+        elif key == "stage":
             if raw_value in _SAFE_STAGE_NAMES:
                 safe[key] = raw_value
         elif key == "remaining_bucket":
@@ -616,19 +640,20 @@ def _sanitize_summary(value: dict[str, object] | None) -> dict[str, object]:
             elif key == "specialist":
                 if raw_value in _SAFE_SPECIALISTS:
                     safe[key] = raw_value
-            elif (
-                key in {"verdict", "decision"}
-                and raw_value in _SAFE_SUMMARY_DECISIONS
-            ):
+            elif key in {"verdict", "decision"} and raw_value in _SAFE_SUMMARY_DECISIONS:
                 safe[key] = raw_value
         elif isinstance(raw_value, (list, tuple)):
             if key == "stages":
                 safe[key] = [
-                    item for item in raw_value if isinstance(item, str) and item in _SAFE_ROOT_STAGES
+                    item
+                    for item in raw_value
+                    if isinstance(item, str) and item in _SAFE_ROOT_STAGES
                 ][:16]
             elif key == "specialists":
                 safe[key] = [
-                    item for item in raw_value if isinstance(item, str) and item in _SAFE_SPECIALISTS
+                    item
+                    for item in raw_value
+                    if isinstance(item, str) and item in _SAFE_SPECIALISTS
                 ][:32]
             elif key == "tool_names":
                 safe[key] = [
@@ -755,7 +780,9 @@ class Span:
         self._pending_summary = None
         self._closed = True
         if self._on_end is not None:
-            self._on_end(final_metadata["status"], final_metadata, usage, time.monotonic() - self._started_at)
+            self._on_end(
+                final_metadata["status"], final_metadata, usage, time.monotonic() - self._started_at
+            )
         if self._observation is None:
             return
         try:
@@ -937,8 +964,12 @@ class TaskTrace:
             provider_retry_count=_bounded_count(
                 outcome.provider_retry_count + self._provider_retry_count
             ),
-            tool_success_count=_bounded_count(outcome.tool_success_count + self._tool_success_count),
-            tool_failure_count=_bounded_count(outcome.tool_failure_count + self._tool_failure_count),
+            tool_success_count=_bounded_count(
+                outcome.tool_success_count + self._tool_success_count
+            ),
+            tool_failure_count=_bounded_count(
+                outcome.tool_failure_count + self._tool_failure_count
+            ),
             provider_latency_ms=_bounded_latency_ms(
                 outcome.provider_latency_ms + self._provider_latency_seconds * 1000
             ),
@@ -969,7 +1000,9 @@ class TaskTrace:
 class Observability:
     """Own a Langfuse client while keeping all SDK failures outside the evaluation path."""
 
-    def __init__(self, config: ObservabilityConfig | None = None, *, client: Any | None = None) -> None:
+    def __init__(
+        self, config: ObservabilityConfig | None = None, *, client: Any | None = None
+    ) -> None:
         self.config = config or ObservabilityConfig.from_env()
         self.client: Any | None = None
         if client is not None:

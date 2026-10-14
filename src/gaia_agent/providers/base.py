@@ -33,7 +33,9 @@ class SafeToolFailure(FrozenModel):
             category=category if isinstance(category, str) else "tool_error",
             retryable=bool(getattr(error, "retryable", False)),
             provider=provider if isinstance(provider, str) else None,
-            attempt_count=attempt_count if isinstance(attempt_count, int) and attempt_count > 0 else 1,
+            attempt_count=attempt_count
+            if isinstance(attempt_count, int) and attempt_count > 0
+            else 1,
             http_status=http_status if isinstance(http_status, int) else None,
         )
 
@@ -70,7 +72,7 @@ class ModelRequest(FrozenModel):
     allowed_tools: tuple[ToolSpec, ...] = ()
     max_output_tokens: int = Field(default=2_000, gt=0)
     max_tool_calls: int = Field(default=8, ge=0)
-    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
 
     @field_validator("output_schema")
     @classmethod
@@ -107,6 +109,8 @@ class ToolEvent(FrozenModel):
 
 
 class ModelResponse(FrozenModel):
+    response_status: Literal["completed", "incomplete", "failed", "unknown"] = "unknown"
+    incomplete_reason: Literal["none", "max_output_tokens", "content_filter", "other"] = "none"
     parsed: dict[str, Any] | None = None
     output_text: str = ""
     usage: Usage = Field(default_factory=Usage)
@@ -218,13 +222,10 @@ def _bind_complete_call(
         complete_signature.bind(*positional, **executor_kwargs)
         return positional, executor_kwargs
 
-    observer_kwargs = (
-        {"usage_observer": usage_observer} if supports_observer else {}
-    )
+    observer_kwargs = {"usage_observer": usage_observer} if supports_observer else {}
     executor_parameter = complete_signature.parameters.get("executor")
     positional_executor = (
-        executor_parameter is None
-        or executor_parameter.kind is Parameter.POSITIONAL_ONLY
+        executor_parameter is None or executor_parameter.kind is Parameter.POSITIONAL_ONLY
     )
     candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = (
         [
@@ -244,9 +245,7 @@ def _bind_complete_call(
                 ((), {"request": request, **observer_kwargs}),
             ]
         )
-    candidates.append(
-        ((), {"request": request, "executor": executor, **observer_kwargs})
-    )
+    candidates.append(((), {"request": request, "executor": executor, **observer_kwargs}))
     if request_name := _keyword_only_request_name(complete_signature):
         candidates.append(
             (
@@ -268,7 +267,9 @@ def _bind_complete_call(
             last_error = error
             continue
         return args, kwargs
-    raise TypeError("provider complete signature is incompatible with ModelProvider") from last_error
+    raise TypeError(
+        "provider complete signature is incompatible with ModelProvider"
+    ) from last_error
 
 
 def _keyword_executor_arguments(

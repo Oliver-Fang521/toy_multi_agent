@@ -847,9 +847,9 @@ def build_runner(
 
     validate_config(config)
     if not injected_dataset and (
-        config.model != "gpt-5.6-luna" or config.reasoning_effort != "max"
+        config.model != "gpt-6.1-sol" or config.reasoning_effort != "low"
     ):
-        raise ValueError("production evaluation requires model=gpt-5.6-luna and reasoning_effort=max")
+        raise ValueError("production evaluation requires model=gpt-6.1-sol and reasoning_effort=low")
     observability_config = ObservabilityConfig.from_env()
     observability = Observability(
         replace(

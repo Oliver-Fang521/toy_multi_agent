@@ -14,6 +14,26 @@ from gaia_agent.observability import Observability, ObservabilityConfig, TaskTra
 from gaia_agent.runner import EvaluationRunner
 
 
+def test_response_diagnostics_summary_rejects_content_and_unknown_values():
+    from gaia_agent.observability import _sanitize_summary
+
+    diagnostic = {
+        "phase": "repair",
+        "code": "schema",
+        "response_status": "incomplete",
+        "incomplete_reason": "max_output_tokens",
+        "raw_output": "PRIVATE",
+    }
+    safe = _sanitize_summary(
+        {"response_diagnostics": [diagnostic, {**diagnostic, "code": "PRIVATE"}]}
+    )
+    assert safe == {
+        "response_diagnostics": [
+            {key: value for key, value in diagnostic.items() if key != "raw_output"}
+        ]
+    }
+
+
 class _FakeObservation:
     def __init__(self, *, name: str, as_type: str, kwargs: dict[str, Any]) -> None:
         self.name = name
@@ -201,7 +221,9 @@ async def test_runner_marks_root_checkpoint_recovery_from_the_checkpoint_event(
     from gaia_agent.config import RunConfig
 
     tasks = [
-        GaiaTask(task_id=f"checkpoint-trace-{level}", question="private", level=level, final_answer="a")
+        GaiaTask(
+            task_id=f"checkpoint-trace-{level}", question="private", level=level, final_answer="a"
+        )
         for level in (1, 2, 3)
     ]
 
@@ -600,7 +622,9 @@ async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
     from gaia_agent import runner as runner_module
 
     tasks = [
-        GaiaTask(task_id=f"trace-task-{level}", question="private", level=level, final_answer="answer")
+        GaiaTask(
+            task_id=f"trace-task-{level}", question="private", level=level, final_answer="answer"
+        )
         for level in (1, 2, 3)
     ]
     config = __import__("gaia_agent.config", fromlist=["RunConfig"]).RunConfig(
@@ -620,7 +644,9 @@ async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
         audit_events: tuple[()] = ()
 
         async def run(self, active_task: GaiaTask) -> TaskPrediction:
-            return prediction.model_copy(update={"task_id": active_task.task_id, "level": active_task.level})
+            return prediction.model_copy(
+                update={"task_id": active_task.task_id, "level": active_task.level}
+            )
 
     client = _FakeClient()
     observability = Observability(
@@ -638,7 +664,9 @@ async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
     def score(answer: str | None, reference: str) -> bool:
         assert answer == "answer"
         assert reference == "answer"
-        roots = [observation for observation in client.observations if observation.name == "gaia-task"]
+        roots = [
+            observation for observation in client.observations if observation.name == "gaia-task"
+        ]
         assert not roots[-1].ended
         return True
 
@@ -651,8 +679,8 @@ async def test_runner_finishes_one_task_root_after_scoring_and_persistence(
     assert root.kwargs["metadata"] == {
         "task_id": "trace-task-1",
         "level": 1,
-            "model": "gpt-5.6-luna",
-            "reasoning_effort": "max",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "low",
         "run_id": "gaia-seed42-n3",
         "attempt_number": 1,
         "evaluation_mode": "test",
@@ -696,7 +724,9 @@ async def test_runner_traces_resumed_selected_tasks_with_persisted_outcomes(
     from gaia_agent.config import RunConfig
 
     tasks = [
-        GaiaTask(task_id=f"resume-task-{level}", question="private", level=level, final_answer="answer")
+        GaiaTask(
+            task_id=f"resume-task-{level}", question="private", level=level, final_answer="answer"
+        )
         for level in (1, 2, 3)
     ]
     config = RunConfig(
@@ -738,7 +768,9 @@ async def test_runner_traces_resumed_selected_tasks_with_persisted_outcomes(
     await resumed._run()
 
     roots = [observation for observation in client.observations if observation.name == "gaia-task"]
-    assert [root.kwargs["metadata"]["task_id"] for root in roots] == [task.task_id for task in tasks]
+    assert [root.kwargs["metadata"]["task_id"] for root in roots] == [
+        task.task_id for task in tasks
+    ]
     assert all(root.ended for root in roots)
     assert all(root.updates[-1]["output"]["correct"] is True for root in roots)
 
@@ -753,7 +785,9 @@ async def test_runner_root_records_recovered_attempt_and_resume_reuses_that_numb
     from gaia_agent.models import TerminalErrorCategory
 
     tasks = [
-        GaiaTask(task_id=f"recover-trace-{level}", question="private", level=level, final_answer="a")
+        GaiaTask(
+            task_id=f"recover-trace-{level}", question="private", level=level, final_answer="a"
+        )
         for level in (1, 2, 3)
     ]
     config = RunConfig(
@@ -837,9 +871,7 @@ async def test_runner_root_records_recovered_attempt_and_resume_reuses_that_numb
             client=resumed_client,
         ),
     )._run()
-    resumed_root = next(
-        item for item in resumed_client.observations if item.name == "gaia-task"
-    )
+    resumed_root = next(item for item in resumed_client.observations if item.name == "gaia-task")
     assert resumed_root.kwargs["metadata"]["attempt_number"] == 2
     assert resumed_root.updates[-1]["output"]["terminal_route"] == "recovered_submit"
     assert resumed_root.updates[-1]["output"]["checkpoint_restored"] is False
@@ -855,7 +887,9 @@ async def test_runner_records_safe_failure_when_persistence_fails(
     from gaia_agent.config import RunConfig
 
     tasks = [
-        GaiaTask(task_id=f"persist-task-{level}", question="private", level=level, final_answer="answer")
+        GaiaTask(
+            task_id=f"persist-task-{level}", question="private", level=level, final_answer="answer"
+        )
         for level in (1, 2, 3)
     ]
     config = RunConfig(
@@ -879,7 +913,9 @@ async def test_runner_records_safe_failure_when_persistence_fails(
     client = _FakeClient()
     monkeypatch.setattr(runner_module, "sample_stratified", lambda *_args: tasks)
     monkeypatch.setattr(runner_module, "question_scorer", lambda *_args: True)
-    monkeypatch.setattr(runner_module, "_persist_task_artifacts", lambda *_args: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(
+        runner_module, "_persist_task_artifacts", lambda *_args: (_ for _ in ()).throw(OSError())
+    )
     runner = EvaluationRunner(
         config=config,
         dataset_loader=lambda _config: (tasks, "revision"),

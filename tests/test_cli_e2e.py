@@ -791,7 +791,7 @@ def test_build_runner_applies_configured_retry_policy_to_openai(
     assert policy.base_delay_seconds == 1.25
 
 
-def test_build_runner_rejects_non_luna_max_production_configuration(
+def test_build_runner_rejects_non_sol_low_production_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -801,11 +801,11 @@ def test_build_runner_rejects_non_luna_max_production_configuration(
         lambda **_: pytest.fail("production client must not be constructed for rejected config"),
     )
 
-    with pytest.raises(ValueError, match="requires model=gpt-5.6-luna"):
+    with pytest.raises(ValueError, match="requires model=gpt-6.1-sol"):
         build_runner(_config(tmp_path, model="other-model", reasoning_effort="high"))
 
 
-def test_build_runner_composes_luna_max_for_every_production_stage(
+def test_build_runner_composes_sol_low_for_every_production_stage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -838,12 +838,12 @@ def test_build_runner_composes_luna_max_for_every_production_stage(
         GaiaTask(task_id="offline-l1", question="Synthetic", level=1, final_answer="unused")
     )
 
-    assert captured_models == ["gpt-5.6-luna"]
-    assert orchestrator._planner.reasoning_effort == "max"
-    assert {agent.reasoning_effort for agent in orchestrator._specialists.values()} == {"max"}
-    assert orchestrator._critic.reasoning_effort == "max"
+    assert captured_models == ["gpt-6.1-sol"]
+    assert orchestrator._planner.reasoning_effort == "low"
+    assert {agent.reasoning_effort for agent in orchestrator._specialists.values()} == {"low"}
+    assert orchestrator._critic.reasoning_effort == "low"
     assert isinstance(orchestrator._evidence_linker, EvidenceLinkerAgent)
-    assert orchestrator._evidence_linker.reasoning_effort == "max"
+    assert orchestrator._evidence_linker.reasoning_effort == "low"
     assert orchestrator._evidence_linker.max_context_bytes == config.stage_context_max_bytes
 
 
