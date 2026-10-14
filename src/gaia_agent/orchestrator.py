@@ -522,6 +522,7 @@ class Orchestrator:
         notebook: ResearchNotebook | None = None,
         evidence_linker: EvidenceLinker | None = None,
         stage_runtime: VoteStageRuntime | None = None,
+        on_progress: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         if config.max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -548,6 +549,13 @@ class Orchestrator:
         self.tool_call_count = 0
         self._invocation_deadline: InvocationDeadline | None = None
         self._graph = self._build_graph()
+        self._on_progress = on_progress
+        self._result_evidence: tuple[Evidence, ...] = ()
+
+    @property
+    def result_evidence(self) -> tuple[Evidence, ...]:
+        """Private evidence for the owner of the most recently completed task."""
+        return self._result_evidence
 
     @property
     def audit_events(self) -> tuple[AuditEvent, ...]:
@@ -566,6 +574,7 @@ class Orchestrator:
         return checkpoint.usage if checkpoint is not None else None
 
     async def run(self, task: GaiaTask) -> TaskPrediction:
+        self._result_evidence = ()
         with invocation_deadline_scope(self._invocation_deadline):
             return await self._run(task)
 
@@ -702,6 +711,7 @@ class Orchestrator:
                 self._refresh_checkpoint_accounting(state, budgeted_tools)
             raise cancellation
         if prediction is not None:
+            self._result_evidence = tuple(state.evidence)
             return prediction.model_copy(
                 update={
                     "duration_seconds": self._now() - started,
@@ -1852,6 +1862,11 @@ class Orchestrator:
                 payload=payload,
             )
         )
+        if self._on_progress is not None:
+            try:
+                self._on_progress(event_type, dict(payload))
+            except Exception:  # noqa: BLE001,S110 - never expose private progress errors
+                pass
 
     def _stage_operational_summary(
         self,
