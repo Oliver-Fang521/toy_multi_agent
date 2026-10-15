@@ -49,3 +49,53 @@ def test_rotation_restart_and_no_plaintext_in_database_or_wal(vault, tmp_path):
     reopened = CredentialVault(connection, vault.cipher, threading.RLock())
     assert reopened.read("alice", "model") == secret
     connection.close()
+
+
+def test_temporary_session_owner_expiry_restart_and_revocation(vault):
+    from gaia_agent.interactive.credential_sessions import CredentialSessions
+    from gaia_agent.interactive.credential_vault import CredentialMaterial
+
+    now = [10.0]
+    sessions = CredentialSessions(vault, lambda: now[0])
+    material = CredentialMaterial(SecretStr("synthetic-temporary-private-key-9981"))
+    handle = sessions.issue("alice", material)
+    ref = sessions.reference("alice", handle)
+    assert material.model.get_secret_value() not in repr(material) + repr(ref)
+    with pytest.raises(CredentialError):
+        sessions.reference("bob", handle)
+    now[0] = 1809
+    assert sessions.resolve(ref).model == material.model
+    now[0] = 1810
+    with pytest.raises(CredentialError, match="credential_expired"):
+        sessions.resolve(ref)
+    new_handle = sessions.issue("alice", material)
+    queued = sessions.reference("alice", new_handle)
+    sessions.invalidate("alice")
+    with pytest.raises(CredentialError, match="credential_revoked"):
+        sessions.resolve(queued)
+    with pytest.raises(CredentialError):
+        CredentialSessions(vault, lambda: now[0]).reference("alice", new_handle)
+    vault.put("alice", "model", material.model, consent=True)
+    saved_ref = sessions.reference("alice", None)
+    assert sessions.resolve(saved_ref).model == material.model
+    sessions.issue("alice", material)
+    with pytest.raises(CredentialError, match="credential_revoked"):
+        sessions.resolve(saved_ref)
+    sessions.close()
+
+
+def test_temporary_session_cap_and_expired_reclamation(vault):
+    from gaia_agent.interactive.credential_sessions import CredentialSessions
+    from gaia_agent.interactive.credential_vault import CredentialMaterial
+
+    now = [0.0]
+    sessions = CredentialSessions(vault, lambda: now[0])
+    material = CredentialMaterial(SecretStr("synthetic-cap-key-2239"))
+    for i in range(100):
+        sessions.issue(f"user-{i}", material)
+    sessions.issue("user-0", material)
+    with pytest.raises(CredentialError, match="credential_sessions_busy"):
+        sessions.issue("overflow", material)
+    now[0] = 1800
+    handle = sessions.issue("overflow", material)
+    assert sessions.resolve(sessions.reference("overflow", handle)).model == material.model
