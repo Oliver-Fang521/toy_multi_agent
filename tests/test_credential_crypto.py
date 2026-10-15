@@ -17,15 +17,24 @@ def test_aead_random_nonce_and_identity_integrity():
     assert cipher.decrypt("alice", "model", envelope) == secret
     assert secret.get_secret_value() not in repr(envelope)
     for owner, provider, value in [
-        ("bob", "model", envelope), ("alice", "serper", envelope),
+        ("bob", "model", envelope),
+        ("alice", "serper", envelope),
         ("alice", "model", replace(envelope, version="v2")),
-        ("alice", "model", replace(envelope, ciphertext=envelope.ciphertext[:-1] + bytes([envelope.ciphertext[-1] ^ 1]))),
+        (
+            "alice",
+            "model",
+            replace(
+                envelope, ciphertext=envelope.ciphertext[:-1] + bytes([envelope.ciphertext[-1] ^ 1])
+            ),
+        ),
     ]:
         with pytest.raises(CredentialError, match="credential_integrity"):
             cipher.decrypt(owner, provider, value)
 
 
-@pytest.mark.parametrize("keys,active", [({}, "v1"), ({"v1": b"a" * 31}, "v1"), ({"v1": b"a" * 32}, "missing")])
+@pytest.mark.parametrize(
+    "keys,active", [({}, "v1"), ({"v1": b"a" * 31}, "v1"), ({"v1": b"a" * 32}, "missing")]
+)
 def test_master_keys_fail_closed(keys, active):
     with pytest.raises(CredentialError, match="credential_configuration"):
         KeyCipher(keys, active)

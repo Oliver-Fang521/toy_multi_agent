@@ -46,6 +46,7 @@ def test_rotation_restart_and_no_plaintext_in_database_or_wal(vault, tmp_path):
         assert secret.get_secret_value().encode() not in path.read_bytes()
     connection = sqlite3.connect(tmp_path / "vault.sqlite")
     import threading
+
     reopened = CredentialVault(connection, vault.cipher, threading.RLock())
     assert reopened.read("alice", "model") == secret
     connection.close()

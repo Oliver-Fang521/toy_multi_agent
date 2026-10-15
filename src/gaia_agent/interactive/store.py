@@ -109,7 +109,9 @@ class ConversationStore:
 
     def lookup(self, owner: str, cid: str, request: InteractiveRequest, idem: str) -> dict | None:
         self.get(owner, cid)
-        row = self.db.execute("SELECT id,fingerprint FROM runs WHERE owner=? AND idem=?", (owner, idem)).fetchone()
+        row = self.db.execute(
+            "SELECT id,fingerprint FROM runs WHERE owner=? AND idem=?", (owner, idem)
+        ).fetchone()
         if row is None:
             return None
         fingerprint = hashlib.sha256((cid + request.model_dump_json()).encode()).hexdigest()
@@ -171,10 +173,16 @@ class ConversationStore:
         messages = []
         for row in rows[:100]:
             result = json.loads(row[1])
-            messages.extend([
-                {"role": "user", "content": row[0]},
-                {"role": "assistant", "content": result["answer"], "evidence": result.get("evidence", [])},
-            ])
+            messages.extend(
+                [
+                    {"role": "user", "content": row[0]},
+                    {
+                        "role": "assistant",
+                        "content": result["answer"],
+                        "evidence": result.get("evidence", []),
+                    },
+                ]
+            )
         return {"messages": messages, "next_offset": offset + 100 if len(rows) > 100 else None}
 
     def history(self, owner: str, cid: str) -> list[dict[str, str]]:

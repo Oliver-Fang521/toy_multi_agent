@@ -17,12 +17,23 @@ class RunService:
         self.slots = asyncio.Semaphore(2)
         self.credential_sessions = credential_sessions
 
-    def start(self, owner: str, cid: str, request: InteractiveRequest, idem: str, *, credential_ref=None, credential_handle=None) -> dict:
+    def start(
+        self,
+        owner: str,
+        cid: str,
+        request: InteractiveRequest,
+        idem: str,
+        *,
+        credential_ref=None,
+        credential_handle=None,
+    ) -> dict:
         existing = self.store.lookup(owner, cid, request, idem)
         if existing is not None:
             return existing
         if self.credential_sessions is not None:
-            credential_ref = credential_ref or self.credential_sessions.reference(owner, credential_handle)
+            credential_ref = credential_ref or self.credential_sessions.reference(
+                owner, credential_handle
+            )
             if credential_ref.owner != owner:
                 raise CredentialError("credential_required", 422)
             self.credential_sessions.resolve(credential_ref)
@@ -59,7 +70,11 @@ class RunService:
                         lambda event, payload: self.store.progress(identifier, event, payload),
                         registered,
                     )
-                    result = await self.execute(credential_ref, *args) if self.credential_sessions is not None else await self.execute(*args)
+                    result = (
+                        await self.execute(credential_ref, *args)
+                        if self.credential_sessions is not None
+                        else await self.execute(*args)
+                    )
                 self.store.update(
                     identifier, status="completed", result=result.model_dump(mode="json")
                 )
@@ -99,7 +114,11 @@ class RunService:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def cancel_owner(self, owner: str):
-        identifiers = [row[0] for row in self.store.db.execute(
-            "SELECT id FROM runs WHERE owner=? AND status IN ('queued','running')", (owner,))]
+        identifiers = [
+            row[0]
+            for row in self.store.db.execute(
+                "SELECT id FROM runs WHERE owner=? AND status IN ('queued','running')", (owner,)
+            )
+        ]
         for identifier in identifiers:
             await self.cancel(owner, identifier)

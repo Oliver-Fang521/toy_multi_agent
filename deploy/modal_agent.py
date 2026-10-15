@@ -1,4 +1,5 @@
 """Deploy with: modal deploy deploy/modal_agent.py (named secret required)."""
+
 from pathlib import Path
 
 import modal
@@ -14,9 +15,16 @@ image = (
 )
 
 
-@app.function(image=image, secrets=[modal.Secret.from_name("toy-agent-web-runtime")],
-              volumes={"/data": volume}, max_containers=1, timeout=600,
-              scaledown_window=600, cpu=1, memory=1024)
+@app.function(
+    image=image,
+    secrets=[modal.Secret.from_name("toy-agent-web-byok-runtime")],
+    volumes={"/data": volume},
+    max_containers=1,
+    timeout=600,
+    scaledown_window=600,
+    cpu=1,
+    memory=1024,
+)
 @modal.concurrent(max_inputs=50)
 @modal.asgi_app()
 def web():
@@ -35,6 +43,7 @@ def web():
                 await asyncio.sleep(15)
                 instance.state.service.store.db.execute("PRAGMA wal_checkpoint(FULL)")
                 await volume.commit.aio()
+
         async with original_lifespan(instance):
             worker = asyncio.create_task(checkpoint())
             try:

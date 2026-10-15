@@ -5,7 +5,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
 
 from gaia_agent.interactive.credential_vault import (
-    CredentialError, CredentialMaterial, ProviderName, validate_secret,
+    CredentialError,
+    CredentialMaterial,
+    ProviderName,
+    validate_secret,
 )
 
 
@@ -17,6 +20,13 @@ class SaveCredential(_Body):
     provider: ProviderName
     key: SecretStr
     consent: Literal[True]
+
+    @field_validator("consent", mode="before")
+    @classmethod
+    def explicit_consent(cls, value):
+        if value is not True:
+            raise CredentialError("consent_required", 422)
+        return value
 
     @field_validator("key")
     @classmethod
@@ -42,14 +52,19 @@ class TemporaryCredentials(_Body):
         return value
 
 
-def mount_credential_routes(app, *, owner_dependency, vault, sessions, cancel_owner, provider_hostname):
+def mount_credential_routes(
+    app, *, owner_dependency, vault, sessions, cancel_owner, provider_hostname
+):
     @app.exception_handler(CredentialError)
     async def credential_error(request, error):
         return JSONResponse({"error": error.code}, status_code=error.status_code)
 
     @app.get("/v1/credentials")
     async def status(user=owner_dependency):
-        return {"provider_hostname": provider_hostname, "statuses": [asdict(s) for s in vault.status(user)]}
+        return {
+            "provider_hostname": provider_hostname,
+            "statuses": [asdict(s) for s in vault.status(user)],
+        }
 
     async def mutate(user, action):
         if user in sessions.mutating:
@@ -65,16 +80,28 @@ def mount_credential_routes(app, *, owner_dependency, vault, sessions, cancel_ow
 
     @app.post("/v1/credentials")
     async def save(body: SaveCredential, user=owner_dependency):
-        return await mutate(user, lambda: asdict(vault.put(user, body.provider, body.key, consent=body.consent)))
+        return await mutate(
+            user, lambda: asdict(vault.put(user, body.provider, body.key, consent=body.consent))
+        )
 
     @app.post("/v1/credentials/delete")
     async def delete(body: DeleteCredential, user=owner_dependency):
         def action():
             vault.delete(user, body.provider)
             return {"deleted": True}
+
         return await mutate(user, action)
 
     @app.post("/v1/credential-sessions")
     async def temporary(body: TemporaryCredentials, user=owner_dependency):
-        return await mutate(user, lambda: {"handle": sessions.issue(user,
-            CredentialMaterial(body.model_key, body.serper_key, body.serpapi_key), _mutation=True), "expires_in": 1800})
+        return await mutate(
+            user,
+            lambda: {
+                "handle": sessions.issue(
+                    user,
+                    CredentialMaterial(body.model_key, body.serper_key, body.serpapi_key),
+                    _mutation=True,
+                ),
+                "expires_in": 1800,
+            },
+        )

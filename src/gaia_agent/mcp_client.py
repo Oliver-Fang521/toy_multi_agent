@@ -33,9 +33,7 @@ _PUBLIC_TOOLS = frozenset(
 _PUBLIC_TOOL_TRACE_ARGUMENT_KEYS = {
     "web_search": frozenset({"query"}),
     "read_webpage": frozenset({"url"}),
-    "execute_python": frozenset(
-        {"instruction", "code", "paths", "attachment_ids", "file_ids"}
-    ),
+    "execute_python": frozenset({"instruction", "code", "paths", "attachment_ids", "file_ids"}),
     "read_attachment": frozenset({"path"}),
     "transcribe_audio": frozenset({"path"}),
     "submit_answer": frozenset({"answer", "evidence_ids"}),
@@ -274,7 +272,9 @@ class MCPToolClient:
         trace_metadata = _safe_mcp_trace_metadata(getattr(result, "meta", None))
         if result.is_error:
             message = "\n".join(
-                content.text for content in result.content if getattr(content, "type", None) == "text"
+                content.text
+                for content in result.content
+                if getattr(content, "type", None) == "text"
             )
             safe = _safe_failure_payload(message)
             if safe is not None:
@@ -440,8 +440,12 @@ class MCPToolClient:
         for secret in (
             self._config.openai_api_key.get_secret_value(),
             self._config.hf_token.get_secret_value(),
-            (self._runtime_env if self._runtime_env is not None else os.environ).get("SERPER_API_KEY", ""),
-            (self._runtime_env if self._runtime_env is not None else os.environ).get("SERPAPI_API_KEY", ""),
+            (self._runtime_env if self._runtime_env is not None else os.environ).get(
+                "SERPER_API_KEY", ""
+            ),
+            (self._runtime_env if self._runtime_env is not None else os.environ).get(
+                "SERPAPI_API_KEY", ""
+            ),
             (self._runtime_env or {}).get("OPENAI_API_KEY", ""),
         ):
             if secret:
@@ -450,7 +454,12 @@ class MCPToolClient:
 
     def _redact_value(self, value: Any) -> Any:
         if isinstance(value, dict):
-            return {key: self._redact_value(item) for key, item in value.items()}
+            return {
+                self._redact(key)
+                if self._runtime_env is not None and isinstance(key, str)
+                else key: self._redact_value(item)
+                for key, item in value.items()
+            }
         if isinstance(value, list):
             return [self._redact_value(item) for item in value]
         if isinstance(value, str):
@@ -485,7 +494,11 @@ def _safe_failure_payload(message: str) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     required = {"error", "category", "retryable", "provider", "attempt_count"}
-    if not isinstance(value, dict) or not required.issubset(value) or value.get("error") != "tool_failed":
+    if (
+        not isinstance(value, dict)
+        or not required.issubset(value)
+        or value.get("error") != "tool_failed"
+    ):
         return None
     category = value["category"]
     provider = value["provider"]
@@ -499,7 +512,11 @@ def _safe_failure_payload(message: str) -> dict[str, Any] | None:
         and (not isinstance(provider, str) or provider not in _SAFE_SEARCH_PROVIDERS)
         or not _safe_count(attempt_count, minimum=1)
         or http_status is not None
-        and (not isinstance(http_status, int) or isinstance(http_status, bool) or not 100 <= http_status <= 599)
+        and (
+            not isinstance(http_status, int)
+            or isinstance(http_status, bool)
+            or not 100 <= http_status <= 599
+        )
     ):
         return None
     safe = {

@@ -3,7 +3,10 @@ import time
 from dataclasses import dataclass
 
 from gaia_agent.interactive.credential_vault import (
-    CredentialError, CredentialMaterial, CredentialRef, validate_secret,
+    CredentialError,
+    CredentialMaterial,
+    CredentialRef,
+    validate_secret,
 )
 
 

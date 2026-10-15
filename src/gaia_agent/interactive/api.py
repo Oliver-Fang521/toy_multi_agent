@@ -50,14 +50,23 @@ class RequestBoundary:
         headers = dict(scope["headers"])
         auth = headers.get(b"authorization", b"")
         user = headers.get(b"x-agent-user", b"")
-        if not hmac.compare_digest(auth, ("Bearer " + self.token).encode()) or not user or len(user) > 128 or any(c < 33 or c > 127 for c in user):
-            return await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+        if (
+            not hmac.compare_digest(auth, ("Bearer " + self.token).encode())
+            or not user
+            or len(user) > 128
+            or any(c < 33 or c > 127 for c in user)
+        ):
+            return await JSONResponse({"error": "unauthorized"}, status_code=401)(
+                scope, receive, send
+            )
         if scope["method"] != "POST":
             return await self.app(scope, receive, send)
         upload = scope["path"].endswith("/uploads")
         limit = MAX_UPLOAD_BYTES + 1024 * 1024 if upload else 64 * 1024
         if upload and self.active_uploads >= 2:
-            return await JSONResponse({"error": "service_busy"}, status_code=503)(scope, receive, send)
+            return await JSONResponse({"error": "service_busy"}, status_code=503)(
+                scope, receive, send
+            )
         if upload:
             self.active_uploads += 1
         try:
@@ -66,12 +75,16 @@ class RequestBoundary:
                 try:
                     message = await asyncio.wait_for(receive(), timeout=15)
                 except TimeoutError:
-                    return await JSONResponse({"error": "upload_timeout"}, status_code=408)(scope, receive, send)
+                    return await JSONResponse({"error": "upload_timeout"}, status_code=408)(
+                        scope, receive, send
+                    )
                 if message["type"] == "http.disconnect":
                     return
                 chunk = message.get("body", b"")
                 if len(body) + len(chunk) > limit:
-                    return await JSONResponse({"error": "file_too_large"}, status_code=413)(scope, receive, send)
+                    return await JSONResponse({"error": "file_too_large"}, status_code=413)(
+                        scope, receive, send
+                    )
                 body.extend(chunk)
                 if not message.get("more_body", False):
                     break
@@ -91,8 +104,13 @@ class RequestBoundary:
 
 
 def create_app(
-    root: Path | None = None, service_token: str | None = None, *, execute=None,
-    cipher=None, provider_hostname="", runtime_settings=None
+    root: Path | None = None,
+    service_token: str | None = None,
+    *,
+    execute=None,
+    cipher=None,
+    provider_hostname="",
+    runtime_settings=None,
 ) -> FastAPI:
     root = root or Path(os.environ.get("AGENT_DATA_DIR", "interactive-data"))
     token = service_token or os.environ.get("AGENT_SERVICE_TOKEN", "")
@@ -101,7 +119,9 @@ def create_app(
     production = execute is None
     if execute is None:
         try:
-            runtime_settings = runtime_settings or InteractiveRuntimeSettings(base_url=os.environ.get("AGENT_MODEL_BASE_URL", ""))
+            runtime_settings = runtime_settings or InteractiveRuntimeSettings(
+                base_url=os.environ.get("AGENT_MODEL_BASE_URL", "")
+            )
         except ValueError:
             raise CredentialError("credential_configuration", 503) from None
         cipher = cipher or cipher_from_environment()
@@ -157,9 +177,16 @@ def create_app(
         async def cancel_owner(user):
             await service.cancel_owner(user)
 
-        mount_credential_routes(app, owner_dependency=owner_dependency, vault=sessions.vault,
-            sessions=sessions, cancel_owner=cancel_owner,
-            provider_hostname=runtime_settings.provider_hostname if runtime_settings else provider_hostname)
+        mount_credential_routes(
+            app,
+            owner_dependency=owner_dependency,
+            vault=sessions.vault,
+            sessions=sessions,
+            cancel_owner=cancel_owner,
+            provider_hostname=runtime_settings.provider_hostname
+            if runtime_settings
+            else provider_hostname,
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):
