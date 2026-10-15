@@ -45,3 +45,13 @@ test("credential routes are protected and handles forwarded only to run starts",
   const hostile = new Request("https://site.example/api/agent/credentials",{method:"POST",headers:{origin:"https://evil.example"}});
   assert.equal((await forwardAgentRequest(hostile,["credentials"],{userId:"alice"},{base:"https://backend.example",token:"secret"})).status,403);
 });
+test("Worker-compatible manual redirects never forward credentials to another destination",async()=>{
+  let calls=0;
+  let redirect:RequestRedirect|undefined;
+  const response=await forwardAgentRequest(new Request("https://site.example/api/agent/credentials"),["credentials"],{userId:"alice"},
+    {base:"https://backend.example",token:"secret"},async(_url,options)=>{
+      calls++;redirect=options?.redirect;
+      return new Response(null,{status:302,headers:{location:"https://evil.example"}});
+    });
+  assert.equal(redirect,"manual");assert.equal(calls,1);assert.equal(response.status,503);assert.equal(response.headers.get("location"),null);
+});

@@ -21,9 +21,13 @@ export async function forwardAgentRequest(request: Request, path: string[], iden
   try {
     const response = await upstream(`${settings.base.replace(/\/$/, "")}/v1/${joined}${query}`, {
       method: request.method, headers, body: request.method === "GET" ? undefined : request.body,
-      redirect: "error", signal: AbortSignal.timeout(60_000),
+      redirect: "manual", signal: AbortSignal.timeout(60_000),
       ...({ duplex: "half" } as Record<string, string>),
     });
+    if(response.status>=300 && response.status<400) {
+      await response.body?.cancel();
+      return Response.json({error:"service_unreachable"},{status:503});
+    }
     return new Response(response.body, { status: response.status,
       headers: { "content-type": "application/json", "cache-control": "no-store" } });
   } catch {

@@ -5,6 +5,9 @@ import { ArrowUp, ArrowUpRight, BookOpen, Check, ChevronRight, Circle, FileText,
   GitBranch, LoaderCircle, Menu, Paperclip, Plus, Search, ShieldCheck, Square, X } from "lucide-react";
 import { safeSourceUrl } from "../lib/proxy";
 import { completedMessage, loadConversationMessages } from "../lib/history";
+import ApiKeySettings from "./ApiKeySettings";
+import { credentialApi } from "../lib/credentials";
+import type { CredentialState } from "../lib/credentials";
 
 type Evidence = { evidence_id: string; kind: string; summary: string; source_url?: string };
 type Message = { role: "user" | "assistant"; content: string; evidence?: Evidence[] };
@@ -42,6 +45,8 @@ export default function AgentChat({ signedIn, displayName, signInPath, signOutPa
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [mobileMenu, setMobileMenu] = useState(false);
+  const [credentialHandle,setCredentialHandle] = useState<string|null>(null);
+  const [savedCredential,setSavedCredential] = useState(false);
   const pollGeneration = useRef(0);
   const bottom = useRef<HTMLDivElement>(null);
   const attempt = useRef<{key:string;question:string;file:File|null;attachmentId:string|null}|null>(null);
@@ -60,6 +65,11 @@ export default function AgentChat({ signedIn, displayName, signInPath, signOutPa
   async function refreshConversations() {
     try { setConversations(await api<Conversation[]>("conversations")); } catch(e) { setError((e as Error).message); }
   }
+  async function refreshCredentials(){try{const state=await credentialApi("credentials") as CredentialState;
+    setSavedCredential(Boolean(state.statuses?.some(s=>s.provider==="model"&&s.configured)));}catch{setSavedCredential(false);}}
+  function credentialsChanged(handle:string|null){setCredentialHandle(handle);void refreshCredentials();}
+  useEffect(()=>{if(signedIn)void refreshCredentials();else{setCredentialHandle(null);setSavedCredential(false);}},[signedIn]);
+  useEffect(()=>{if(!credentialHandle)return;const timer=setTimeout(()=>setCredentialHandle(null),1800*1000);return()=>clearTimeout(timer);},[credentialHandle]);
   async function history(id:string) {
     return loadConversationMessages<Message>(offset => api<{messages:Message[];next_offset:number|null}>(`conversations/${id}?offset=${offset}`));
   }
@@ -117,6 +127,7 @@ export default function AgentChat({ signedIn, displayName, signInPath, signOutPa
   }
   async function submit() {
     if (!signedIn || busy || !question.trim()) return;
+    if(!credentialHandle&&!savedCredential&&!attempt.current){setError("请先在 API keys 中配置你自己的密钥；历史答案仍可查看。");return;}
     setPending(true); setError("");
     const text = question.trim();
     if (!attempt.current || attempt.current.question !== text || attempt.current.file !== file)
@@ -132,7 +143,7 @@ export default function AgentChat({ signedIn, displayName, signInPath, signOutPa
         attempt.current.attachmentId = attachmentId;
       }
       const next:Run = await api<Run>(`conversations/${identifier}/runs`, {method:"POST",
-        headers:{"content-type":"application/json","idempotency-key":attempt.current.key},
+        headers:{"content-type":"application/json","idempotency-key":attempt.current.key,...(credentialHandle?{"x-agent-credential-handle":credentialHandle}:{})},
         body:JSON.stringify({question:text, attachment_id:attachmentId})});
       setMessages(current => [...current,{role:"user",content:text}]);
       if (next.status === "completed" && next.result) {
@@ -171,6 +182,7 @@ export default function AgentChat({ signedIn, displayName, signInPath, signOutPa
     <main className="main-panel">
       <header className="topbar"><button className="mobile-toggle" onClick={() => setMobileMenu(!mobileMenu)} aria-label="Toggle navigation"><Menu size={20}/></button>
         <span>Research assistant <span className="topbar-separator">/</span> <span className="muted">{cid?"Conversation":"New conversation"}</span></span>
+        {signedIn&&<ApiKeySettings onCredentialChange={credentialsChanged}/>}
         <div className="model-pill"><span className="status-dot"/> GPT-6.1 Sol <span>· low</span></div></header>
       <section className={`conversation ${messages.length ? "has-messages" : ""}`}>
         {!messages.length && <div className="welcome"><div className="eyebrow"><span/> A LITTLE TEAM FOR BIG QUESTIONS</div>
