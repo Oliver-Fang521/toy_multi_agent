@@ -677,6 +677,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
+    { name = "cryptography" },
     { name = "datasets" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -710,6 +711,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.13,<5" },
+    { name = "cryptography", specifier = ">=46,<51" },
     { name = "datasets", specifier = ">=4,<5" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
