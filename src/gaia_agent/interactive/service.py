@@ -82,3 +82,9 @@ class RunService:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def cancel_owner(self, owner: str):
+        identifiers = [row[0] for row in self.store.db.execute(
+            "SELECT id FROM runs WHERE owner=? AND status IN ('queued','running')", (owner,))]
+        for identifier in identifiers:
+            await self.cancel(owner, identifier)

@@ -12,6 +12,9 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile
 
 from gaia_agent.interactive.composition import execute_interactive
+from gaia_agent.interactive.credential_api import mount_credential_routes
+from gaia_agent.interactive.credential_sessions import CredentialSessions
+from gaia_agent.interactive.credential_vault import CredentialVault
 from gaia_agent.interactive.models import InteractiveConfig, InteractiveRequest
 from gaia_agent.interactive.service import RunService
 from gaia_agent.interactive.store import ConversationStore, ServiceError
@@ -87,7 +90,8 @@ class RequestBoundary:
 
 
 def create_app(
-    root: Path | None = None, service_token: str | None = None, *, execute=None
+    root: Path | None = None, service_token: str | None = None, *, execute=None,
+    cipher=None, provider_hostname=""
 ) -> FastAPI:
     root = root or Path(os.environ.get("AGENT_DATA_DIR", "interactive-data"))
     token = service_token or os.environ.get("AGENT_SERVICE_TOKEN", "")
@@ -103,6 +107,7 @@ def create_app(
             )
 
     service = RunService(store, root / "runs", execute)
+    sessions = CredentialSessions(CredentialVault(store.db, cipher, store.lock)) if cipher else None
     active_upload_users: set[str] = set()
 
     @asynccontextmanager
@@ -119,6 +124,8 @@ def create_app(
                 store.db.execute("DELETE FROM uploads WHERE id=?", (row["id"],))
         yield
         await service.shutdown()
+        if sessions:
+            sessions.close()
         store.db.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -135,6 +142,14 @@ def create_app(
         return user
 
     owner_dependency = Depends(owner)
+    if sessions:
+        app.state.credential_sessions = sessions
+
+        async def cancel_owner(user):
+            await service.cancel_owner(user)
+
+        mount_credential_routes(app, owner_dependency=owner_dependency, vault=sessions.vault,
+            sessions=sessions, cancel_owner=cancel_owner, provider_hostname=provider_hostname)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):

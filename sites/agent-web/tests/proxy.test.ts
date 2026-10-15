@@ -32,3 +32,16 @@ test("conversation pagination forwards only a validated offset", async () => {
     {base:"https://backend.example",token:"secret"},async url => { seen=String(url); return Response.json([]); });
   assert.equal(seen,"https://backend.example/v1/conversations/12345678-1234-1234-1234-123456789abc?offset=100");
 });
+test("credential routes are protected and handles forwarded only to run starts", async () => {
+  for (const path of [["credentials"],["credentials","delete"],["credential-sessions"],
+    ["conversations","12345678-1234-1234-1234-123456789abc","runs"]]) {
+    let headers = new Headers();
+    const result = await forwardAgentRequest(new Request("https://site.example/api/agent/"+path.join("/"), {
+      method:"POST",headers:{origin:"https://site.example","x-agent-credential-handle":"fake-handle"}}),path,{userId:"alice"},
+      {base:"https://backend.example",token:"secret"},async (_url, options) => {headers=new Headers(options?.headers); return Response.json({});});
+    assert.equal(result.status,200);
+    assert.equal(headers.get("x-agent-credential-handle"),path.at(-1)==="runs" ? "fake-handle":null);
+  }
+  const hostile = new Request("https://site.example/api/agent/credentials",{method:"POST",headers:{origin:"https://evil.example"}});
+  assert.equal((await forwardAgentRequest(hostile,["credentials"],{userId:"alice"},{base:"https://backend.example",token:"secret"})).status,403);
+});

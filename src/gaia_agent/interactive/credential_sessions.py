@@ -22,8 +22,11 @@ class CredentialSessions:
         self.clock = clock
         self._sessions: dict[str, _Session] = {}
         self._generations: dict[str, int] = {}
+        self.mutating: set[str] = set()
 
-    def issue(self, owner, material: CredentialMaterial) -> str:
+    def issue(self, owner, material: CredentialMaterial, *, _mutation=False) -> str:
+        if owner in self.mutating and not _mutation:
+            raise CredentialError("credential_revoked", 409)
         for value in (material.model, material.serper, material.serpapi):
             if value is not None:
                 validate_secret(value)
@@ -42,6 +45,8 @@ class CredentialSessions:
         return ref
 
     def resolve(self, ref: CredentialRef) -> CredentialMaterial:
+        if ref.owner in self.mutating:
+            raise CredentialError("credential_revoked", 409)
         if ref.generation != self._generations.get(ref.owner, 0):
             raise CredentialError("credential_revoked", 422)
         if ref.handle is not None:
