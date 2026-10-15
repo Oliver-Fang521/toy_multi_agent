@@ -6,7 +6,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from types import TracebackType
@@ -128,6 +128,7 @@ class MCPToolClient:
         allowed: set[str] | frozenset[str] | None = None,
         attachments: Iterable[Path] = (),
         observability: Observability | None = None,
+        runtime_env: Mapping[str, str] | None = None,
     ) -> None:
         self._task_root = task_root.resolve()
         self._config = config or RunConfig.from_env()
@@ -143,6 +144,7 @@ class MCPToolClient:
         self._usage_lock = asyncio.Lock()
         self._call_count = 0
         self._observability = observability
+        self._runtime_env = dict(runtime_env) if runtime_env is not None else None
 
     @property
     def is_connected(self) -> bool:
@@ -418,6 +420,13 @@ class MCPToolClient:
             "OPENAI_API_KEY": self._config.openai_api_key.get_secret_value(),
             "HF_TOKEN": self._config.hf_token.get_secret_value(),
         }
+        if self._runtime_env is not None:
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("HF_TOKEN", None)
+            for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "SERPER_API_KEY", "SERPAPI_API_KEY"):
+                if value := self._runtime_env.get(name):
+                    env[name] = value
+            return env
         if os.environ.get("GAIA_MCP_FAKE_BACKEND") == "1":
             env["GAIA_MCP_FAKE_BACKEND"] = "1"
         if os.environ.get("OPENAI_BASE_URL"):
@@ -431,8 +440,9 @@ class MCPToolClient:
         for secret in (
             self._config.openai_api_key.get_secret_value(),
             self._config.hf_token.get_secret_value(),
-            os.environ.get("SERPER_API_KEY", ""),
-            os.environ.get("SERPAPI_API_KEY", ""),
+            (self._runtime_env if self._runtime_env is not None else os.environ).get("SERPER_API_KEY", ""),
+            (self._runtime_env if self._runtime_env is not None else os.environ).get("SERPAPI_API_KEY", ""),
+            (self._runtime_env or {}).get("OPENAI_API_KEY", ""),
         ):
             if secret:
                 message = message.replace(secret, "[REDACTED]")

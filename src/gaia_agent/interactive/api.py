@@ -11,11 +11,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile
 
-from gaia_agent.interactive.composition import execute_interactive
 from gaia_agent.interactive.credential_api import mount_credential_routes
+from gaia_agent.interactive.credential_crypto import cipher_from_environment
+from gaia_agent.interactive.credential_runtime import InteractiveRuntimeSettings, UserRuntime
 from gaia_agent.interactive.credential_sessions import CredentialSessions
-from gaia_agent.interactive.credential_vault import CredentialVault
-from gaia_agent.interactive.models import InteractiveConfig, InteractiveRequest
+from gaia_agent.interactive.credential_vault import CredentialError, CredentialVault
+from gaia_agent.interactive.models import InteractiveRequest
 from gaia_agent.interactive.service import RunService
 from gaia_agent.interactive.store import ConversationStore, ServiceError
 
@@ -91,23 +92,31 @@ class RequestBoundary:
 
 def create_app(
     root: Path | None = None, service_token: str | None = None, *, execute=None,
-    cipher=None, provider_hostname=""
+    cipher=None, provider_hostname="", runtime_settings=None
 ) -> FastAPI:
     root = root or Path(os.environ.get("AGENT_DATA_DIR", "interactive-data"))
     token = service_token or os.environ.get("AGENT_SERVICE_TOKEN", "")
     if len(token) < 16:
         raise RuntimeError("service_credential_missing")
-    store = ConversationStore(root / "state.sqlite")
+    production = execute is None
     if execute is None:
-        config = InteractiveConfig(openai_api_key=os.environ["OPENAI_API_KEY"])
-
-        async def execute(request, workspace, history, on_progress, attachment_path):
-            return await execute_interactive(
-                request, config, workspace, history, on_progress, attachment_path=attachment_path
-            )
-
-    service = RunService(store, root / "runs", execute)
+        try:
+            runtime_settings = runtime_settings or InteractiveRuntimeSettings(base_url=os.environ.get("AGENT_MODEL_BASE_URL", ""))
+        except ValueError:
+            raise CredentialError("credential_configuration", 503) from None
+        cipher = cipher or cipher_from_environment()
+    store = ConversationStore(root / "state.sqlite")
     sessions = CredentialSessions(CredentialVault(store.db, cipher, store.lock)) if cipher else None
+    if production:
+        execute = UserRuntime(runtime_settings, sessions).execute
+    elif sessions:
+        fake_execute = execute
+
+        async def execute(ref, *args):
+            sessions.resolve(ref)
+            return await fake_execute(*args)
+
+    service = RunService(store, root / "runs", execute, credential_sessions=sessions)
     active_upload_users: set[str] = set()
 
     @asynccontextmanager
@@ -149,7 +158,8 @@ def create_app(
             await service.cancel_owner(user)
 
         mount_credential_routes(app, owner_dependency=owner_dependency, vault=sessions.vault,
-            sessions=sessions, cancel_owner=cancel_owner, provider_hostname=provider_hostname)
+            sessions=sessions, cancel_owner=cancel_owner,
+            provider_hostname=runtime_settings.provider_hostname if runtime_settings else provider_hostname)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):
@@ -244,7 +254,10 @@ def create_app(
         idem = request.headers.get("idempotency-key", "")
         if not idem or len(idem) > 128:
             raise HTTPException(422, "idempotency_key_required")
-        return service.start(user, cid, body, idem)
+        handle = request.headers.get("x-agent-credential-handle")
+        if handle is not None and (len(handle) > 128 or not handle.isascii()):
+            raise CredentialError("invalid_credential", 422)
+        return service.start(user, cid, body, idem, credential_handle=handle)
 
     @app.get("/v1/runs/{identifier}")
     async def get_run(identifier: str, user=owner_dependency):

@@ -107,6 +107,16 @@ class ConversationStore:
             )
             return self.run(owner, identifier)
 
+    def lookup(self, owner: str, cid: str, request: InteractiveRequest, idem: str) -> dict | None:
+        self.get(owner, cid)
+        row = self.db.execute("SELECT id,fingerprint FROM runs WHERE owner=? AND idem=?", (owner, idem)).fetchone()
+        if row is None:
+            return None
+        fingerprint = hashlib.sha256((cid + request.model_dump_json()).encode()).hexdigest()
+        if row["fingerprint"] != fingerprint:
+            raise ServiceError("idempotency_conflict", 409)
+        return self.run(owner, row["id"])
+
     def run(self, owner: str, identifier: str) -> dict:
         row = self.db.execute(
             "SELECT * FROM runs WHERE id=? AND owner=?", (identifier, owner)
