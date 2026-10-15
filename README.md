@@ -118,6 +118,12 @@ both globally and by stage. Recoverable provider failures use bounded retry/back
 can fall back to configured providers behind a circuit breaker. Structured stage output gets one
 tool-free local repair instead of launching an unbounded second research path.
 
+Local repair retains a bounded selection of successful research excerpts and safe source URLs.
+Repair calls use low reasoning effort so the response budget can produce the structured result.
+Specialist audit events and trace summaries record only allowlisted validation codes, initial/repair
+outcomes, response status, and incomplete reasons such as `max_output_tokens`; research content
+remains private.
+
 After stable graph transitions, private research state is written to an authenticated sibling
 checkpoint directory. `--resume` validates the persisted run configuration, restores only trusted
 state, repairs incomplete public records, and skips already completed tasks.
@@ -233,11 +239,11 @@ GAIA_MAX_STEPS=1 uv run gaia-agent evaluate \
 uv run gaia-agent verify-results results/smoke-3
 ```
 
-Reproduce the configuration used by the published best 15-task run:
+Run the current `gpt-6.1-sol` / `low` configuration on the same deterministic 15-task sample:
 
 ```console
-GAIA_MODEL=gpt-5.6-luna \
-GAIA_REASONING_EFFORT=max \
+GAIA_MODEL=gpt-6.1-sol \
+GAIA_REASONING_EFFORT=low \
 GAIA_QUALITY_POLICY=benchmark \
 GAIA_PROVIDER_MAX_ATTEMPTS=3 \
 uv run gaia-agent evaluate \
@@ -252,13 +258,13 @@ uv run gaia-agent evaluate \
   --critic-timeout-seconds 60 \
   --specialist-max-tool-calls 18 \
   --critic-max-tool-calls 6 \
-  --output-dir results/gaia-15-seed42
+  --output-dir results/gaia-sol-low-seed42
 
-uv run gaia-agent verify-results results/gaia-15-seed42
+uv run gaia-agent verify-results results/gaia-sol-low-seed42
 ```
 
-The fixed configuration reproduces the evaluation protocol and task selection, not a guaranteed
-score: hosted search results and model outputs can change between runs.
+The published 7/15 result remains a historical Luna/max run. The current Sol/low configuration
+has not been benchmarked yet. Hosted search results and model outputs can change between runs.
 
 Resume an interrupted run by repeating the same command and output directory with `--resume`.
 Behavior-defining configuration must match the stored manifest.
@@ -269,8 +275,8 @@ CLI options override `GAIA_*` environment variables, which override built-in def
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `GAIA_MODEL` | `gpt-5.6-luna` | Production model |
-| `GAIA_REASONING_EFFORT` | `max` | Reasoning level |
+| `GAIA_MODEL` | `gpt-6.1-sol` | Production model |
+| `GAIA_REASONING_EFFORT` | `low` | Reasoning level |
 | `GAIA_SAMPLE_SIZE` | `15` | Balanced evaluation size; divisible by 3 |
 | `GAIA_MAX_STEPS` | `8` | Maximum plan steps |
 | `GAIA_MAX_TOOL_CALLS` | `24` | Global logical tool-call budget |
@@ -292,7 +298,7 @@ uv run pytest
 uv run ruff check .
 
 # After running either evaluation command above:
-uv run gaia-agent verify-results results/gaia-15-seed42
+uv run gaia-agent verify-results results/gaia-sol-low-seed42
 ```
 
 The test suite covers agent schemas and permissions, graph transitions, MCP isolation, provider
@@ -310,8 +316,9 @@ trace-driven reliability improvements, and stage-level recovery.
 - GAIA is gated; reproducing the evaluation requires accepting its dataset terms.
 - Hosted tools and model calls can incur API charges.
 - The published score covers only 15 deterministic validation tasks.
-- The production composition is intentionally pinned to the configured Luna/max evaluation path;
+- The production composition is intentionally pinned to the configured Sol/low evaluation path;
   provider-neutral test adapters exist, but different production providers are not benchmark
   equivalent.
+- Audio transcription uses `gpt-4o-mini-transcribe`; GPT-6.1 Sol does not support audio input.
 - The project does not publish GAIA questions, reference answers, task-level predictions, or
   attachments.

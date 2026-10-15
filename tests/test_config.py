@@ -10,7 +10,7 @@ def test_run_config_requires_balanced_sample_size() -> None:
         RunConfig(openai_api_key="sk-test", hf_token="hf_test", sample_size=10)
 
 
-def test_run_config_defaults_to_luna_max_in_direct_and_environment_construction(
+def test_run_config_defaults_to_sol_low_in_direct_and_environment_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-environment")
@@ -21,8 +21,8 @@ def test_run_config_defaults_to_luna_max_in_direct_and_environment_construction(
     direct = RunConfig(openai_api_key="sk-test", hf_token="hf-test")
     from_env = RunConfig.from_env()
 
-    assert (direct.model, direct.reasoning_effort) == ("gpt-5.6-luna", "max")
-    assert (from_env.model, from_env.reasoning_effort) == ("gpt-5.6-luna", "max")
+    assert (direct.model, direct.reasoning_effort) == ("gpt-6.1-sol", "low")
+    assert (from_env.model, from_env.reasoning_effort) == ("gpt-6.1-sol", "low")
 
 
 def test_stage_budgets_are_derived_from_global_limits() -> None:

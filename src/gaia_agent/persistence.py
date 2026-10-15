@@ -40,9 +40,7 @@ _SECRET_VALUE_PATTERNS = (
 )
 _PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
 _PUBLIC_PACKAGE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
-_PUBLIC_RETRY_REASONS = frozenset(
-    {"provider_transient_exhausted", "timeout", "task_transient"}
-)
+_PUBLIC_RETRY_REASONS = frozenset({"provider_transient_exhausted", "timeout", "task_transient"})
 _PUBLIC_RETRY_CATEGORIES = TRANSIENT_PROVIDER_ERROR_NAMES | frozenset(
     {"TimeoutError", "ConnectionError", "provider_transient", "task_transient"}
 )
@@ -89,6 +87,7 @@ _PUBLIC_TOOL_NORMAL_RESULT_SHAPES = {
 _BOUNDED_RESULT_KEYS = frozenset({"output", "truncated"})
 _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
     {
+        "stage_response_diagnostic",
         "tool_call_started",
         "tool_call_completed",
         "tool_call_failed",
@@ -116,15 +115,14 @@ _PUBLIC_AUDIT_EVENT_TYPES = frozenset(
     }
 )
 _PUBLIC_AUDIT_EVENT_KEYS = {
+    "stage_response_diagnostic": frozenset(
+        {"stage", "phase", "code", "response_status", "incomplete_reason"}
+    ),
     "tool_call_started": frozenset({"tool", "call_number", "argument_keys"}),
     "tool_call_completed": frozenset({"tool", "call_number", "argument_keys", "result_keys"}),
     "tool_call_failed": frozenset({"tool", "call_number", "argument_keys", "category"}),
-    "tool_call_reused": frozenset(
-        {"tool", "call_number", "argument_keys", "result_keys"}
-    ),
-    "tool_call_restored": frozenset(
-        {"tool", "call_number", "argument_keys", "result_keys"}
-    ),
+    "tool_call_reused": frozenset({"tool", "call_number", "argument_keys", "result_keys"}),
+    "tool_call_restored": frozenset({"tool", "call_number", "argument_keys", "result_keys"}),
     "terminal_failure": frozenset({"category", "critic_verdict"}),
     "plan_started": frozenset({"task_id"}),
     "plan_completed": frozenset({"task_id", "step_count", "specialists"}),
@@ -320,7 +318,9 @@ class RunStore:
         if not store.manifest_path.is_file() or store.manifest_path.is_symlink():
             raise ValueError("run manifest is missing or unsafe")
         try:
-            persisted = RunManifest.model_validate_json(store.manifest_path.read_text(encoding="utf-8"))
+            persisted = RunManifest.model_validate_json(
+                store.manifest_path.read_text(encoding="utf-8")
+            )
         except (OSError, ValueError) as error:
             raise ValueError("run manifest is invalid") from error
         if persisted != manifest:
@@ -492,7 +492,10 @@ class RunStore:
             if record is not None:
                 grouped.setdefault(record["task_id"], []).append(record)
                 continue
-            if isinstance(raw_record, Mapping) and raw_record.get("task_id") in self.manifest.selected_task_ids:
+            if (
+                isinstance(raw_record, Mapping)
+                and raw_record.get("task_id") in self.manifest.selected_task_ids
+            ):
                 invalid_task_ids.add(raw_record["task_id"])
             else:
                 unattributed_corruption = True
@@ -508,7 +511,9 @@ class RunStore:
         )
 
     def _write_prediction_records(self, records: Mapping[str, Mapping[str, Any]]) -> None:
-        ordered = [records[task_id] for task_id in self.manifest.selected_task_ids if task_id in records]
+        ordered = [
+            records[task_id] for task_id in self.manifest.selected_task_ids if task_id in records
+        ]
         lines = "".join(_json_text(record) for record in ordered)
         _atomic_write(self.predictions_path, lines)
 
@@ -632,6 +637,14 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
         }:
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 1_000_000:
                 raise ValueError("audit counter must be a bounded integer")
+        elif key in {"phase", "response_status", "incomplete_reason"}:
+            allowed = {
+                "phase": {"initial", "repair"},
+                "response_status": {"completed", "incomplete", "failed", "unknown"},
+                "incomplete_reason": {"none", "max_output_tokens", "content_filter", "other"},
+            }
+            if value not in allowed[key]:
+                raise ValueError("response diagnostic is not allowlisted")
         elif key == "code":
             if value not in {
                 "role_mismatch",
@@ -640,6 +653,7 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
                 "candidate_format",
                 "checked_evidence",
                 "schema",
+                *({"valid"} if event_type == "stage_response_diagnostic" else set()),
             }:
                 raise ValueError("audit code is not allowlisted")
         elif key == "stage":
@@ -660,7 +674,9 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
             if value not in {item.value for item in SpecialistName}:
                 raise ValueError("audit specialist is not allowlisted")
         elif key == "specialists":
-            if not isinstance(value, list) or any(item not in {role.value for role in SpecialistName} for item in value):
+            if not isinstance(value, list) or any(
+                item not in {role.value for role in SpecialistName} for item in value
+            ):
                 raise ValueError("audit specialists are not allowlisted")
             if len(value) > 32:
                 raise ValueError("audit specialists exceed the public limit")
@@ -690,7 +706,10 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
         if tool not in _PUBLIC_TOOL_NAMES:
             raise ValueError("tool audit must include an allowlisted tool")
         argument_keys = public.get("argument_keys")
-        if not isinstance(argument_keys, list) or not set(argument_keys) <= _PUBLIC_TOOL_ARGUMENT_KEYS[tool]:
+        if (
+            not isinstance(argument_keys, list)
+            or not set(argument_keys) <= _PUBLIC_TOOL_ARGUMENT_KEYS[tool]
+        ):
             raise ValueError("tool audit argument keys do not match the tool contract")
         if len(argument_keys) > 32:
             raise ValueError("tool audit argument keys exceed the public limit")
@@ -701,9 +720,15 @@ def _public_audit_payload(event_type: str, payload: Mapping[str, Any]) -> dict[s
             raise ValueError("tool failure audit cannot include result keys")
         if event_type in {"tool_call_completed", "tool_call_reused", "tool_call_restored"}:
             result_key_set = frozenset(result_keys) if isinstance(result_keys, list) else None
-            if result_key_set not in _PUBLIC_TOOL_NORMAL_RESULT_SHAPES[tool] | {_BOUNDED_RESULT_KEYS}:
+            if result_key_set not in _PUBLIC_TOOL_NORMAL_RESULT_SHAPES[tool] | {
+                _BOUNDED_RESULT_KEYS
+            }:
                 raise ValueError("tool audit result keys do not match the tool contract")
-            if not isinstance(result_keys, list) or len(result_keys) != len(result_key_set) or len(result_keys) > 32:
+            if (
+                not isinstance(result_keys, list)
+                or len(result_keys) != len(result_key_set)
+                or len(result_keys) > 32
+            ):
                 raise ValueError("tool audit result keys exceed the public limit")
     elif "argument_keys" in public or "result_keys" in public or "tool" in public:
         raise ValueError("non-tool audit cannot include tool metadata")
@@ -741,21 +766,34 @@ def _validate_audit_value_context(event_type: str, payload: Mapping[str, Any]) -
 
 
 def _validate_plan_record(value: Any) -> None:
-    if not isinstance(value, dict) or set(value) != {"steps"} or not isinstance(value["steps"], list):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"steps"}
+        or not isinstance(value["steps"], list)
+    ):
         raise ValueError("plan artifact is not a public plan shape")
     for index, step in enumerate(value["steps"], start=1):
         if not isinstance(step, dict) or set(step) != {"index", "specialist"}:
             raise ValueError("plan artifact contains an unsupported field")
-        if step["index"] != index or step["specialist"] not in {role.value for role in SpecialistName}:
+        if step["index"] != index or step["specialist"] not in {
+            role.value for role in SpecialistName
+        }:
             raise ValueError("plan artifact contains an invalid public value")
 
 
 def _validate_audit_record(value: Any) -> None:
-    if not isinstance(value, dict) or set(value) != {"sequence", "event_type", "timestamp", "payload"}:
+    if not isinstance(value, dict) or set(value) != {
+        "sequence",
+        "event_type",
+        "timestamp",
+        "payload",
+    }:
         raise ValueError("audit artifact is not a public audit shape")
     if not isinstance(value["sequence"], int) or value["sequence"] < 1:
         raise ValueError("audit sequence must be a positive integer")
-    if value["event_type"] not in _PUBLIC_AUDIT_EVENT_TYPES or not isinstance(value["timestamp"], str):
+    if value["event_type"] not in _PUBLIC_AUDIT_EVENT_TYPES or not isinstance(
+        value["timestamp"], str
+    ):
         raise ValueError("audit event is not public")
     try:
         datetime.fromisoformat(value["timestamp"])
@@ -831,25 +869,34 @@ def _validated_prediction_record(
     task_id = record.get("task_id")
     if task_id not in expected_levels:
         return None
-    if record.get("level") != expected_levels[task_id] or not isinstance(record.get("correct"), bool):
+    if record.get("level") != expected_levels[task_id] or not isinstance(
+        record.get("correct"), bool
+    ):
         return None
     if not isinstance(record.get("answer"), str | type(None)):
         return None
     if record.get("critic_verdict") not in _PUBLIC_CRITIC_VERDICTS:
         return None
-    if not isinstance(record.get("duration_seconds"), int | float) or record["duration_seconds"] < 0:
+    if (
+        not isinstance(record.get("duration_seconds"), int | float)
+        or record["duration_seconds"] < 0
+    ):
         return None
     if not isinstance(record.get("run_index"), int) or record["run_index"] < 0:
         return None
     if not isinstance(record.get("vote_count"), int) or record["vote_count"] < 1:
         return None
-    if not isinstance(record.get("attempt_number"), int) or isinstance(
-        record["attempt_number"], bool
-    ) or record["attempt_number"] < 1:
+    if (
+        not isinstance(record.get("attempt_number"), int)
+        or isinstance(record["attempt_number"], bool)
+        or record["attempt_number"] < 1
+    ):
         return None
-    if not isinstance(record.get("recovery_count"), int) or isinstance(
-        record["recovery_count"], bool
-    ) or record["recovery_count"] < 0:
+    if (
+        not isinstance(record.get("recovery_count"), int)
+        or isinstance(record["recovery_count"], bool)
+        or record["recovery_count"] < 0
+    ):
         return None
     if not isinstance(record.get("recovery_succeeded"), bool):
         return None
@@ -857,9 +904,11 @@ def _validated_prediction_record(
         return None
     if record.get("retry_category") not in _PUBLIC_RETRY_CATEGORIES | {None}:
         return None
-    if not isinstance(record.get("provider_attempt_count"), int) or isinstance(
-        record["provider_attempt_count"], bool
-    ) or record["provider_attempt_count"] < 0:
+    if (
+        not isinstance(record.get("provider_attempt_count"), int)
+        or isinstance(record["provider_attempt_count"], bool)
+        or record["provider_attempt_count"] < 0
+    ):
         return None
     usage = record.get("usage")
     if not isinstance(usage, dict) or set(usage) != {
@@ -916,7 +965,5 @@ def _redact_answer(answer: str | None) -> str | None:
 
 def _known_secret_values() -> tuple[str, ...]:
     return tuple(
-        value
-        for value in (os.environ.get("OPENAI_API_KEY"), os.environ.get("HF_TOKEN"))
-        if value
+        value for value in (os.environ.get("OPENAI_API_KEY"), os.environ.get("HF_TOKEN")) if value
     )

@@ -50,6 +50,32 @@ from gaia_agent.runner import EvaluationRunner
 from gaia_agent.search import SearchProviderChain, SearchProviderError
 
 
+@pytest.mark.asyncio
+async def test_failed_lookup_repair_diagnostics_survive_stage_task(fake_provider):
+    from gaia_agent.agents import LookupAgent
+    from gaia_agent.providers import ModelResponse
+
+    fake_provider._responses.extend([
+        ModelResponse(output_text="not valid initial", response_status="incomplete",
+                      incomplete_reason="max_output_tokens"),
+        ModelResponse(output_text="not valid repair", response_status="completed"),
+    ])
+    calls = []
+    orchestrator = _orchestrator(
+        planner=FakePlanner(calls, _plan(SpecialistName.LOOKUP)),
+        specialists={SpecialistName.LOOKUP: LookupAgent(fake_provider)},
+        critic=FakeCritic(calls, []), tools=FakeTools(calls),
+    )
+    result = await orchestrator.run(_task())
+    assert result.error_category == TerminalErrorCategory.MALFORMED_RESPONSE
+    diagnostics = [event.payload for event in orchestrator.audit_events
+                   if event.event_type == "stage_response_diagnostic"]
+    assert [item["phase"] for item in diagnostics] == ["initial", "repair"]
+    assert diagnostics[0]["incomplete_reason"] == "max_output_tokens"
+    assert diagnostics[1]["code"] == "schema"
+    assert "not valid" not in json.dumps(diagnostics)
+
+
 class FakePlanner:
     def __init__(
         self,

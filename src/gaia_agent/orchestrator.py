@@ -270,9 +270,7 @@ def _ready_for_critic(state: _TaskState) -> bool:
             for origin in computation_origins
             if _numeric_value(state.candidate_origins.get(origin)) == final_value
         }
-        return len(agreeing_origins) >= 2 or (
-            bool(agreeing_origins) and "source" in kinds
-        )
+        return len(agreeing_origins) >= 2 or (bool(agreeing_origins) and "source" in kinds)
     if state.plan is not None and any(
         step.specialist == SpecialistName.LOOKUP for step in state.plan.steps
     ):
@@ -487,11 +485,7 @@ class _BudgetedToolClient:
 
     def _check_stage_deadline(self) -> None:
         budget = self._stage_budget
-        if (
-            budget is not None
-            and budget.deadline is not None
-            and budget.deadline <= self._now()
-        ):
+        if budget is not None and budget.deadline is not None and budget.deadline <= self._now():
             raise StageBudgetExceeded(budget.name, "time")
 
     def _now(self) -> float:
@@ -510,9 +504,7 @@ class _GraphState(TypedDict, total=False):
     soft_step_failures: int
     decision: CriticDecision
     prediction: TaskPrediction
-    entry_cursor: Literal[
-        "plan", "act", "evidence_repair", "verify", "correct", "submit"
-    ]
+    entry_cursor: Literal["plan", "act", "evidence_repair", "verify", "correct", "submit"]
 
 
 class Orchestrator:
@@ -530,6 +522,7 @@ class Orchestrator:
         notebook: ResearchNotebook | None = None,
         evidence_linker: EvidenceLinker | None = None,
         stage_runtime: VoteStageRuntime | None = None,
+        on_progress: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         if config.max_steps < 1:
             raise ValueError("max_steps must be positive")
@@ -556,6 +549,13 @@ class Orchestrator:
         self.tool_call_count = 0
         self._invocation_deadline: InvocationDeadline | None = None
         self._graph = self._build_graph()
+        self._on_progress = on_progress
+        self._result_evidence: tuple[Evidence, ...] = ()
+
+    @property
+    def result_evidence(self) -> tuple[Evidence, ...]:
+        """Private evidence for the owner of the most recently completed task."""
+        return self._result_evidence
 
     @property
     def audit_events(self) -> tuple[AuditEvent, ...]:
@@ -574,15 +574,14 @@ class Orchestrator:
         return checkpoint.usage if checkpoint is not None else None
 
     async def run(self, task: GaiaTask) -> TaskPrediction:
+        self._result_evidence = ()
         with invocation_deadline_scope(self._invocation_deadline):
             return await self._run(task)
 
     async def _run(self, task: GaiaTask) -> TaskPrediction:
         loop = asyncio.get_running_loop()
         started = (
-            self._vote_stage_runtime.now()
-            if self._vote_stage_runtime is not None
-            else loop.time()
+            self._vote_stage_runtime.now() if self._vote_stage_runtime is not None else loop.time()
         )
         if self._vote_stage_runtime is None:
             self._vote_stage_runtime = VoteStageRuntime.for_config(
@@ -712,6 +711,7 @@ class Orchestrator:
                 self._refresh_checkpoint_accounting(state, budgeted_tools)
             raise cancellation
         if prediction is not None:
+            self._result_evidence = tuple(state.evidence)
             return prediction.model_copy(
                 update={
                     "duration_seconds": self._now() - started,
@@ -846,11 +846,7 @@ class Orchestrator:
         return max(25, self._config.max_steps + 10)
 
     async def _graph_restore(self, graph_state: _GraphState) -> dict[str, Any]:
-        checkpoint = (
-            self._notebook.load_stage_checkpoint()
-            if self._notebook is not None
-            else None
-        )
+        checkpoint = self._notebook.load_stage_checkpoint() if self._notebook is not None else None
         if checkpoint is None:
             return {"entry_cursor": "plan"}
         state = graph_state["runtime"]
@@ -927,9 +923,7 @@ class Orchestrator:
                         "repair_attempted": bool(
                             getattr(self._planner, "last_repair_attempted", False)
                         ),
-                        "fallback_used": bool(
-                            getattr(self._planner, "last_fallback_used", False)
-                        ),
+                        "fallback_used": bool(getattr(self._planner, "last_fallback_used", False)),
                         **self._stage_operational_summary(
                             graph_state["budgets"]["planner"],
                             None,
@@ -1114,9 +1108,7 @@ class Orchestrator:
             if resolved:
                 if state.step_count < 1:
                     raise ValueError("evidence repair requires a completed specialist step")
-                source_step = state.plan.steps[
-                    min(state.step_count - 1, len(state.plan.steps) - 1)
-                ]
+                source_step = state.plan.steps[min(state.step_count - 1, len(state.plan.steps) - 1)]
                 self._record_result(
                     state,
                     source_step,
@@ -1206,7 +1198,9 @@ class Orchestrator:
             deadline=budget.deadline,
             max_calls=budget.max_calls,
             started_at=now,
-            budget_seconds=(max(0.0, budget.deadline - now) if budget.deadline is not None else 0.0),
+            budget_seconds=(
+                max(0.0, budget.deadline - now) if budget.deadline is not None else 0.0
+            ),
         )
         prediction = await self._run_in_stage(
             budget,
@@ -1235,9 +1229,7 @@ class Orchestrator:
         state = graph_state["runtime"]
         if state.plan is None:
             raise ValueError("stable checkpoint requires a plan")
-        decision = (
-            graph_state.get("decision") if cursor in {"correct", "submit"} else None
-        )
+        decision = graph_state.get("decision") if cursor in {"correct", "submit"} else None
         checkpoint = StageCheckpoint(
             cursor=cursor,
             plan=state.plan,
@@ -1297,11 +1289,7 @@ class Orchestrator:
         state.step_count += 1
         self.step_count = state.step_count
         event_prefix = "correction_act" if correction else "act"
-        scope = (
-            f"correction:{self.correction_count}"
-            if correction
-            else f"act:{state.step_count}"
-        )
+        scope = f"correction:{self.correction_count}" if correction else f"act:{state.step_count}"
         tools.start_scope(
             scope,
             stage=budget.name,
@@ -1336,6 +1324,20 @@ class Orchestrator:
                 )
             finally:
                 state.usage = _add_usage(state.usage, specialist.last_usage)
+                for diagnostic in getattr(specialist, "last_response_diagnostics", ()):
+                    self._audit("stage_response_diagnostic", {"stage": "specialist", **diagnostic})
+                if specialist_span is not None:
+                    specialist_span.set_summary(
+                        {
+                            "repair_attempted": bool(
+                                getattr(specialist, "last_repair_attempted", False)
+                            ),
+                            "response_diagnostics": list(
+                                getattr(specialist, "last_response_diagnostics", ())
+                            ),
+                            **self._stage_operational_summary(budget, tools, stage_started),
+                        }
+                    )
             if specialist_span is not None:
                 specialist_span.set_summary(
                     {
@@ -1347,6 +1349,9 @@ class Orchestrator:
                         "candidate_present": result.candidate_answer is not None,
                         "repair_attempted": bool(
                             getattr(specialist, "last_repair_attempted", False)
+                        ),
+                        "response_diagnostics": list(
+                            getattr(specialist, "last_response_diagnostics", ())
                         ),
                         **self._stage_operational_summary(budget, tools, stage_started),
                     }
@@ -1374,8 +1379,7 @@ class Orchestrator:
         if any(not evidence_id.strip() for evidence_id in result_ids):
             raise ValueError("evidence IDs must be non-empty")
         result_digests = [
-            hashlib.sha256(evidence_id.encode("utf-8")).digest()
-            for evidence_id in result_ids
+            hashlib.sha256(evidence_id.encode("utf-8")).digest() for evidence_id in result_ids
         ]
         if len(result_digests) != len(set(result_digests)) or (
             state.raw_evidence_id_digests.intersection(result_digests)
@@ -1639,13 +1643,9 @@ class Orchestrator:
                 for origin in computation_origins
                 if _numeric_value(state.candidate_origins.get(origin)) == final_value
             }
-            return len(agreeing_origins) >= 2 or (
-                bool(agreeing_origins) and "source" in kinds
-            )
+            return len(agreeing_origins) >= 2 or (bool(agreeing_origins) and "source" in kinds)
         assert state.plan is not None
-        is_research = any(
-            step.specialist == SpecialistName.LOOKUP for step in state.plan.steps
-        )
+        is_research = any(step.specialist == SpecialistName.LOOKUP for step in state.plan.steps)
         if is_research:
             return "source" in kinds
         return bool(state.evidence)
@@ -1654,7 +1654,9 @@ class Orchestrator:
         if state.candidate is None:
             return "candidate answer is missing"
         if _numeric_value(state.candidate) is not None:
-            return "numerical answer requires two independent computations or computation plus source"
+            return (
+                "numerical answer requires two independent computations or computation plus source"
+            )
         return "research answer requires source evidence"
 
     async def _submit(
@@ -1731,9 +1733,7 @@ class Orchestrator:
 
     def _stage_budgets(self, started: float) -> dict[str, StageBudget]:
         envelope = (
-            self._vote_stage_runtime.envelope
-            if self._vote_stage_runtime is not None
-            else None
+            self._vote_stage_runtime.envelope if self._vote_stage_runtime is not None else None
         ) or StageDeadlineEnvelope.for_config(self._config, started_at=started)
         return {
             "planner": StageBudget(
@@ -1773,8 +1773,7 @@ class Orchestrator:
         operation: Callable[[], Awaitable[Any]],
         stage_runtime: _StageRuntime | None = None,
         *,
-        telemetry_stage: Literal["planner", "specialist", "critic", "submit"]
-        | None = None,
+        telemetry_stage: Literal["planner", "specialist", "critic", "submit"] | None = None,
     ) -> Any:
         remaining = None
         loop_deadline = None
@@ -1863,6 +1862,11 @@ class Orchestrator:
                 payload=payload,
             )
         )
+        if self._on_progress is not None:
+            try:
+                self._on_progress(event_type, dict(payload))
+            except Exception:  # noqa: BLE001,S110 - never expose private progress errors
+                pass
 
     def _stage_operational_summary(
         self,

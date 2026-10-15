@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import weakref
+from collections import deque
 from typing import Any
 
 import pytest
@@ -34,9 +35,116 @@ from gaia_agent.providers import (
 
 
 @pytest.mark.asyncio
-async def test_evidence_linker_selects_only_known_hashes_without_tools(
-    fake_provider, task
-) -> None:
+async def test_lookup_repair_retains_bounded_research_and_diagnostics(
+    fake_provider, fake_tools, task
+):
+    fake_provider._responses = deque(
+        [
+            ModelResponse(
+                output_text="not valid specialist output",
+                tool_events=(
+                    ToolEvent(
+                        call_id="call",
+                        name="web_search",
+                        arguments={"query": "private query"},
+                        output={
+                            "answer": "Observed support",
+                            "sources": [{"url": "https://example.org/source", "title": "Source"}],
+                            "private_field": "DO_NOT_COPY",
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                parsed={"specialist": "lookup", "evidence": [], "candidate_answer": "answer"}
+            ),
+        ]
+    )
+    agent = LookupAgent(fake_provider, reasoning_effort="max")
+    await agent.run(task, PlanStep(specialist="lookup", instruction="Research"), (), fake_tools)
+    repair = fake_provider.requests[1]
+    context = json.dumps(repair.input_items)
+    assert "Observed support" in context
+    assert "https://example.org/source" in context
+    assert "DO_NOT_COPY" not in context
+    assert "private query" not in context
+    assert repair.allowed_tools == ()
+    assert repair.reasoning_effort == "low"
+    assert agent.last_response_diagnostics[0]["code"] == "schema"
+    assert agent.last_response_diagnostics[1]["code"] == "valid"
+
+
+@pytest.mark.asyncio
+async def test_lookup_records_failed_repair_without_response_content(
+    fake_provider, fake_tools, task
+):
+    fake_provider._responses = deque(
+        [
+            ModelResponse(
+                output_text="not valid initial",
+                response_status="incomplete",
+                incomplete_reason="max_output_tokens",
+            ),
+            ModelResponse(output_text="not valid repair", response_status="completed"),
+        ]
+    )
+    agent = LookupAgent(fake_provider)
+    with pytest.raises(StageProtocolError):
+        await agent.run(task, PlanStep(specialist="lookup", instruction="Research"), (), fake_tools)
+    assert agent.last_response_diagnostics == (
+        {
+            "phase": "initial",
+            "code": "schema",
+            "response_status": "incomplete",
+            "incomplete_reason": "max_output_tokens",
+        },
+        {
+            "phase": "repair",
+            "code": "schema",
+            "response_status": "completed",
+            "incomplete_reason": "none",
+        },
+    )
+
+
+def test_repair_evidence_is_bounded_and_excludes_failed_tools():
+    from gaia_agent.agents import _with_repair_evidence
+
+    request = ModelRequest(
+        instructions="repair",
+        input_items=(),
+        output_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    )
+    response = ModelResponse(
+        tool_events=(
+            ToolEvent(
+                call_id="a",
+                name="web_search",
+                arguments={},
+                output={"error": "failed", "answer": "FAILED_CONTENT"},
+            ),
+            ToolEvent(
+                call_id="b",
+                name="read_webpage",
+                arguments={},
+                output={"text": "x" * 100_000, "url": "http://127.0.0.1/private"},
+            ),
+        )
+    )
+    repaired = _with_repair_evidence(request, response, 4096)
+    assert context_size_bytes(repaired.input_items) <= 4096
+    assert "FAILED_CONTENT" not in json.dumps(repaired.input_items)
+    assert "127.0.0.1" not in json.dumps(repaired.input_items)
+    assert "repair_evidence" in json.dumps(repaired.input_items)
+
+
+@pytest.mark.asyncio
+async def test_evidence_linker_selects_only_known_hashes_without_tools(fake_provider, task) -> None:
     fake_provider.return_parsed({"evidence_entry_hashes": ["known"]})
     linker = EvidenceLinkerAgent(fake_provider, reasoning_effort="max")
 
@@ -58,9 +166,7 @@ async def test_evidence_linker_selects_only_known_hashes_without_tools(
 async def test_evidence_linker_rejects_the_whole_selection_for_an_unknown_hash(
     fake_provider, task
 ) -> None:
-    fake_provider.return_parsed(
-        {"evidence_entry_hashes": ["known", "invented"]}
-    )
+    fake_provider.return_parsed({"evidence_entry_hashes": ["known", "invented"]})
 
     selected = await EvidenceLinkerAgent(fake_provider).link(
         task,
@@ -76,9 +182,7 @@ async def test_evidence_linker_rejects_the_whole_selection_for_an_unknown_hash(
 async def test_evidence_linker_rejects_the_whole_selection_for_a_duplicate_hash(
     fake_provider, task
 ) -> None:
-    fake_provider.return_parsed(
-        {"evidence_entry_hashes": ["known", "known"]}
-    )
+    fake_provider.return_parsed({"evidence_entry_hashes": ["known", "known"]})
 
     selected = await EvidenceLinkerAgent(fake_provider).link(
         task,
@@ -157,9 +261,7 @@ async def test_evidence_linker_bounds_and_sanitizes_private_model_context(
 
 
 @pytest.mark.asyncio
-async def test_evidence_linker_short_circuits_when_there_are_no_cards(
-    fake_provider, task
-) -> None:
+async def test_evidence_linker_short_circuits_when_there_are_no_cards(fake_provider, task) -> None:
     linker = EvidenceLinkerAgent(fake_provider)
 
     selected = await linker.link(task, "answer", ())
@@ -652,9 +754,7 @@ async def test_specialist_accepts_legacy_provider_with_keyword_only_executor(
 
 
 @pytest.mark.asyncio
-async def test_specialist_accepts_keyword_only_request_name_and_executor(
-    fake_tools, task
-) -> None:
+async def test_specialist_accepts_keyword_only_request_name_and_executor(fake_tools, task) -> None:
     class LegacyProvider:
         async def complete(
             self,
@@ -720,9 +820,7 @@ async def test_provider_positional_only_observer_keeps_keyword_only_executor(
 
 
 @pytest.mark.asyncio
-async def test_provider_varargs_keeps_declared_keyword_executor(
-    fake_tools, task
-) -> None:
+async def test_provider_varargs_keeps_declared_keyword_executor(fake_tools, task) -> None:
     class VarargsProvider:
         async def complete(
             self,
@@ -775,7 +873,7 @@ async def test_uninspectable_provider_uses_historical_call_once_for_local_repair
                             "specialist": "lookup",
                             "instruction": "Find a source",
                         }
-                    ]
+                    ],
                 },
                 usage=Usage(input_tokens=1, total_tokens=1),
             )
@@ -1110,7 +1208,9 @@ async def test_specialist_usage_resets_before_a_provider_failure(
 
 
 @pytest.mark.asyncio
-async def test_critic_repairs_one_malformed_response_locally(fake_provider, fake_tools, task) -> None:
+async def test_critic_repairs_one_malformed_response_locally(
+    fake_provider, fake_tools, task
+) -> None:
     fake_provider.return_text("not valid critic output")
     fake_provider.return_parsed(
         {
@@ -1278,9 +1378,7 @@ async def test_visual_agent_sends_high_detail_image_and_retains_read_tool(
 async def test_specialist_context_serializes_prior_evidence_in_order(
     fake_provider, fake_tools, task
 ) -> None:
-    fake_provider.return_parsed(
-        {"specialist": "lookup", "evidence": [], "candidate_answer": None}
-    )
+    fake_provider.return_parsed({"specialist": "lookup", "evidence": [], "candidate_answer": None})
     evidence = (
         Evidence(
             evidence_id="source-2",
@@ -1332,21 +1430,21 @@ async def test_specialist_context_selects_bounded_unique_high_value_evidence(
 
     assert context["question"] == task.question
     assert context["evidence"][0]["evidence_id"] == "source-0"
-    assert len({item.get("domain") for item in context["evidence"]}) == len(
-        context["evidence"]
-    )
+    assert len({item.get("domain") for item in context["evidence"]}) == len(context["evidence"])
     assert context_size_bytes(input_items) <= 24_576
     assert "x" * 12_000 not in repr(input_items)
 
 
 @pytest.mark.asyncio
-async def test_specialist_context_measures_final_unicode_json_serialization(fake_tools, task) -> None:
-    unicode_task = task.model_copy(update={"question": "¿qué? \"\\" + "é" * 160})
+async def test_specialist_context_measures_final_unicode_json_serialization(
+    fake_tools, task
+) -> None:
+    unicode_task = task.model_copy(update={"question": '¿qué? "\\' + "é" * 160})
     evidence = tuple(
         Evidence(
             evidence_id=f"source-{index}",
             kind="source",
-            summary=f"résumé {index} \"\\" + "é" * 2_000,
+            summary=f'résumé {index} "\\' + "é" * 2_000,
             source_url=f"https://source-{index}.example.test/fact",
         )
         for index in range(12)
@@ -1354,7 +1452,7 @@ async def test_specialist_context_measures_final_unicode_json_serialization(fake
 
     input_items = await _specialist_input(
         unicode_task,
-        PlanStep(specialist="lookup", instruction="Quote \"\\ evidence"),
+        PlanStep(specialist="lookup", instruction='Quote "\\ evidence'),
         evidence,
         visual=False,
         tools=fake_tools,
@@ -1430,9 +1528,7 @@ async def test_visual_context_estimator_matches_actual_serialized_request(
     text_only = (
         {
             **input_items[0],
-            "content": [
-                item for item in input_items[0]["content"] if item["type"] == "input_text"
-            ],
+            "content": [item for item in input_items[0]["content"] if item["type"] == "input_text"],
         },
     )
     assert estimated_bytes == context_size_bytes(text_only)
@@ -1608,7 +1704,9 @@ async def test_specialist_rejects_evidence_id_already_present_in_prior_evidence(
 
 
 @pytest.mark.asyncio
-async def test_specialist_rejects_a_result_for_the_wrong_role(fake_provider, fake_tools, task) -> None:
+async def test_specialist_rejects_a_result_for_the_wrong_role(
+    fake_provider, fake_tools, task
+) -> None:
     fake_provider.return_parsed(
         {"specialist": "computation", "evidence": [], "candidate_answer": "42"}
     )
@@ -1658,9 +1756,7 @@ async def test_critic_uses_only_verification_tools_and_returns_typed_decision(
         }
     )
 
-    decision = await CriticAgent(fake_provider).verify(
-        task, "Marie Curie", evidence, fake_tools
-    )
+    decision = await CriticAgent(fake_provider).verify(task, "Marie Curie", evidence, fake_tools)
     request = fake_provider.requests[0]
 
     assert decision.verdict == "approve"
@@ -1733,9 +1829,7 @@ async def test_critic_approval_must_name_existing_checked_evidence(
 
 
 @pytest.mark.asyncio
-async def test_critic_rejects_unknown_checked_evidence_id(
-    fake_provider, fake_tools, task
-) -> None:
+async def test_critic_rejects_unknown_checked_evidence_id(fake_provider, fake_tools, task) -> None:
     fake_provider.return_parsed(
         {
             "verdict": "approve",
@@ -1969,7 +2063,9 @@ async def test_critic_rejects_revision_grounded_only_by_non_evidence_tool_event(
 
 
 @pytest.mark.asyncio
-async def test_critic_falls_back_after_two_unknown_verdicts(fake_provider, fake_tools, task) -> None:
+async def test_critic_falls_back_after_two_unknown_verdicts(
+    fake_provider, fake_tools, task
+) -> None:
     parsed = {
         "verdict": "maybe",
         "feedback": "Unstructured indecision",
@@ -2012,9 +2108,7 @@ async def test_critic_rejects_a_non_concise_correction(
 
 
 @pytest.mark.asyncio
-async def test_critic_cannot_approve_a_missing_candidate(
-    fake_provider, fake_tools, task
-) -> None:
+async def test_critic_cannot_approve_a_missing_candidate(fake_provider, fake_tools, task) -> None:
     evidence = (
         Evidence(
             evidence_id="source-1",
@@ -2107,9 +2201,7 @@ async def test_specialist_schema_is_role_specific_and_does_not_ask_model_for_usa
         "type": "string",
         "const": "computation",
     }
-    assert schema["$defs"]["Evidence"]["properties"]["kind"]["enum"] == [
-        "computation"
-    ]
+    assert schema["$defs"]["Evidence"]["properties"]["kind"]["enum"] == ["computation"]
     assert "usage" not in schema["properties"]
 
 

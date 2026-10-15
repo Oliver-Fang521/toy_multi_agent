@@ -104,7 +104,7 @@ class OpenAIProvider:
     def __init__(
         self,
         client: Any,
-        model: str = "gpt-5.6-sol",
+        model: str = "gpt-6.1-sol",
         *,
         use_previous_response_id: bool = True,
         observability: Observability | None = None,
@@ -275,11 +275,7 @@ class OpenAIProvider:
             tool_call_count += len(calls)
             if not self._use_previous_response_id:
                 _append_tool_turn(history, response, calls, outputs)
-            next_common = (
-                tool_free_common
-                if tool_call_count == request.max_tool_calls
-                else common
-            )
+            next_common = tool_free_common if tool_call_count == request.max_tool_calls else common
             response = await self._continue(
                 previous_response=response,
                 input_items=outputs if self._use_previous_response_id else list(history),
@@ -293,7 +289,20 @@ class OpenAIProvider:
         parsed = None if refused or not output_text else _extract_json_object(output_text)
         if parsed is not None and not isinstance(parsed, dict):
             raise ValueError("structured response must decode to an object")
+        status = getattr(response, "status", "unknown")
+        details = getattr(response, "incomplete_details", None)
+        reason = getattr(details, "reason", None)
         return ModelResponse(
+            response_status=(
+                status if status in {"completed", "incomplete", "failed"} else "unknown"
+            ),
+            incomplete_reason=(
+                reason
+                if reason in {"max_output_tokens", "content_filter"}
+                else "other"
+                if details is not None
+                else "none"
+            ),
             parsed=parsed,
             output_text=output_text,
             usage=_aggregate_usage(responses),
